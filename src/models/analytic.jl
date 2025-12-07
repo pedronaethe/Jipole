@@ -6,6 +6,11 @@ const α_analytic = -0.0
 const height = (100. / 3.0)
 const l0 = 1.0
 
+
+const RHO_unit = 3.e-18
+const U_unit = RHO_unit * CL^2  # Internal energy density unit in erg
+const B_unit = CL * sqrt(4 * π * RHO_unit)  # Magnetic field unit in Gauss
+
 function radiating_region(X::MVec4, Rh::Float64)
     """
     Checks if the position is within the radiating region.
@@ -96,11 +101,6 @@ function get_analytic_jk(X, Kcon, freqcgs::Float64, bhspin)
 
     jnu_inv = max(Ne * (ν/freqcgs)^(-α_analytic)/ν^2, 0.0)
     knu_inv = max((A * Ne * (ν/freqcgs)^(-(α_analytic + 2.5)) + 1.e-54) * ν, 0.0)
-
-    if(jnu_inv > 1e-30)
-        println("r = $(exp(X[2])), th = $(X[3] * π), Ne = $Ne, ν = $ν, jnu_inv = $jnu_inv, knu_inv = $knu_inv")
-        error("")
-    end
 
     if(isnan(jnu_inv) || isinf(jnu_inv))
         @error "Invalid jnu_inv computed" jnu_inv

@@ -167,7 +167,7 @@ function set_dxdX(X)
     dxdX[2,2] = exp(X[2])
     if(MODEL == "analytic" || MODEL == "thin_disk")
         dxdX[3,3] = π
-    elif(MODEL == "iharm")
+    elseif(MODEL == "iharm")
         if(METRIC == "MKS")
             dxdX[3,3] = π + (1 - hslope) * π * cos(2*π*X[3])
         elseif(METRIC == "FMKS")

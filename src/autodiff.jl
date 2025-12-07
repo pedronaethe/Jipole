@@ -136,19 +136,19 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
         # Use finite differences for iharm model
         # iharm model uses bisection method to find camera theta coordinate, which is not differentiable
         # because of the if statements inside the root finding
-        # del = 1e-7
-        # θl = θo - del
-        # θh = θo + del
-        # Xl = camera_position(ro, θl, 0.0, bhspin, Rout)
-        # Xh = camera_position(ro, θh, 0.0, bhspin, Rout)
-        # dX_dθo = (Xh .- Xl) ./ (2.0 * del)
-        # Kl = CalculateK(ro, θl, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
-        # Kh = CalculateK(ro, θh, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
-        # dK_dθo = (Kh .- Kl) ./ (2.0 * del)
-        dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, 0.0, bhspin, Rout), θo)
-        dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
-
+        del = 1e-6
+        θl = θo - del
+        θh = θo + del
+        Xl = camera_position(ro, θl, 0.0, bhspin, Rout)
+        Xh = camera_position(ro, θh, 0.0, bhspin, Rout)
+        dX_dθo = (Xh .- Xl) ./ (2.0 * del)
+        Kl = CalculateK(ro, θl, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
+        Kh = CalculateK(ro, θh, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
+        dK_dθo = (Kh .- Kl) ./ (2.0 * del)
+        # dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, 0.0, bhspin, Rout), θo)
+        # dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
     end 
+
     dX_da = ForwardDiff.derivative(x -> camera_position(ro, θo, 0.0, x, Rout), bhspin)
     dK_da = ForwardDiff.derivative(x -> CalculateK(ro, θo, i, j, nx, ny, fovx, fovy, x, freq, Rout), bhspin)
 
@@ -226,11 +226,15 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
                 temp_dK_da[k] = temp_dK_da[k] - dl * jac[k, 9]
             end
 
-
             push_photon!(X, Kcon, -dl,Xhalf, Kconhalf, lconn, bhspin)
-
+            # if(i == 0 && j == 0)
+            #     println("step = $step")
+            #     println("dX_dθo = $temp_dX_dθo")
+            #     println("dK_dθo = $temp_dK_dθo")
+            # end
+            # println("$i, $j, $step, $dX_dθo")
+            # println("X = $X, stop_backward_integration = $(stop_backward_integration(X, Kcon, Rh, Rstop))")
             step += 1
-  
             insert!(traj, step ,OfTraj(
                 copy(dl),
                 copy(X),   
@@ -244,7 +248,6 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
             ))
         end
     end
-    
 
     if (step > nmaxstep)
         @error("AutoDiffGeoTrajEulerMethod: Maximum number of steps reached without meeting geodesics stop condition.")
@@ -271,7 +274,6 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
     end
 
     ji, ki = get_jk(Xi, Kconi, freq, bhspin, data)
-
 
     # Then replace your ForwardDiff calls in the loop with:
     for nstep = step:-1:2
@@ -305,7 +307,7 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
         jac_I_A = ForwardDiff.derivative(rad_a, bhspin)
         jac_I_I = ForwardDiff.derivative(rad_i, Intensity)
 
-        dI_dθo = dI_dθo + (traj[nstep].dl) * (dot(jac_I_X, traj[nstep].dX_dθo) + dot(jac_I_K, traj[nstep].dK_dθo) + jac_I_I * dI_dθo)
+        dI_dθo = dI_dθo + (traj[nstep - 1].dl) * (dot(jac_I_X, traj[nstep].dX_dθo) + dot(jac_I_K, traj[nstep].dK_dθo) + jac_I_I * dI_dθo)
         dI_da = dI_da + (traj[nstep].dl) * (dot(jac_I_X, traj[nstep].dX_da) + dot(jac_I_K, traj[nstep].dK_da) + jac_I_I * dI_da + jac_I_A)
 
         jf, kf = get_jk(Xf, Kconf, freq, bhspin, data)

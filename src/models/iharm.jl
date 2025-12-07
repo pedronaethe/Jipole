@@ -4,7 +4,9 @@ using Printf
 # --- Constants for Primitives ---
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
-
+const RHO_unit = M_unit / L_unit^3  # Density unit in g/cm^3
+const U_unit = RHO_unit * CL^2  # Internal energy density unit in erg
+const B_unit = CL * sqrt(4 * π * RHO_unit)  # Magnetic field unit in Gauss
 
 metric_type = "METRIC_FMKS"
 if (metric_type == "METRIC_FMKS")

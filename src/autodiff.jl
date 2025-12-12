@@ -253,7 +253,6 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
         @error("AutoDiffGeoTrajEulerMethod: Maximum number of steps reached without meeting geodesics stop condition.")
         error()
     end
-    resize!(traj, length(traj)) 
     # Determine the correct Dual type from autodiff
 
     #=========================================================USED FOR INTENSITY INTEGRATION=========================================================#

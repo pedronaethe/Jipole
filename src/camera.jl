@@ -58,6 +58,71 @@ function root_find(x, cstartx, cstopx)
   return xc[3];
 end
 
+function root_find_newton(x, cstartx, cstopx)
+    """
+    Finds the root of the theta function using Newton's method.
+    Parameters:
+    @x: Vector of position coordinates in internal coordinates.
+    """
+    # Target value we are trying to match
+    th_target = x[3]
+
+    # Initialize working vector
+    xc = zeros(eltype(x), length(x))
+    
+    # Pre-fill constant components (assuming index 2 is log-radius and 4 is generic)
+    xc[2] = log(x[2])
+    xc[4] = x[4]
+
+    # --- Initial Guess ---
+    # We start at the midpoint of the search interval to be safe
+    xc[3] = 0.5 * (cstartx[3] + cstopx[3])
+
+    # Settings for Newton's Method
+    tol::Float64 = 1.e-16
+    max_iter::Int = 100
+    epsilon::Float64 = 1.e-7 # Step size for finite difference derivative
+
+    for i in 1:max_iter
+        # 1. Evaluate the function at current guess
+        # f(theta) = theta_func(theta) - th_target
+        current_val = theta_func(xc)
+        f_val = current_val - th_target
+
+        # Check convergence
+        if abs(f_val) < tol
+            return xc[3]
+        end
+
+        # 2. Calculate Derivative using Finite Difference
+        # f'(theta) ≈ (f(theta + eps) - f(theta)) / eps
+        current_theta = xc[3]
+        xc[3] = current_theta + epsilon
+        val_plus = theta_func(xc)
+        
+        derivative = (val_plus - current_val) / epsilon
+
+        # Reset xc[3] to current theta for the update step
+        xc[3] = current_theta
+
+        # Avoid division by zero
+        if abs(derivative) < 1.e-14
+            println("Warning: Derivative close to zero, Newton method failed.")
+            break
+        end
+
+        # 3. Newton Update Step
+        # x_new = x_old - f(x) / f'(x)
+        xc[3] = xc[3] - (f_val / derivative)
+        
+        # Optional: Clamp the result to stay within bounds if necessary
+        # xc[3] = clamp(xc[3], cstartx[3], cstopx[3])
+    end
+
+    return xc[3]
+end
+
+
 function camera_position(cam_dist::Float64, cam_theta_angle, cam_phi_angle::Float64, bhspin, Rout::Float64)
     """
     Computes the camera position in internal coordinates based on the distance and angles.
@@ -68,7 +133,6 @@ function camera_position(cam_dist::Float64, cam_theta_angle, cam_phi_angle::Floa
     """
 
     if(MODEL == "analytic" || MODEL == "thin_disk")
-        Rh = 1 + sqrt(1. - bhspin * bhspin);
 
         T = promote_type(typeof(cam_dist), typeof(cam_theta_angle), typeof(cam_phi_angle), typeof(bhspin))
         X = zeros(T, 4)
@@ -79,18 +143,15 @@ function camera_position(cam_dist::Float64, cam_theta_angle, cam_phi_angle::Floa
         X[4] = cam_phi_angle/180 * π
         return X
     elseif (MODEL == "iharm")
-        Rh = 1 + sqrt(1. - bhspin * bhspin);
 
         T = promote_type(typeof(cam_dist), typeof(cam_theta_angle), typeof(cam_phi_angle), typeof(bhspin))
         X = zeros(T, 4)
         x = [zero(T), T(cam_dist), T(cam_theta_angle)/T(180) * T(π), T(cam_phi_angle)/T(180) * T(π)]
-        cstartx = [zero(T), log(T(Rh)), zero(T), zero(T)]
-        cstopx = [zero(T), log(T(Rout)), one(T), T(2) * T(π)]
-
         X[1] = 0.0
         X[2] = log(cam_dist)
         #X[3] = root_find(x, cstartx, cstopx)
-        X[3] = cam_theta_angle / 180
+        X[3] = root_find_newton(x, cstartx, cstopx)
+        #X[3] = cam_theta_angle / 180
         X[4] = cam_phi_angle/180 * π
         return X
     else

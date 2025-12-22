@@ -4,7 +4,6 @@ using Printf
 # --- Constants for Primitives ---
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
-const M_unit = 3e26
 const RHO_unit = M_unit / L_unit^3  # Density unit in g/cm^3
 const U_unit = RHO_unit * CL^2  # Internal energy density unit in erg
 const B_unit = CL * sqrt(4 * π * RHO_unit)  # Magnetic field unit in Gauss
@@ -358,14 +357,13 @@ function get_model_fourv(data, X, Kcon, Ucon, Ucov, Bcon, Bcov, bhspin)
         end
         return
     end
-    Vcon = similar(X)
+    Vcon = typeof(X)(undef)
     tfac, _, _ = set_tinterp_ns(X)
     nA = 1 #TODO: when using slowlight, we should implement this
     nB = 1 #TODO: when using slowlight, we should implement this
     Vcon[2] = interp_scalar_time(X, data[nA].U1, data[nB].U1, tfac);
     Vcon[3] = interp_scalar_time(X, data[nA].U2, data[nB].U2, tfac);
     Vcon[4] = interp_scalar_time(X, data[nA].U3, data[nB].U3, tfac);
-
     VdotV = 0.0
     for μ in 2:NDIM
         for ν in 2:NDIM

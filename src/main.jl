@@ -54,7 +54,7 @@ include("gradientdescent.jl")
 
 
 
-function IpoleGeoIntensityIntegration(traj, freq_cgs::Float64, nx::Int,ny::Int, scalefactor::Float64, bhspin::Float64)
+function IpoleGeoIntensityIntegration(traj, freq_cgs::Float64, nx::Int,ny::Int, scalefactor::Float64, bhspin::Float64, data = nothing)
     """
     Once the trajectories are calculated, integrate the intensity for each pixel.
     Parameters:
@@ -70,7 +70,7 @@ function IpoleGeoIntensityIntegration(traj, freq_cgs::Float64, nx::Int,ny::Int, 
     Threads.@threads for i in 0:(nx - 1)
         println("Processing row $i out of $(nx)")
         for j in 0:(ny - 1)
-            integrate_emission!(traj[i+1, j+1], length(traj[i+1, j+1]), Image, i + 1, j + 1, freq_cgs, bhspin)
+            integrate_emission!(traj[i+1, j+1], length(traj[i+1, j+1]), Image, i + 1, j + 1, freq_cgs, bhspin, data)
         end
     end
 

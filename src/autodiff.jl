@@ -63,8 +63,8 @@ function systemODEs_flat(XK)
     @views return Mom4ODE(XK[1:4], XK[5:8], XK[9])
 end
 
-function CalculateK(ro, θo, i,j, nx, ny, fovx, fovy, bhspin, freq, Rout)
-    Xcam = camera_position(ro, θo, 0.0, bhspin, Rout)
+function CalculateK(ro, θo, phi, i,j, nx, ny, fovx, fovy, bhspin, freq, Rout)
+    Xcam = camera_position(ro, θo, phi, bhspin, Rout)
     T = eltype(Xcam)
     Kcon = MVector{4, T}(undef)
     X = MVector{4, T}(undef)
@@ -81,7 +81,7 @@ function RadTransferDiff(Xi, Kconi, freq, Ii, bhspin, data)
     return ji - ki * Ii
 end
 
-function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64},ro::Float64, θo::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64,i::Int64,j::Int64,freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, data = nothing)
+function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64},ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64,i::Int64,j::Int64,freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, data = nothing)
     """
     Returns the intensity and the derivative of the intensity with respect to θo for pixel (i,j) using autodiff.
 
@@ -107,7 +107,7 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
 
     #=========================================================USED FOR GEODESIC INTEGRATION=========================================================#
     #First set up the initial position and momentum of the specific pixel (i,j)
-    Xcam = MVec4(camera_position(ro, θo, 0.0, bhspin, Rout))
+    Xcam = MVec4(camera_position(ro, θo, phi, bhspin, Rout))
     Kcon = MVec4(undef)
     X = MVec4(undef)
     Rh = 1 + sqrt(1. - bhspin * bhspin);  # Radius of the horizon
@@ -129,28 +129,28 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
     #Define reference for the intensity integration part so that I don't have to reallocate each step
     jac = MMatrix{4, 9, Float64}(undef)
     if(MODEL == "analytic" || MODEL == "thin_disk")
-        dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, 0.0, bhspin, Rout), θo)
-        dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
+        dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, phi, bhspin, Rout), θo)
+        dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
 
     elseif (MODEL == "iharm")
         # Use finite differences for iharm model
         # iharm model uses bisection method to find camera theta coordinate, which is not differentiable
         # because of the if statements inside the root finding
-        del = 1e-6
-        θl = θo - del
-        θh = θo + del
-        Xl = camera_position(ro, θl, 0.0, bhspin, Rout)
-        Xh = camera_position(ro, θh, 0.0, bhspin, Rout)
-        dX_dθo = (Xh .- Xl) ./ (2.0 * del)
-        Kl = CalculateK(ro, θl, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
-        Kh = CalculateK(ro, θh, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
-        dK_dθo = (Kh .- Kl) ./ (2.0 * del)
-        # dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, 0.0, bhspin, Rout), θo)
-        # dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
+        # del = 1e-6
+        # θl = θo - del
+        # θh = θo + del
+        # Xl = camera_position(ro, θl, phi, bhspin, Rout)
+        # Xh = camera_position(ro, θh, phi, bhspin, Rout)
+        # dX_dθo = (Xh .- Xl) ./ (2.0 * del)
+        # Kl = CalculateK(ro, θl, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
+        # Kh = CalculateK(ro, θh, phi,i, j, nx, ny, fovx, fovy, bhspin, freq, Rout)
+        # dK_dθo = (Kh .- Kl) ./ (2.0 * del)
+        dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, phi, bhspin, Rout), θo)
+        dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
     end 
 
-    dX_da = ForwardDiff.derivative(x -> camera_position(ro, θo, 0.0, x, Rout), bhspin)
-    dK_da = ForwardDiff.derivative(x -> CalculateK(ro, θo, i, j, nx, ny, fovx, fovy, x, freq, Rout), bhspin)
+    dX_da = ForwardDiff.derivative(x -> camera_position(ro, θo, phi, x, Rout), bhspin)
+    dK_da = ForwardDiff.derivative(x -> CalculateK(ro, θo, phi, i, j, nx, ny, fovx, fovy, x, freq, Rout), bhspin)
 
     XK = MVector{9, Float64}(undef)
     XK[9] = bhspin
@@ -221,19 +221,15 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
             mul!(temp_jac_dK_da, view(jac, 1:4, 5:8), traj[step].dK_da)
             # Handle the jacobian column separately to avoid broadcasting issues
             @. temp_dK_da = traj[step].dK_da - dl * (temp_jac_dX_da + temp_jac_dK_da)
+
+            
             # Extract column 9 as a proper vector, not a view
             for k in 1:4
                 temp_dK_da[k] = temp_dK_da[k] - dl * jac[k, 9]
             end
 
             push_photon!(X, Kcon, -dl,Xhalf, Kconhalf, lconn, bhspin)
-            # if(i == 0 && j == 0)
-            #     println("step = $step")
-            #     println("dX_dθo = $temp_dX_dθo")
-            #     println("dK_dθo = $temp_dK_dθo")
-            # end
-            # println("$i, $j, $step, $dX_dθo")
-            # println("X = $X, stop_backward_integration = $(stop_backward_integration(X, Kcon, Rh, Rstop))")
+
             step += 1
             insert!(traj, step ,OfTraj(
                 copy(dl),
@@ -305,8 +301,9 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
         ForwardDiff.gradient!(jac_I_K, rad_k, Kconi)
         jac_I_A = ForwardDiff.derivative(rad_a, bhspin)
         jac_I_I = ForwardDiff.derivative(rad_i, Intensity)
+        
 
-        dI_dθo = dI_dθo + (traj[nstep - 1].dl) * (dot(jac_I_X, traj[nstep].dX_dθo) + dot(jac_I_K, traj[nstep].dK_dθo) + jac_I_I * dI_dθo)
+        dI_dθo = dI_dθo + (traj[nstep].dl) * (dot(jac_I_X, traj[nstep].dX_dθo) + dot(jac_I_K, traj[nstep].dK_dθo) + jac_I_I * dI_dθo)
         dI_da = dI_da + (traj[nstep].dl) * (dot(jac_I_X, traj[nstep].dX_da) + dot(jac_I_K, traj[nstep].dK_da) + jac_I_I * dI_da + jac_I_A)
 
         jf, kf = get_jk(Xf, Kconf, freq, bhspin, data)
@@ -326,6 +323,461 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
     dI_dθo_out[] = dI_dθo * freq^3
     intensity_out[] = Intensity * freq^3
     dI_da_out[] = dI_da * freq^3
+    empty!(traj)
+    return nothing
+end
+
+
+# function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64},ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64,i::Int64,j::Int64,freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, data = nothing)
+#     """
+#     Returns the intensity and the derivative of the intensity with respect to θo for pixel (i,j) using autodiff.
+
+#     Parameters:
+#     @ro: Distance of the camera in Rg.
+#     @θo: Angle of the camera in degrees.
+#     @bhspin: Spin of the black hole.
+#     @nx: Number of pixels in the x direction.
+#     @ny: Number of pixels in the y direction.
+#     @nmaxstep: Maximum number of steps for the geodesic integration.
+#     @i: Pixel index in the x direction.
+#     @j: Pixel index in the y direction.
+#     @freq: Frequency of the radiation.
+#     @scalefactor: Scale factor for the intensity.
+#     @fovx: Field of view in the x direction.
+#     @fovy: Field of view in the y direction.
+
+#     Observations:
+#     - At first it does the geodesic integration using the RK2 method. In the geodesic integration step, it also calculates dX_dθo and dK_dθo, which are the derivatives of the position and momentum with respect to θo.
+#     - After the geodesic integration, it integrates the intensity along the geodesics using the approximate_solve function. There, it also calculates the derivative of the intensity with respect to θo.
+#     """
+
+
+#     #=========================================================USED FOR GEODESIC INTEGRATION=========================================================#
+#     #First set up the initial position and momentum of the specific pixel (i,j)
+#     Xcam = MVec4(camera_position(ro, θo, phi, bhspin, Rout))
+#     Kcon = MVec4(undef)
+#     X = MVec4(undef)
+#     Rh = 1 + sqrt(1. - bhspin * bhspin);  # Radius of the horizon
+
+#     #Define X and Kcon
+#     init_XK!(X, Kcon, i,j, Xcam, nx, ny, fovx, fovy, bhspin)
+#     #Put Kcon in correct unitless
+#     Kcon .*= freq * HPL / (ME * CL * CL) 
+#     dl_unit::Float64 = L_unit * HPL / (ME * CL^2)  # Unit conversion factor for dl
+
+#     # half steps, used for polarization
+#     # Set the variables before (i) and after (f) the first step
+#     Xhalf = copy(X)
+#     Kconhalf = copy(Kcon)
+#     lconn = Tensor3D(undef)
+
+#     #Calculate the derivative of the initial positions and momentum with respect to θo
+#     #The derivative of K is calculated using finite differences
+#     #Define reference for the intensity integration part so that I don't have to reallocate each step
+#     jac = MMatrix{4, 9, Float64}(undef)
+#     dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, phi, bhspin, Rout), θo)
+#     dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
+    
+#     XK = MVector{9, Float64}(undef)
+#     XK[9] = bhspin
+#     #push first step to trajectory
+
+#     insert!(traj, 1, OfTraj(
+#     0,
+#     copy(X),
+#     copy(Kcon),
+#     copy(Xhalf),
+#     copy(Kconhalf),
+#     copy(dX_dθo),
+#     copy(dK_dθo),
+#     MVec4(undef),
+#     MVec4(undef)
+#     ))
+
+
+#     # Continue from the second step, since first step is defined at init_XK!
+#     step::Int64 = 1
+
+
+#     # Pre-allocate temporary vectors to avoid allocations in the main loop
+#     temp_dX_dθo = MVec4(undef)
+#     temp_dK_dθo = MVec4(undef) 
+
+#     # Also pre-allocate for matrix-vector operations
+#     temp_jac_dX_dθo = MVec4(undef)
+#     temp_jac_dK_dθo = MVec4(undef)
+#     while (stop_backward_integration(X, Kcon, Rh, Rstop) == 0 && (step <= nmaxstep))
+#         @inbounds begin
+#             #Unite X and Kcon into a single vector for ForwardDiff
+#             @inbounds for k = 1:4
+#                 XK[k] = X[k]
+#                 XK[k+4] = Kcon[k]
+#             end
+
+#             #Calculate the Jacobian of the system of ODEs with respect to the X^μ, K^μ and spin
+#             # jac is a 4×9 matrix:
+#             # Rows: Output variables (dK₁/dλ, dK₂/dλ, dK₃/dλ, dK₄/dλ)
+#             # Columns: Input variables (1:4 = X₁, X₂, X₃, X₄; 5:8 = K₁, K₂, K₃, K₄; 9 = bhspin)
+#             # Entry (i, j): ∂(ODE_i)/∂(var_j)
+#             # Table structure:
+#             #         | ∂(dK₁/dλ)/∂X₁ ... ∂(dK₁/dλ)/∂X₄ ∂(dK₁/dλ)/∂K₁ ... ∂(dK₁/dλ)/∂K₄ ∂(dK₁/dλ)/∂a |
+#             #         | ∂(dK₂/dλ)/∂X₁ ... ∂(dK₂/dλ)/∂X₄ ∂(dK₂/dλ)/∂K₁ ... ∂(dK₂/dλ)/∂K₄ ∂(dK₂/dλ)/∂a |
+#             #         | ∂(dK₃/dλ)/∂X₁ ... ∂(dK₃/dλ)/∂X₄ ∂(dK₃/dλ)/∂K₁ ... ∂(dK₃/dλ)/∂K₄ ∂(dK₃/dλ)/∂a |
+#             #         | ∂(dK₄/dλ)/∂X₁ ... ∂(dK₄/dλ)/∂X₄ ∂(dK₄/dλ)/∂K₁ ... ∂(dK₄/dλ)/∂K₄ ∂(dK₄/dλ)/∂a |
+#             ForwardDiff.jacobian!(jac, systemODEs_flat, XK)
+
+#             dl = stepsize(X, Kcon, cstartx, cstopx)
+#             @. temp_dX_dθo = traj[step].dX_dθo - dl * traj[step].dK_dθo
+
+#             mul!(temp_jac_dX_dθo, view(jac, 1:4, 1:4), traj[step].dX_dθo)
+#             mul!(temp_jac_dK_dθo, view(jac, 1:4, 5:8), traj[step].dK_dθo)
+#             @. temp_dK_dθo = traj[step].dK_dθo - dl * (temp_jac_dX_dθo + temp_jac_dK_dθo)
+#             push_photon!(X, Kcon, -dl,Xhalf, Kconhalf, lconn, bhspin)
+#             step += 1
+#             insert!(traj, step ,OfTraj(
+#                 copy(dl* dl_unit),
+#                 copy(X),   
+#                 copy(Kcon),   
+#                 copy(Xhalf),   
+#                 copy(Kconhalf),
+#                 copy(temp_dX_dθo),
+#                 copy(temp_dK_dθo),
+#                 MVec4(undef),
+#                 MVec4(undef)
+#             ))
+#         end
+#     end
+
+#     if (step > nmaxstep)
+#         @error("AutoDiffGeoTrajEulerMethod: Maximum number of steps reached without meeting geodesics stop condition.")
+#         error()
+#     end
+#     # Determine the correct Dual type from autodiff
+
+#     #=========================================================USED FOR INTENSITY INTEGRATION=========================================================#
+#     # Integrate intensity forward
+#     Xi = MVec4(undef)
+#     Kconi = MVec4(undef)
+#     Xf = MVec4(undef)
+#     Kconf = MVec4(undef)
+#     Intensity = 0.0
+#     dI_dθo = 0.0
+#     jac_I_X = MVec4(undef)
+#     jac_I_K = MVec4(undef)
+    
+#     for k in 1:NDIM
+#         Xi[k] = traj[step].X[k]
+#         Kconi[k] = traj[step].Kcon[k]
+#     end
+
+#     ji, ki = get_jk(Xi, Kconi, freq, bhspin, data)
+
+#     # Then replace your ForwardDiff calls in the loop with:
+#     for nstep = step:-1:2
+#         for k in 1:NDIM
+#             Xi[k] = traj[nstep].X[k]
+#             Xf[k] = traj[nstep - 1].X[k]
+#             Kconi[k] = traj[nstep].Kcon[k]
+#             Kconf[k] = traj[nstep - 1].Kcon[k]
+#         end
+
+#         if(MODEL == "thin_disk")
+#             if(thindisk_region(Xi, Xf))
+#                 Intensity = GetTDBoundaryCondition(Xi, Kconi, bhspin, Rh)
+#             end
+#             continue
+#         end
+
+#         if !radiating_region(Xf, Rh)
+#             continue
+#         end
+
+#         # Update the callable structs with current values
+#         rad_x = RadTransferX(Kconi, freq, Intensity, bhspin, data)
+#         rad_k = RadTransferK(Xi, freq, Intensity, bhspin, data)
+#         rad_i = RadTransferI(Xi, Kconi, freq, bhspin, data)
+
+#         # Use the callable structs instead of closures
+#         ForwardDiff.gradient!(jac_I_X, rad_x, Xi)
+#         ForwardDiff.gradient!(jac_I_K, rad_k, Kconi)
+#         jac_I_I = ForwardDiff.derivative(rad_i, Intensity)
+
+#         #Terms for dI_dθo
+#         term_X_n = dot(jac_I_X, traj[nstep].dX_dθo)
+#         term_K_n = dot(jac_I_K, traj[nstep].dK_dθo)
+#         term_I_n = jac_I_I * dI_dθo
+
+#         #This is the Right hand side of equation (9) from the paper at step n
+#         k1 = term_X_n + term_K_n + term_I_n
+
+#         #Predict dI_dθo at the step n
+#         dI_dθo_pred = dI_dθo + traj[nstep - 1].dl * k1
+
+#         #Evolve intensity to step n - 1
+#         jf, kf = get_jk(Xf, Kconf, freq, bhspin, data)
+#         Intensity = approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep - 1].dl)
+
+#         # Update the callable structs with current values
+#         rad_x = RadTransferX(Kconf, freq, Intensity, bhspin, data)
+#         rad_k = RadTransferK(Xf, freq, Intensity, bhspin, data)
+#         rad_i = RadTransferI(Xf, Kconf, freq, bhspin, data)
+
+#         # Use the callable structs instead of closures
+#         ForwardDiff.gradient!(jac_I_X, rad_x, Xf)
+#         ForwardDiff.gradient!(jac_I_K, rad_k, Kconf)
+#         jac_I_I = ForwardDiff.derivative(rad_i, Intensity)
+
+#         #This is the Right hand side of equation (9) from the paper at step n +1 (in our case, we are going downwards in indices)
+#         term_X_nplus1 = dot(jac_I_X, traj[nstep - 1].dX_dθo)
+#         term_K_nplus1 = dot(jac_I_K, traj[nstep - 1].dK_dθo)
+#         term_I_nplus1 = jac_I_I * dI_dθo_pred
+
+#         k2 = term_X_nplus1 + term_K_nplus1 + term_I_nplus1
+
+#         #Correct dI_dθo at step n using the predicted value at step n-1
+#         #We should use dl nstep -1 here because that's the step size between nstep and nstep -1 
+#         dI_dθo = dI_dθo + ((traj[nstep - 1].dl) / 2.0) * (k1 + k2)
+#         if(abs(dI_dθo) > 0.0)
+#             println("dI_dθo after step $nstep: $(dI_dθo * freq^3), dl = $(traj[nstep - 1].dl), k1 = $k1, k2 = $k2\n")
+#             r, th = bl_coord(Xf)
+#             println("r = $r, θ = $th\n")
+#         end
+
+#         if (isnan(Intensity) || isinf(Intensity))
+#             @error "NaN or Inf encountered in intensity calculation at pixel ($i, $j)"
+#             println("Intensity = $Intensity, ji = $ji, ki = $ki, jf = $jf, kf = $kf")
+#             print_vector("Kconf =", Kconf)
+#             print_vector("Kconi =", Kconi)
+#             error("NaN or Inf encountered in intensity calculation")
+#         end
+        
+#         ji = jf
+#         ki = kf
+#     end
+
+#     dI_dθo_out[] = dI_dθo * freq^3
+#     intensity_out[] = Intensity * freq^3
+#     dI_da_out[] = 0 * freq^3
+#     empty!(traj)
+#     return nothing
+# end
+
+
+function transfer_step(I_prev, X_curr, K_curr, X_next, K_next, dl, freq, bhspin, data)
+    ji, ki = get_jk(X_curr, K_curr, freq, bhspin, data)
+    jf, kf = get_jk(X_next, K_next, freq, bhspin, data)
+    return approximate_solve(I_prev, ji, ki, jf, kf, dl)
+end
+
+function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64},ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64,i::Int64,j::Int64,freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, data = nothing)
+    """
+    Returns the intensity and the derivative of the intensity with respect to θo for pixel (i,j) using autodiff.
+
+    Parameters:
+    @ro: Distance of the camera in Rg.
+    @θo: Angle of the camera in degrees.
+    @bhspin: Spin of the black hole.
+    @nx: Number of pixels in the x direction.
+    @ny: Number of pixels in the y direction.
+    @nmaxstep: Maximum number of steps for the geodesic integration.
+    @i: Pixel index in the x direction.
+    @j: Pixel index in the y direction.
+    @freq: Frequency of the radiation.
+    @scalefactor: Scale factor for the intensity.
+    @fovx: Field of view in the x direction.
+    @fovy: Field of view in the y direction.
+
+    Observations:
+    - At first it does the geodesic integration using the RK2 method. In the geodesic integration step, it also calculates dX_dθo and dK_dθo, which are the derivatives of the position and momentum with respect to θo.
+    - After the geodesic integration, it integrates the intensity along the geodesics using the approximate_solve function. There, it also calculates the derivative of the intensity with respect to θo.
+    """
+
+
+    #=========================================================USED FOR GEODESIC INTEGRATION=========================================================#
+    #First set up the initial position and momentum of the specific pixel (i,j)
+    Xcam = MVec4(camera_position(ro, θo, phi, bhspin, Rout))
+    Kcon = MVec4(undef)
+    X = MVec4(undef)
+    Rh = 1 + sqrt(1. - bhspin * bhspin);  # Radius of the horizon
+
+    #Define X and Kcon
+    init_XK!(X, Kcon, i,j, Xcam, nx, ny, fovx, fovy, bhspin)
+    #Put Kcon in correct unitless
+    Kcon .*= freq * HPL / (ME * CL * CL) 
+    dl_unit::Float64 = L_unit * HPL / (ME * CL^2)  # Unit conversion factor for dl
+
+    # half steps, used for polarization
+    # Set the variables before (i) and after (f) the first step
+    Xhalf = copy(X)
+    Kconhalf = copy(Kcon)
+    lconn = Tensor3D(undef)
+
+    #Calculate the derivative of the initial positions and momentum with respect to θo
+    #The derivative of K is calculated using finite differences
+    #Define reference for the intensity integration part so that I don't have to reallocate each step
+    jac = MMatrix{4, 9, Float64}(undef)
+    dX_dθo = ForwardDiff.derivative(x -> camera_position(ro, x, phi, bhspin, Rout), θo)
+    dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, Rout), θo)
+
+    XK = MVector{9, Float64}(undef)
+    XK[9] = bhspin
+    #push first step to trajectory
+
+    insert!(traj, 1, OfTraj(
+    0,
+    copy(X),
+    copy(Kcon),
+    copy(Xhalf),
+    copy(Kconhalf),
+    copy(dX_dθo),
+    copy(dK_dθo),
+    MVec4(undef),
+    MVec4(undef)
+    ))
+
+
+    #Check if it has been saved in traj.
+    # Continue from the second step, since first step is defined at init_XK!
+    step::Int64 = 1
+
+
+    # Pre-allocate temporary vectors to avoid allocations in the main loop
+    temp_dX_dθo = MVec4(undef)
+    temp_dK_dθo = MVec4(undef) 
+
+    # Also pre-allocate for matrix-vector operations
+    temp_jac_dX_dθo = MVec4(undef)
+    temp_jac_dK_dθo = MVec4(undef)
+    while (stop_backward_integration(X, Kcon, Rh, Rstop) == 0 && (step <= nmaxstep))
+        @inbounds begin
+            #Unite X and Kcon into a single vector for ForwardDiff
+            @inbounds for k = 1:4
+                XK[k] = X[k]
+                XK[k+4] = Kcon[k]
+            end
+
+            #Calculate the Jacobian of the system of ODEs with respect to the X^μ, K^μ and spin
+            # jac is a 4×9 matrix:
+            # Rows: Output variables (dK₁/dλ, dK₂/dλ, dK₃/dλ, dK₄/dλ)
+            # Columns: Input variables (1:4 = X₁, X₂, X₃, X₄; 5:8 = K₁, K₂, K₃, K₄; 9 = bhspin)
+            # Entry (i, j): ∂(ODE_i)/∂(var_j)
+            # Table structure:
+            #         | ∂(dK₁/dλ)/∂X₁ ... ∂(dK₁/dλ)/∂X₄ ∂(dK₁/dλ)/∂K₁ ... ∂(dK₁/dλ)/∂K₄ ∂(dK₁/dλ)/∂a |
+            #         | ∂(dK₂/dλ)/∂X₁ ... ∂(dK₂/dλ)/∂X₄ ∂(dK₂/dλ)/∂K₁ ... ∂(dK₂/dλ)/∂K₄ ∂(dK₂/dλ)/∂a |
+            #         | ∂(dK₃/dλ)/∂X₁ ... ∂(dK₃/dλ)/∂X₄ ∂(dK₃/dλ)/∂K₁ ... ∂(dK₃/dλ)/∂K₄ ∂(dK₃/dλ)/∂a |
+            #         | ∂(dK₄/dλ)/∂X₁ ... ∂(dK₄/dλ)/∂X₄ ∂(dK₄/dλ)/∂K₁ ... ∂(dK₄/dλ)/∂K₄ ∂(dK₄/dλ)/∂a |
+            ForwardDiff.jacobian!(jac, systemODEs_flat, XK)
+
+            dl = stepsize(X, Kcon, cstartx, cstopx)
+            traj[step].dl = dl * dl_unit
+            @. temp_dX_dθo = traj[step].dX_dθo - dl * traj[step].dK_dθo
+
+            mul!(temp_jac_dX_dθo, view(jac, 1:4, 1:4), traj[step].dX_dθo)
+            mul!(temp_jac_dK_dθo, view(jac, 1:4, 5:8), traj[step].dK_dθo)
+            @. temp_dK_dθo = traj[step].dK_dθo - dl * (temp_jac_dX_dθo + temp_jac_dK_dθo)
+
+            push_photon!(X, Kcon, -dl,Xhalf, Kconhalf, lconn, bhspin)
+
+            step += 1
+            insert!(traj, step ,OfTraj(
+                copy(dl),
+                copy(X),   
+                copy(Kcon),   
+                copy(Xhalf),   
+                copy(Kconhalf),
+                copy(temp_dX_dθo),
+                copy(temp_dK_dθo),
+                MVec4(undef),
+                MVec4(undef)
+            ))
+        end
+    end
+
+    if (step > nmaxstep)
+        @error("AutoDiffGeoTrajEulerMethod: Maximum number of steps reached without meeting geodesics stop condition.")
+        error()
+    end
+    # Determine the correct Dual type from autodiff
+
+    #=========================================================USED FOR INTENSITY INTEGRATION=========================================================#
+    # Integrate intensity forward
+    Xi = MVec4(undef)
+    Kconi = MVec4(undef)
+    Xf = MVec4(undef)
+    Kconf = MVec4(undef)
+    Intensity = 0.0
+    dI_dθo = 0.0
+    jac_I_X = MVec4(undef)
+    jac_I_K = MVec4(undef)
+
+    step -= 1
+
+    for k in 1:NDIM
+        Xi[k] = traj[step].X[k]
+        Kconi[k] = traj[step].Kcon[k]
+    end
+
+    ji, ki = get_jk(Xi, Kconi, freq, bhspin, data)
+
+    # Then replace your ForwardDiff calls in the loop with:
+    for nstep = step:-1:2
+        for k in 1:NDIM
+            Xi[k] = traj[nstep].X[k]
+            Xf[k] = traj[nstep - 1].X[k]
+            Kconi[k] = traj[nstep].Kcon[k]
+            Kconf[k] = traj[nstep - 1].Kcon[k]
+        end
+
+        if(MODEL == "thin_disk")
+            if(thindisk_region(Xi, Xf))
+                Intensity = GetTDBoundaryCondition(Xi, Kconi, bhspin, Rh)
+            end
+            continue
+        end
+
+        if !radiating_region(Xf, Rh)
+            continue
+        end
+
+
+
+        # --- CALCULATE GRADIENTS ---
+        # 1. Derivative w.r.t Intensity (Transmission)
+        jac_I_I = ForwardDiff.derivative(I -> transfer_step(I, Xi, Kconi, Xf, Kconf, traj[nstep - 1].dl, freq, bhspin, data), Intensity)
+
+        # 2. Gradients w.r.t Start (i)
+        jac_I_Xi = ForwardDiff.gradient(x -> transfer_step(Intensity, x, Kconi, Xf, Kconf, traj[nstep - 1].dl, freq, bhspin, data), Xi)
+        jac_I_Ki = ForwardDiff.gradient(k -> transfer_step(Intensity, Xi, k, Xf, Kconf, traj[nstep - 1].dl, freq, bhspin, data), Kconi)
+        # 3. Gradients w.r.t End (f) - PREVIOUSLY MISSING
+        jac_I_Xf = ForwardDiff.gradient(x -> transfer_step(Intensity, Xi, Kconi, x, Kconf, traj[nstep - 1].dl, freq, bhspin, data), Xf)
+        jac_I_Kf = ForwardDiff.gradient(k -> transfer_step(Intensity, Xi, Kconi, Xf, k, traj[nstep - 1].dl, freq, bhspin, data), Kconf)
+
+        # --- UPDATE DERIVATIVE (CHAIN RULE) ---
+        # Note: No multiplication by dl here! The gradients already contain the step info.
+        
+        term_geom_i = dot(jac_I_Xi, traj[nstep].dX_dθo) + dot(jac_I_Ki, traj[nstep].dK_dθo)
+        term_geom_f = dot(jac_I_Xf, traj[nstep - 1].dX_dθo) + dot(jac_I_Kf, traj[nstep - 1].dK_dθo)
+        
+        # dI_new = (Transmission * dI_old) + Source_Terms
+        dI_dθo = (jac_I_I * dI_dθo) + term_geom_i + term_geom_f
+        jf, kf = get_jk(Xf, Kconf, freq, bhspin, data)
+        Intensity = approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep - 1].dl)
+
+        if (isnan(Intensity) || isinf(Intensity))
+            @error "NaN or Inf encountered in intensity calculation at pixel ($i, $j)"
+            println("Intensity = $Intensity, ji = $ji, ki = $ki, jf = $jf, kf = $kf")
+            print_vector("Kconf =", Kconf)
+            print_vector("Kconi =", Kconi)
+            error("NaN or Inf encountered in intensity calculation")
+        end
+        
+        ji = jf
+        ki = kf
+    end
+
+    dI_dθo_out[] = dI_dθo * freq^3
+    intensity_out[] = Intensity * freq^3
+    dI_da_out[] = 0 * freq^3
     empty!(traj)
     return nothing
 end

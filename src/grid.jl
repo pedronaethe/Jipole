@@ -57,7 +57,7 @@ end
 
 function interp_scalar(X, data)
     #del::MVec4 = [0.0, 0.0, 0.0, 0.0]
-    del = typeof(X)(0.0, 0.0, 0.0, 0.0)  # Same type as X
+    del = zeros(eltype(X), 4)
 
     i, j, k = Xtoijk_ghost!(X, del)
 

@@ -24,7 +24,6 @@ end
 
 function jar_calc(data, X, Kcon, bhspin)
     Ne = get_model_ne(X, data)
-
     if(Ne == 0.0)
         return (0.0, 0.0)
     end
@@ -32,9 +31,9 @@ function jar_calc(data, X, Kcon, bhspin)
     # make Ucon use a promoted element type between X and bhspin (handles Dual numbers)
     elT = promote_type(eltype(X), typeof(bhspin))
     Ucon = similar(X, elT)
-    Ucov = typeof(Ucon)(undef)
-    Bcon = typeof(Ucon)(undef)
-    Bcov = typeof(Ucon)(undef)
+    Ucov = similar(Ucon)
+    Bcon = similar(Ucon)
+    Bcov = similar(Ucon)
     get_model_fourv(data, X, Kcon, Ucon, Ucov, Bcon, Bcov, bhspin)
     nu = get_fluid_nu(Kcon, Ucov)
     nusq = nu * nu
@@ -166,11 +165,9 @@ function get_bk_angle(Kcon, Ucov, Bcon, Bcov)
     
     #Calculating the normalized dot product of the photon 4-momentum and the magnetic field 4-vector
     μ = (Kcon[1] * Bcov[1] + Kcon[2] * Bcov[2] + Kcon[3] * Bcov[3] + Kcon[4] * Bcov[4]) / (norm_K * norm_B)
-
     if abs(μ) > 1.
         μ /= abs(μ)
     end
-    
     return acos(μ)
 end
 

@@ -169,7 +169,6 @@ function get_pixel(traj::Vector{OfTraj}, i::Int, j::Int, Xcam::MVec4, maxnstep, 
     Kcon = MVec4(undef)
 
     init_XK!(X, Kcon, i, j, Xcam, nx,ny, fovx, fovy, bhspin, xoff, yoff)
-
     for mu in 1:NDIM
         Kcon[mu] *= freq
     end

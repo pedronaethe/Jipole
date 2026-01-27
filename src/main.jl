@@ -47,7 +47,6 @@ include("radiation.jl")
 include("maxwell_juettner.jl")
 include("grid.jl")
 include("./models/$(MODEL).jl")
-include("./models/iharmOther.jl")
 
 include("geodesics.jl")
 include("autodiff.jl")
@@ -149,5 +148,6 @@ end
 
 #main()
 #GC.gc()
+
 
 

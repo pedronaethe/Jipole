@@ -1,108 +1,110 @@
-include("../src/metrics.jl")
+"""
+Construction of orthonormal tetrads used to define the observer/plasma
+rest frames.
+"""
+module Tetrads
 
-export make_camera_tetrad
+using StaticArrays
+using ..Constants
+using ..Coordinates
+using ..Metrics
+using ..Utils
 
+export make_camera_tetrad, make_plasma_tetrad, null_normalize, tetrad_to_coordinate!
 
+"""
+    make_camera_tetrad(X, bhspin, model)
 
-function make_camera_tetrad(X, bhspin)
-    """
-    Returns a camera tetrad based on the input position vector X.
+Compute the camera tetrad at the position `X`.
 
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
+The tetrad is constructed such that `e^0` is aligned with the camera's
+`Ucam`, `e^3` is aligned with the outward radial direction, `e^2` is
+aligned with the north pole of the coordinate system ("y" in the image
+plane), and `e^1` is the remaining direction ("x" in the image plane).
+Points the camera such that the angular momentum at the field-of-view
+center is zero.
 
-    Observations:
-    The tetrad is constructed such that:
-    - e^0 is aligned with the camera's Ucam.
-    - e^3 is aligned with the radial direction (outward).
-    - e^2 is aligned with the north pole of the coordinate system ("y" in the image plane).
-    - e^1 is the remaining direction ("x" in the image plane).
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters, used to select the coordinate mapping.
 
-    Points the camera such that the angular momentum at FOV center is 0.
-    """
+# Returns
+- A tuple `(oddflag, Econ, Ecov)`.
+"""
+function make_camera_tetrad(X, bhspin, model)
+    Gcov = Metrics.gcov_func(X, bhspin, model)
+    Gcon = Metrics.gcon_func(Gcov)
 
-    Gcov = gcov_func(X, bhspin);
-    Gcon = gcon_func(Gcov);
-
-
-    trial= zero(MVec4)
+    trial = zero(MVector{4,Float64})
     trial[1] = -1.0
 
-    Ucam = flip_index(trial, Gcon)
-    #@warn("Warning! Two different definitions of Ucam in make_camera_tetrad! One from ipole Ilinois repository and one from Monika's repository.")
-    # Ucam[1] = 1.0
-    # Ucam[2] = 0.0
-    # Ucam[3] = 0.0
-    # Ucam[4] = 0.0
+    Ucam = Coordinates.flip_index(trial, Gcon)
 
-    trial = zero(MVec4)
+    trial = zero(MVector{4,Float64})
     trial[1] = 1.0
     trial[2] = 1.0
 
-    Kcon = flip_index(trial, Gcon)
-    trial = zero(MVec4)
+    Kcon = Coordinates.flip_index(trial, Gcon)
+    trial = zero(MVector{4,Float64})
     trial[3] = 1.0
-    sing::Int, Econ, Ecov = make_plasma_tetrad(Ucam, Kcon, trial, Gcov)
+    sing, Econ, Ecov = make_plasma_tetrad(Ucam, Kcon, trial, Gcov)
 
-
-    return sing, Econ, Ecov;
-    
+    return sing, Econ, Ecov
 end
 
+"""
+    make_plasma_tetrad(Ucon, Kcon, Bcon, Gcov)
 
+Compute the plasma tetrad from the fluid 4-velocity, photon 4-momentum,
+and magnetic field 4-vector.
+
+`Econ[k, l]`: `k` is the tetrad basis index, `l` is the coordinate basis
+index (up). `Ecov` switches both indices. `e^0` is along `U`, `e^2` is
+along `b`, `e^3` is along the spatial part of `K`.
+
+# Arguments
+- `Ucon`: Contravariant 4-velocity of the plasma.
+- `Kcon`: Contravariant 4-vector in the direction of the photon.
+- `Bcon`: Contravariant 4-vector in the direction of the magnetic field.
+- `Gcov`: Covariant metric tensor.
+
+# Returns
+- A tuple `(oddflag, Econ, Ecov)`.
+"""
 function make_plasma_tetrad(Ucon, Kcon, Bcon, Gcov)
-    """
-    Returns a plasma tetrad based on the input vectors Ucon, Kcon, and Bcon.
-
-    Parameters:
-    @Ucon: Covariant 4-velocity vector of the plasma.
-    @Kcon: Covariant 4-vector in the direction of the camera.
-    @Bcon: Covariant 4-vector in the direction of the magnetic field.
-    @Gcov: Covariant metric tensor in Kerr-Schild coordinates.
-
-
-    Observations:
-    Econ[k][l]
-    - k: index attached to tetrad basis, index down
-    - l: index attached to coordinate basis, index up
-    
-    Ecov switches both indices
-    e^0 along U
-    e^2 along b
-    e^3 along spatial part of K
-    """
     Econ = MMatrix{4,4,eltype(Ucon)}(undef)
     Ecov = MMatrix{4,4,eltype(Ucon)}(undef)
-    ones_vector = ones(MVec4)
-    Econ[1,:] = set_Econ_from_trial(1, Ucon);
-    Econ[2,:] = set_Econ_from_trial(4, ones_vector);
-    Econ[3,:] = set_Econ_from_trial(3, Bcon);
-    Econ[4,:] = set_Econ_from_trial(4, Kcon);
-    Econ[1,:] = normalize_vector(Econ[1,:], Gcov);
-    Econ[4,:] = project_out(Econ[4,:], Econ[1,:], Gcov);
-    Econ[4,:] = project_out(Econ[4,:], Econ[1,:], Gcov);
-    Econ[4,:] = normalize_vector(Econ[4,:], Gcov);
+    ones_vector = ones(MVector{4,Float64})
+    Econ[1, :] = Utils.set_Econ_from_trial(1, Ucon)
+    Econ[2, :] = Utils.set_Econ_from_trial(4, ones_vector)
+    Econ[3, :] = Utils.set_Econ_from_trial(3, Bcon)
+    Econ[4, :] = Utils.set_Econ_from_trial(4, Kcon)
+    Econ[1, :] = Utils.normalize_vector(Econ[1, :], Gcov)
+    Econ[4, :] = Utils.project_out(Econ[4, :], Econ[1, :], Gcov)
+    Econ[4, :] = Utils.project_out(Econ[4, :], Econ[1, :], Gcov)
+    Econ[4, :] = Utils.normalize_vector(Econ[4, :], Gcov)
 
-    Econ[3,:] = project_out(Econ[3,:], Econ[1,:], Gcov);
-    Econ[3,:] = project_out(Econ[3,:], Econ[4,:], Gcov);
-    Econ[3,:] = project_out(Econ[3,:], Econ[1,:], Gcov);
-    Econ[3,:] = project_out(Econ[3,:], Econ[4,:], Gcov);
-    Econ[3,:] = normalize_vector(Econ[3,:], Gcov);
-    Econ[2,:] = project_out(Econ[2,:], Econ[1,:], Gcov);
-    Econ[2,:] = project_out(Econ[2,:], Econ[3,:], Gcov);
-    Econ[2,:] = project_out(Econ[2,:], Econ[4,:], Gcov);
-    Econ[2,:] = project_out(Econ[2,:], Econ[1,:], Gcov);
-    Econ[2,:] = project_out(Econ[2,:], Econ[3,:], Gcov);
-    Econ[2,:] = project_out(Econ[2,:], Econ[4,:], Gcov);
-    Econ[2,:] = normalize_vector(Econ[2,:], Gcov);
+    Econ[3, :] = Utils.project_out(Econ[3, :], Econ[1, :], Gcov)
+    Econ[3, :] = Utils.project_out(Econ[3, :], Econ[4, :], Gcov)
+    Econ[3, :] = Utils.project_out(Econ[3, :], Econ[1, :], Gcov)
+    Econ[3, :] = Utils.project_out(Econ[3, :], Econ[4, :], Gcov)
+    Econ[3, :] = Utils.normalize_vector(Econ[3, :], Gcov)
+    Econ[2, :] = Utils.project_out(Econ[2, :], Econ[1, :], Gcov)
+    Econ[2, :] = Utils.project_out(Econ[2, :], Econ[3, :], Gcov)
+    Econ[2, :] = Utils.project_out(Econ[2, :], Econ[4, :], Gcov)
+    Econ[2, :] = Utils.project_out(Econ[2, :], Econ[1, :], Gcov)
+    Econ[2, :] = Utils.project_out(Econ[2, :], Econ[3, :], Gcov)
+    Econ[2, :] = Utils.project_out(Econ[2, :], Econ[4, :], Gcov)
+    Econ[2, :] = Utils.normalize_vector(Econ[2, :], Gcov)
     oddflag::Int = 0
-    flag, dot_var = check_handedness(Econ, Gcov)
-    
-    if (flag != 0)
-        oddflag |= 0x10 
+    flag, dot_var = Utils.check_handedness(Econ, Gcov)
+
+    if flag != 0
+        oddflag |= 0x10
     end
 
-    if (abs(abs(dot_var) - 1) > 1e-10)
+    if abs(abs(dot_var) - 1) > 1e-10
         oddflag |= 0x1
     end
 
@@ -113,45 +115,57 @@ function make_plasma_tetrad(Ucon, Kcon, Bcon, Gcov)
     end
 
     for k in 1:4
-        Ecov[k, :] = flip_index(Econ[k, :], Gcov)
+        Ecov[k, :] = Coordinates.flip_index(Econ[k, :], Gcov)
     end
 
     for l in 1:4
-        Ecov[1, l] *= -1 
+        Ecov[1, l] *= -1
     end
 
     return oddflag, Econ, Ecov
 end
 
+"""
+    null_normalize(Kcon, fnorm)
 
+Normalize a null vector in a tetrad frame.
+
+# Arguments
+- `Kcon`: 4-vector in the tetrad frame.
+- `fnorm`: Desired norm of the vector.
+
+# Returns
+- The normalized vector.
+"""
 function null_normalize(Kcon, fnorm)
-    """
-    Normalizes null vector in a tetrad frame.
-
-    Parameters:
-    @Kcon: Covariant 4-vector in the tetrad frame.
-    @fnorm: Desired norm of the vector.
-    """
     Kcon_out = copy(Kcon)
     inorm = sqrt(sum(Kcon[2:4] .^ 2))
     Kcon_out[1] = fnorm
     for k in 2:4
-        Kcon_out[k] *= fnorm/inorm
+        Kcon_out[k] *= fnorm / inorm
     end
     return Kcon_out
 end
 
+"""
+    tetrad_to_coordinate!(Kcon, Econ, Kcon_tetrad)
+
+Convert a contravariant 4-vector from the tetrad frame to the coordinate
+frame.
+
+# Arguments
+- `Kcon`: Output vector, overwritten with the coordinate-frame 4-vector.
+- `Econ`: Tetrad basis vectors in covariant form.
+- `Kcon_tetrad`: Contravariant 4-vector in the tetrad frame.
+
+# Returns
+- `Kcon`.
+"""
 function tetrad_to_coordinate!(Kcon, Econ, Kcon_tetrad)
-    """
-    Returns the contravariant 4-vector in the coordinate frame from the tetrad frame.
-
-    Parameters:
-    @Econ: Tetrad basis vectors in covariant form.
-    @Kcon_tetrad: Contravariant 4-vector in the tetrad frame.
-    """
-
     @inbounds for l in 1:4
         Kcon[l] = Econ[1, l] * Kcon_tetrad[1] + Econ[2, l] * Kcon_tetrad[2] + Econ[3, l] * Kcon_tetrad[3] + Econ[4, l] * Kcon_tetrad[4]
     end
     return Kcon
+end
+
 end

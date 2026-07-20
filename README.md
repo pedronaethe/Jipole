@@ -49,27 +49,54 @@ IJulia.installkernel("Jipole", "--project=" * Base.current_project())
 
 This creates a dedicated Jupyter kernel that automatically loads the Jipole project environment.
 
+## Package Structure
+
+Jipole is a regular Julia package (`src/Jipole.jl`). Every file under `src/` is its own
+capitalized submodule, reachable as `Jipole.<ModuleName>`, e.g. `Jipole.Camera.camera_position`,
+`Jipole.Geodesics.get_pixel`, `Jipole.Radiation.integrate_emission!`.
+
+Three interchangeable emission models are provided as submodules — `Jipole.Analytic`,
+`Jipole.ThinDisk`, and `Jipole.Iharm` — each defining its own parameters type
+(`AnalyticParams`, `ThinDiskParams`, `IharmParams`). Which model runs is decided by which
+parameters object you construct and pass around, via Julia's multiple dispatch — there is no
+global model switch to edit.
+
+```julia
+using Jipole
+
+# Analytic torus (Gold et al. 2020)
+model = Jipole.Analytic.AnalyticParams(bhspin, Rout, cstartx, cstopx, MBH)
+
+# Thin disk
+model = Jipole.ThinDisk.ThinDiskParams(bhspin, Rout, cstartx, cstopx, MBH, Mdot)
+
+# GRMHD simulation dump
+model = Jipole.Iharm.read_header(dump_filepath, MBH)
+```
+
+From there, the same calls (`Jipole.Camera.camera_position(...)`, `Jipole.Geodesics.get_pixel(...)`,
+`Jipole.Radiation.integrate_emission!(...)`) work regardless of which model you constructed —
+see `example_notebooks/GenerateImages.ipynb` for the analytic/thin-disk models side by side, and
+`example_notebooks/GenerateImageGRMHD.ipynb` for the GRMHD model.
+
 ## Configuration
 
 ### Model Parameters
 
-The analytical model parameters are configured in `./src/models/analytic.jl`. This file contains the fundamental physical parameters that define your radiative transfer model:
+Each model's physical parameters are keyword arguments on its parameters constructor, rather
+than file-level constants:
 
 ```julia
-const A = 1.e6          # Absorption parameter
-const α_analytic = -0.0 # Emissivity's exponential dependence on frequency
-const height = (100. / 3.0)  # Disk height parameter
-const l0 = 1.0          # whether to consider gas with angular momentum
+model = Jipole.Analytic.AnalyticParams(bhspin, Rout, cstartx, cstopx, MBH;
+    A=1.e6,       # Absorption coefficient normalization
+    α=-0.0,       # Emissivity's exponential dependence on frequency (spectral index)
+    height=100.0/3.0,  # Disk height parameter
+    l0=1.0)       # Normalization of the specific angular momentum profile
 ```
 
-#### Parameter Descriptions
-
-- **A**: Absorption parameter that controls the overall absorption coefficient in the medium
-- **α_analytic**: Controls the emissivity's exponential dependence on frequency (spectral index)
-- **height**: Disk height parameter defining the vertical structure of the accretion disk
-- **l0**: Boolean-like parameter determining whether to consider gas with angular momentum effects
-
-The black hole spin parameter can be adjusted directly within the Jupyter notebooks, allowing for interactive exploration of different spacetime geometries without modifying source code.
+The black hole spin (`bhspin`) and mass (`MBH`) are passed directly to the constructor,
+allowing interactive exploration of different spacetime geometries and units from the notebook
+without touching source code.
 
 ## Running Jipole
 
@@ -96,8 +123,9 @@ The black hole spin parameter can be adjusted directly within the Jupyter notebo
 ### Using Jupyter Notebooks
 
 1. Open your web browser and navigate to the JupyterLab interface (typically `http://localhost:8888`)
-2. When creating or opening a notebook, ensure you select the **"Jipole"** kernel from the kernel menu
-3. The Jipole kernel ensures that all Jipole dependencies are automatically loaded
+2. When creating or opening a notebook, ensure you select the Jipole kernel for this project from the kernel menu
+   (install one with `using IJulia; IJulia.installkernel("Jipole", "--project=" * abspath("."))` if you don't have one yet)
+3. Every notebook simply starts with `using Jipole` — no `include`s, no global `MODEL`/`MBH`/`SLOW_LIGHT` constants
 
 ### Notebooks Overview
 

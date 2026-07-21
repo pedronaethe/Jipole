@@ -114,7 +114,7 @@ loading the next dump into the (reused) oldest slot.
 - `model`: Iharm model parameters.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
 """
-function update_data!(params_slowlight::OfSlowLight, simulation_data::Vector{Iharm.IharmData}, trat_large::Float64, model::Iharm.IharmParams, all_dumps_path::String)
+function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large::Float64, model::Iharm.IharmParams, all_dumps_path::String)
     oldest_data = simulation_data[1]
 
     simulation_data[1] = simulation_data[2]
@@ -191,54 +191,37 @@ function process_slowlight_images!(
             end
             last_img_target += params_slowlight.ImageCadence
         end
-
-        for k in 1:nimgs_concurrently
-            if valid_images[k] == 0
-                continue
-            end
+        valid_ks = [k for k in 1:nimgs_concurrently if valid_images[k] == 1]
+        p = Progress(length(valid_ks) * pixels_x * pixels_y;
+            desc = "Rendering $(length(valid_ks)) frame(s) this round...", showspeed = true, barlen = 30)
+        progress_lock = ReentrantLock()
+        for k in valid_ks
             do_output = true
 
-            p = Progress(
-                pixels_x * pixels_y;
-                desc="Rendering frame slice $k... out of $nimgs_concurrently",
-                showspeed=true,
-                barlen=30
-            )
-
-            Threads.@threads for i in 1:pixels_x
+            Threads.@threads :greedy for i in 1:pixels_x
                 for j in 1:pixels_y
-                    Xi = MVector{4,Float64}(undef)
-                    Kconi = MVector{4,Float64}(undef)
-                    Xf = MVector{4,Float64}(undef)
-                    Kconf = MVector{4,Float64}(undef)
-                    Xhalf = MVector{4,Float64}(undef)
-                    Kconhalf = MVector{4,Float64}(undef)
                     traj = all_geodesics[i, j]
-                    nstep = copy(MovieArray[i, j, k].nstep)
+                    nstep = MovieArray[i, j, k].nstep
+                    dt = target_times[k] + 1e-5
 
                     while (nstep > 2)
-                        for a in 1:Constants.NDIM
-                            Xi[a] = traj[nstep].X[a]
-                            Xhalf[a] = traj[nstep].Xhalf[a]
-                            Xf[a] = traj[nstep-1].X[a]
-                            Kconi[a] = traj[nstep].Kcon[a]
-                            Kconhalf[a] = traj[nstep].Kconhalf[a]
-                            Kconf[a] = traj[nstep-1].Kcon[a]
-                        end
-                        Xi[1] += target_times[k] + 1e-5
-                        Xhalf[1] += target_times[k] + 1.e-5
-                        Xf[1] += target_times[k] + 1.e-5
+                        Xi = traj[nstep].X
+                        Xf = traj[nstep-1].X
+                        Kconi = traj[nstep].Kcon
+                        Kconf = traj[nstep-1].Kcon
 
-                        if Xi[1] < params_slowlight.tA
-                            Xf[1] += params_slowlight.tA - Xi[1]
-                            Xhalf[1] += params_slowlight.tA - Xi[1]
-                            Xi[1] = params_slowlight.tA
+                        Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
+                        Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
+                       if Xi[1] < params_slowlight.tA
+                            shift = params_slowlight.tA - Xi[1]
+                            Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
+                            Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
                         end
                         if Xi[1] >= params_slowlight.tB
                             if Xf[1] >= params_slowlight.tf
-                                Xi[1] += params_slowlight.tf - Xf[1]
-                                Xhalf[1] += params_slowlight.tf - Xf[1]
-                                Xf[1] = params_slowlight.tf
+                                shift = params_slowlight.tf - Xf[1]
+                                Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
+                                Xf = SVector{4,Float64}(params_slowlight.tf, Xf[2], Xf[3], Xf[4])
                             else
                                 break
                             end
@@ -251,14 +234,15 @@ function process_slowlight_images!(
 
                         nstep -= 1
                     end
-                    MovieArray[i, j, k].nstep = copy(nstep)
+                    MovieArray[i, j, k].nstep = nstep
                     if nstep != 2
                         do_output = false
                     end
-                    ProgressMeter.next!(p)
+                    lock(progress_lock) do
+                        ProgressMeter.next!(p)
+                    end
                 end
             end
-            finish!(p)
 
             if do_output
                 Image_out = map(x -> x.Intensity, MovieArray[:, :, k]) .* freq^3
@@ -271,6 +255,7 @@ function process_slowlight_images!(
                 nopenimgs -= 1
             end
         end
+        finish!(p)
 
         if nopenimgs <= 1
             break

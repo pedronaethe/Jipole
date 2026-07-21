@@ -32,7 +32,6 @@ include("models/iharm.jl")
 include("imaging.jl")
 include("slowlight.jl")
 include("autodiff.jl")
-include("gradientdescent.jl")
 include("utils_gpu.jl")
 
 end

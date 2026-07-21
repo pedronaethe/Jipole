@@ -11,7 +11,9 @@ Jipole is an ipole-based Julia implementation designed to perform radiative tran
 
 ## Current Development Status
 
-The current version of Jipole focuses on implementing and validating the test problems described in **Section 3.2** of [Gold et al. 2020](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6). We have ported the well-established C-based [ipole](https://github.com/moscibrodzka/ipole) ([Moscibrodzka & Gammie 2017](https://arxiv.org/abs/1712.03057)) code to Julia with some extended functionalities.
+The current version of Jipole is capable of producing images for Iharm3D file types. We also have implemented the test problems described in  **Section 3.2** of [Gold et al. 2020](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6) and thin disk model as described in the [Prather et al. 2023](http://iopscience.iop.org/article/10.3847/1538-4357/acc586).
+
+The code is currently able to perform slow-light runs and has been compared with the well estabished code [Blacklight](https://github.com/c-white/blacklight) ([C. White. 2022](https://iopscience.iop.org/article/10.3847/1538-4365/ac77ef/meta)) and [ipole](https://github.com/moscibrodzka/ipole) ([Moscibrodzka & Gammie 2017](https://arxiv.org/abs/1712.03057)).
 
 
 ## Installation and Setup
@@ -79,25 +81,6 @@ From there, the same calls (`Jipole.Camera.camera_position(...)`, `Jipole.Geodes
 see `example_notebooks/GenerateImages.ipynb` for the analytic/thin-disk models side by side, and
 `example_notebooks/GenerateImageGRMHD.ipynb` for the GRMHD model.
 
-## Configuration
-
-### Model Parameters
-
-Each model's physical parameters are keyword arguments on its parameters constructor, rather
-than file-level constants:
-
-```julia
-model = Jipole.Analytic.AnalyticParams(bhspin, Rout, cstartx, cstopx, MBH;
-    A=1.e6,       # Absorption coefficient normalization
-    α=-0.0,       # Emissivity's exponential dependence on frequency (spectral index)
-    height=100.0/3.0,  # Disk height parameter
-    l0=1.0)       # Normalization of the specific angular momentum profile
-```
-
-The black hole spin (`bhspin`) and mass (`MBH`) are passed directly to the constructor,
-allowing interactive exploration of different spacetime geometries and units from the notebook
-without touching source code.
-
 ## Running Jipole
 
 ### Starting the Environment
@@ -125,7 +108,7 @@ without touching source code.
 1. Open your web browser and navigate to the JupyterLab interface (typically `http://localhost:8888`)
 2. When creating or opening a notebook, ensure you select the Jipole kernel for this project from the kernel menu
    (install one with `using IJulia; IJulia.installkernel("Jipole", "--project=" * abspath("."))` if you don't have one yet)
-3. Every notebook simply starts with `using Jipole` — no `include`s, no global `MODEL`/`MBH`/`SLOW_LIGHT` constants
+3. Every notebook simply starts with `using Jipole`.
 
 ### Notebooks Overview
 
@@ -133,16 +116,21 @@ without touching source code.
   Computes geodesics for each pixel and allows for **debugging and visualization** of the trajectories. Useful for inspecting geodesics before integrating intensity.  
 
 - **GenerateImage.ipynb**  
-  Computes the **final intensity map** for thin-disk or analytical models, performing **forward integration of emission** along geodesics in a memory-efficient way.  
+  Computes the **final intensity map** for thin-disk or analytical models, performing **forward integration of emission** along geodesics.  
+
+- **GenerateImageGRMHD.ipynb**  
+Computes the **final intensity map** for a GRMHD Iharm3D snapshot, performing **forward integration of emission** along geodesics.  
 
 - **Autodiff.ipynb**  
   Performs **differentiable ray tracing** to compute **derivatives of the image intensity** with respect to parameters like black hole spin (`a`) and observer inclination (`θ`). Uses the **conjugate gradient algorithm** to recover ground truth parameters from a computed intensity map, demonstrating **gradient-based parameter estimation**.
 
 ## References
 
-- Gold, R. et al. 2020, ApJ, 897, 148: "Verification of Radiative Transfer Schemes for the EHT"
-- Moscibrodzka, M. & Gammie, C. F. 2017, "ipole - semianalytic scheme for relativistic polarized radiative transport", arXiv:1712.03057
-- Revels, J., Lubin, M., and Papamarkou, T. 2016, "Forward-Mode Automatic Differentiation in Julia", arXiv:1607.07892
+- Gold, R. et al. 2020, ApJ, 897, 148: [Verification of Radiative Transfer Schemes for the EHT](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6)
+- Moscibrodzka, M. & Gammie, C. F. 2017, arXiv:1712.03057: [ipole – semi-analytic scheme for relativistic polarized radiative transport](https://academic.oup.com/mnras/article/475/1/43/4712230)
+- Revels, J., Lubin, M., and Papamarkou, T. 2016, arXiv:1607.07892: [Forward-Mode Automatic Differentiation in Julia](https://arxiv.org/abs/1607.07892)
+- Naethe Motta, P. et al. 2025, ApJ, 995, 56: [Jipole: A Differentiable ipole-based Code for Radiative Transfer in Curved Spacetimes](https://iopscience.iop.org/article/10.3847/1538-4357/ae16a0)
+- Naethe Motta, P. et al. 2026, ApJ, 1004, 2: [Sensitivities of Black Hole Images from General Relativistic Magnetohydrodynamic Simulations](https://iopscience.iop.org/article/10.3847/1538-4357/ae733f)
 
 
 ## Contact

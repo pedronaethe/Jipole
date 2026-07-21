@@ -495,7 +495,7 @@ function load_data(filename::String, trat_large::Float64, model::IharmParams; ad
 
     rho = uu = u1 = u2 = u3 = b1 = b2 = b3 = nothing
 
-    data_array = Vector{IharmData}(undef, 1)
+    data_array = Vector{IharmData{Array{Float64,3}}}(undef, 1)
 
     h5open(filename, "r") do file
         t = read(file, "t")

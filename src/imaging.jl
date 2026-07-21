@@ -150,7 +150,7 @@ function calculate_image!(
     Xhalf = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
     Khalf = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
     zero_vec = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
-    lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
+    #lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
 
     step::Int64 = 1
     @inbounds traj[i_local, j_local, step] = OfTrajGRMHD(
@@ -161,7 +161,7 @@ function calculate_image!(
         @inbounds begin
             dl = Geodesics.stepsize(X, K, params.cstartx, params.cstopx)
             scaled_dl = dl * dl_unit
-            X, K, Xhalf, Khalf = Geodesics.push_photon(X, K, -dl, lconn, bhspin, params)
+            X, K, Xhalf, Khalf = Geodesics.push_photon(X, K, -dl, bhspin, params)
             step += 1
             traj[i_local, j_local, step] = OfTrajGRMHD(
                 scaled_dl, X, K, Xhalf, Khalf,

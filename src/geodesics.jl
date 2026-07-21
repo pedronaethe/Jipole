@@ -603,16 +603,14 @@ backward, depending on its sign), using a midpoint (RK2) integrator.
 # Returns
 - A tuple `(new_X, new_Kcon, Xhalf, Kconhalf)`.
 """
-Base.@inline function push_photon(X::SVector{4,Float64}, Kcon::SVector{4,Float64}, dl::Float64, lconn, bhspin::Float64, model)
-    get_connection_analytic!(X, lconn, bhspin, model)
-
-    dKcon_half = compute_dKcon(0.5 * dl, lconn, Kcon)
+Base.@inline function push_photon(X::SVector{4,Float64}, Kcon::SVector{4,Float64}, dl::Float64, bhspin::Float64, model)
+    lconn_half = get_connection_analytic(X, bhspin, model)
+    dKcon_half = compute_dKcon(0.5 * dl, lconn_half, Kcon)
     Kconhalf = Kcon + dKcon_half
     Xhalf = X + (0.5 * dl) * Kcon
 
-    get_connection_analytic!(Xhalf, lconn, bhspin, model)
-
-    dKcon_full = compute_dKcon(dl, lconn, Kconhalf)
+    lconn_full = get_connection_analytic(Xhalf, bhspin, model)
+    dKcon_full = compute_dKcon(dl, lconn_full, Kconhalf)
     new_Kcon = Kcon + dKcon_full
     new_X = X + dl * Kconhalf
 
@@ -819,7 +817,7 @@ function trace_geodesic(Xi::SVector{4,Float64}, Kconi::SVector{4,Float64}, traj:
     position_in_midplane = th > π / 2 ? 1 : 0
 
     nstep = 1
-    lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
+    #lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
     ABSOLUTE_MAX = 50000
 
     while (stop_backward_integration(X, Kcon, Rh, Rstop) == 0) && (nstep < ABSOLUTE_MAX)
@@ -847,7 +845,7 @@ function trace_geodesic(Xi::SVector{4,Float64}, Kconi::SVector{4,Float64}, traj:
             midplane_crossings += 1
         end
 
-        new_X, new_Kcon, Xhalf, Kconhalf = push_photon(X, Kcon, -dl, lconn, bhspin, model)
+        new_X, new_Kcon, Xhalf, Kconhalf = push_photon(X, Kcon, -dl, bhspin, model)
 
         nstep += 1
 

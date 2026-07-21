@@ -51,7 +51,8 @@ end
     dexter_shape_function(x)
 
 Dexter (2016) fitting function for the thermal synchrotron emissivity
-shape.
+shape. Currently not used, but reminescent from ipole. This should be integrated
+as an user choice in the future
 
 # Arguments
 - `x`: Dimensionless frequency ratio.
@@ -60,6 +61,7 @@ shape.
 - The fitting function value.
 """
 function dexter_shape_function(x)
+    #TODO: Integrate the dexter fit as an user choice in the future
     return 2.5651 * (1 + 1.92 * x^(-1.0 / 3.0) +
                       0.9977 * x^(-2.0 / 3.0)) * exp(-1.8899 * x^(1.0 / 3.0))
 end
@@ -67,7 +69,8 @@ end
 """
     maxwell_juettner_dexter_i(Ne, ν, θe, B, θ)
 
-Dexter (2016) fit for the thermal synchrotron emissivity.
+Dexter (2016) fit for the thermal synchrotron emissivity. Currently not used, but reminescent from ipole. This should be integrated
+as an user choice in the future
 
 # Arguments
 - `Ne`: Electron number density.
@@ -128,7 +131,7 @@ Thermal synchrotron emissivity used by the radiative transfer.
 Currently always uses the Leung et al. (2011) fit ([`maxwell_juettner_leung_i`](@ref)),
 since it is unpolarized; the Dexter (2016) fit below is kept for when
 polarized transport is added (`ipole`'s C implementation selects the
-Dexter fit via `params.dexter_fit = 1`).
+Dexter fit via `params.dexter_fit = 1`). This will be used as a wrapper in the future.
 
 # Arguments
 - `B`: Magnetic field strength.

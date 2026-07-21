@@ -2,7 +2,7 @@
 Metric tensor construction and inversion.
 
 `METRIC_*` are the metric-family identifiers shared by every model's
-`metric` field (previously defined redundantly in each model file).
+`metric` field.
 """
 module Metrics
 
@@ -61,7 +61,7 @@ stays differentiable when called on the autodiff path.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Model parameters (metric family via `model.metric`).
 - `gcov`: Output matrix, overwritten with the covariant metric tensor.
-- `R0`: Optional radial coordinate shift.
+- `R0`: Optional radial coordinate shift, reminescent from old MKS models.
 """
 function gcov_func!(X, bhspin, model, gcov, R0::Float64=0.0)
     r, th = Coordinates.bl_coord(X, model, R0)
@@ -219,6 +219,9 @@ end
 
 In-place version of [`gcon_func`](@ref), writing the result into `gcon`.
 
+It uses the `inv` function from `LinearAlgebra` to compute the inverse of the
+covariant metric tensor.
+
 # Arguments
 - `gcov`: Covariant metric tensor.
 - `gcon`: Output matrix, overwritten with the contravariant metric tensor.
@@ -232,6 +235,9 @@ end
 
 Compute the contravariant metric tensor by inverting the covariant metric
 tensor.
+
+It uses the `inv` function from `LinearAlgebra` to compute the inverse of the
+covariant metric tensor.
 
 # Arguments
 - `gcov`: Covariant metric tensor.

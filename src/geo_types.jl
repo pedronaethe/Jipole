@@ -1,5 +1,5 @@
 """
-Geodesic-trajectory record types shared across the engine (`Geodesics`,
+Geodesic-trajectory record types structures shared across the code (`Geodesics`,
 `Radiation`, `Autodiff`, `GradientDescent`).
 """
 module GeoTypes
@@ -9,7 +9,7 @@ using StaticArrays
 export OfTrajM, OfTrajS, OfTraj, OfTrajGRMHD
 
 """
-Mutable record of a single geodesic step, used while a trajectory is being
+Mutable structure of a single geodesic step, used while a trajectory is being
 integrated forward/backward before being frozen into an `OfTrajS`.
 """
 mutable struct OfTrajM
@@ -20,7 +20,7 @@ mutable struct OfTrajM
     Kconhalf::MVector{4,Float64}
 end
 
-"""Immutable, frozen record of a single geodesic step."""
+"""Immutable, frozen structure of a single geodesic step."""
 struct OfTrajS
     dl::Float64
     X::SVector{4,Float64}
@@ -30,9 +30,9 @@ struct OfTrajS
 end
 
 """
-Immutable record of a single geodesic step, extended with the derivatives
+Immutable structure of a single geodesic step, extended with the derivatives
 of position/momentum with respect to observer inclination (`θo`) and the
-autodiff parameter (spin `a` or `Rhigh`), used by the `Autodiff` module.
+autodiff parameter (spin `a`), used by the `Autodiff` module.
 """
 struct OfTraj
     dl::Float64
@@ -48,7 +48,7 @@ end
 
 
 """
-Immutable record of a single geodesic step, extended with the derivatives
+Immutable structure of a single geodesic step, extended with the derivatives
 of position/momentum with respect to observer inclination (`θo`).
 Primarily used for GPU version.
 """
@@ -63,10 +63,11 @@ struct OfTrajGRMHD
 end
 
 """
-Immutable record of a single geodesic step, generic over element type `T`
+Immutable structure of a single geodesic step, generic over element type `T`
 so it can carry `ForwardDiff.Dual` (used when differentiating the full
 geodesic + radiative-transfer computation directly, as opposed to the
-separate linearized-tangent-vector approach `OfTrajGRMHD` is used for).
+separate approach of integrating the sensitivities ODE, which is the case for
+`OfTrajGRMHD`).
 """
 struct OfTrajDual{T}
     dl::T

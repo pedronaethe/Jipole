@@ -7,6 +7,10 @@ The functions that depend on the coordinate mapping used by a given model
 the method defined here is the default (matching the exponential-radial,
 uncompressed-polar mapping used by `Analytic`/`ThinDisk`), and `Iharm`
 overrides them with its metric-dependent (MKS/FMKS) mapping.
+
+Some of the functions here are reminescent from previous versions of the code and
+attempts to integrate with different packages. They are not gonna be deleted because 
+they might be useful in the future.
 """
 module Coordinates
 

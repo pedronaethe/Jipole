@@ -31,6 +31,9 @@ export init_xk!, init_kcon, get_pixel, calculate_geodesics, models_and_mks_conne
 Initialize the position and photon 4-momentum for the geodesic launched
 from camera pixel `(i, j)`.
 
+The logic follows: Create an orthonormal tetrad at the camera position through gram-schmidt process, then construct a null 4-momentum.
+Normalize the 4-momentum and transform it to the coordinate basis. The initial position is always the camera position, so no position output is needed.
+
 # Arguments
 - `X`: Output vector, overwritten with the initial position.
 - `Kcon`: Output vector, overwritten with the initial 4-momentum.
@@ -70,6 +73,9 @@ Non-mutating, GPU-safe variant of [`init_xk!`](@ref) that returns the
 initial photon 4-momentum directly. The initial position is always
 `Xcam`, so no position output is needed.
 
+The logic follows: Create an orthonormal tetrad at the camera position through gram-schmidt process, then construct a null 4-momentum.
+Normalize the 4-momentum and transform it to the coordinate basis. The initial position is always the camera position, so no position output is needed.
+
 # Arguments
 - `i`, `j`: Pixel indices in the image plane.
 - `Xcam`: Camera position in internal coordinates.
@@ -104,6 +110,8 @@ end
 
 Trace the geodesic for camera pixel `(i, j)`, filling `traj` with the
 trajectory steps.
+
+The function initializes the four-position and four-momentum of the photon, then calls [`trace_geodesic`](@ref) to perform the integration. The trajectory is stored in `traj`, which is a vector of `OfTrajS` structs.
 
 # Arguments
 - `traj`: Output trajectory vector, filled by [`trace_geodesic`](@ref).
@@ -142,7 +150,7 @@ end
 """
     calculate_geodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
 
-Trace the geodesics for every pixel of the image plane.
+Loops through every pixel of the camera, calculating the geodesic trajectory for each pixel and storing it in a matrix of vectors.
 
 # Arguments
 - `Xcam`: Camera position in internal coordinates.
@@ -322,6 +330,8 @@ end
 
 Compute the analytic connection coefficients for the Funky Modified
 Kerr-Schild (FMKS) metric, as used by `Iharm`.
+
+This has been generated in Mathematica and has been tested to match the finite differences method.
 
 # Arguments
 - `X`: Position four-vector in internal coordinates.
@@ -671,7 +681,7 @@ const DEL = 1.e-6
 
 Compute the connection coefficients at `X` via finite differences of the
 metric tensor (an alternative to the closed-form
-[`get_connection_analytic`](@ref)).
+[`get_connection_analytic`](@ref)). It is currently not used in the codebase, but is provided for reference.
 
 # Arguments
 - `X`: Position four-vector in internal coordinates.
@@ -733,6 +743,10 @@ end
 
 Compute the adaptive step size for the geodesic integration.
 
+There is a redundant `if (true)` block in this function. I leave the other one as the original
+stepsize used in grmonty, for future reference.
+
+
 # Arguments
 - `X`: Position four-vector in internal coordinates.
 - `Kcon`: Contravariant photon 4-momentum.
@@ -744,7 +758,7 @@ Compute the adaptive step size for the geodesic integration.
 - The step size `dl`.
 """
 function stepsize(X, Kcon, cstartx, cstopx, eps_ipole::Float64=0.01)
- 
+    #TODO: Create a choice for the user to do it.
     if (true)
         deh::Float64 = min(abs(X[2] - cstartx[2]), 0.1)
         dlx2 = eps_ipole * (10 * deh) / (abs(Kcon[2]) + Constants.SMALL * Constants.SMALL)
@@ -768,6 +782,7 @@ end
     stop_backward_integration(X, Kcon, Rh, Rstop)
 
 Check whether the backward geodesic integration should stop.
+The condition is that the photon has either reached the stopping radius `Rstop` while moving inward, or has crossed the event horizon radius `Rh`.
 
 # Arguments
 - `X`: Position four-vector in internal coordinates.

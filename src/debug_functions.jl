@@ -1,6 +1,8 @@
 """
 Diagnostic printing helpers used throughout the engine to report vectors
 and matrices when something numerically invalid is encountered.
+
+Yes, I've used this several times to debug this code.
 """
 module DebugFunctions
 

@@ -2,7 +2,7 @@
 Differentiable ray tracing: computes the image intensity together with
 its derivatives with respect to observer inclination (`θo`) and either
 black hole spin `a` (`Analytic`/`ThinDisk`) or `Rhigh`
-(`Iharm`), via `ForwardDiff`.
+(`Iharm`), via `ForwardDiff`. We plan to extend this to more parameters as a futured developments.
 """
 module Autodiff
 
@@ -57,19 +57,21 @@ end
     calculate_kcon(ro, θo, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model)
 
 Compute the unitless photon 4-momentum launched from camera pixel
-`(i, j)`.
+`(i, j)`. 
+
+A tetrad is constructed at the camera position, and the photon 4-momentum is computed in that tetrad frame, then normalized and transformed to the internal coordinate system.
 
 # Arguments
 - `ro`, `θo`, `phi`: Camera radial distance, inclination, and azimuth.
 - `i`, `j`: Pixel indices in the image plane.
 - `nx`, `ny`: Image resolution.
-- `fovx`, `fovy`: Field of view, in radians.
+- `fovx`, `fovy`: Field of view.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `freq`: Frequency, in cgs units.
 - `model`: Model parameters.
 
 # Returns
-- The unitless contravariant photon 4-momentum.
+- The unitless contravariant photon 4-momentum in the internal coordinate system.
 """
 function calculate_kcon(ro, θo, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model)
     Xcam = Camera.camera_position(ro, θo, phi, bhspin, model)
@@ -84,7 +86,7 @@ end
     rad_transfer_diff(Xi, Kconi, freq, Ii, bhspin, model, data)
 
 Right-hand side of the (linearized) radiative transfer equation at a
-single point, `dI/dλ = j - k I`.
+single point, `dI/dλ = j - k I`. This function is used solely for computing the derivatives for the analytical model.
 
 # Arguments
 - `Xi`: Position four-vector in internal coordinates.
@@ -109,6 +111,11 @@ end
 Evolve the intensity over one geodesic segment, recomputing `j`/`k` at
 both endpoints (used by [`ApproxSolveWrapper`](@ref)-style autodiff
 wrappers).
+
+Intensity is calculated as following:
+I = I_prev * exp(-k_avg * dl) + j_avg / k_avg * (1 - exp(-k_avg * dl))
+
+where j_avg = (j_curr + j_next) / 2 and k_avg = (k_curr + k_next) / 2.
 
 # Arguments
 - `I_prev`: Intensity at the start of the segment.
@@ -138,6 +145,8 @@ for pixel `(i, j)`, using forward-mode autodiff through the geodesic
 integration (`Analytic`/`ThinDisk` models only — `Iharm` uses
 [`autodiff_geo_traj_euler_method_grmhd!`](@ref)).
 
+This follows the equations defined in [Naethe Motta et al. 2025](https://iopscience.iop.org/article/10.3847/1538-4357/ae16a0)
+
 # Arguments
 - `traj`: Scratch trajectory vector, emptied by this function.
 - `dI_dθo_out`, `intensity_out`, `dI_da_out`: Output references.
@@ -147,12 +156,13 @@ integration (`Analytic`/`ThinDisk` models only — `Iharm` uses
 - `nmaxstep`: Maximum number of integration steps.
 - `i`, `j`: Pixel indices in the image plane.
 - `freq`: Frequency, in cgs units.
-- `fovx`, `fovy`: Field of view, in radians.
+- `fovx`, `fovy`: Field of view.
 - `model`: Model parameters.
 - `Rstop`: Backward-integration stopping radius.
-- `data`: Model-specific auxiliary data.
+- `data`: Model-specific auxiliary data. It is not used for the `Analytic`/`ThinDisk` models. Should be taken out in the future.
 """
 function autodiff_geo_traj_euler_method!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64}, ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64, i::Int64, j::Int64, freq::Float64, fovx::Float64, fovy::Float64, model, Rstop::Float64, data=nothing)
+    #TODO: Remove data argument in the future, as it is not used for the Analytic/ThinDisk models. It is only used for the Iharm model, which has its own autodiff function.
     Xcam = MVector{4,Float64}(Camera.camera_position(ro, θo, phi, bhspin, model))
     Kcon = MVector{4,Float64}(undef)
     X = MVector{4,Float64}(undef)
@@ -327,6 +337,8 @@ Compute the intensity and its derivatives with respect to `θo` and
 geodesic integration for `θo`, and the analytic `dj/dRhigh`/`dk/dRhigh`
 from [`Iharm.jar_calc`](@ref) for `Rhigh`.
 
+    This is done as discussed in [Naethe Motta et al. 2026] (https://iopscience.iop.org/article/10.3847/1538-4357/ae733f)
+
 # Arguments
 - `traj`: Scratch trajectory vector, emptied by this function.
 - `dI_dθo_out`, `intensity_out`, `dI_dRhigh_out`: Output references.
@@ -336,7 +348,7 @@ from [`Iharm.jar_calc`](@ref) for `Rhigh`.
 - `nmaxstep`: Maximum number of integration steps.
 - `i`, `j`: Pixel indices in the image plane.
 - `freq`: Frequency, in cgs units.
-- `fovx`, `fovy`: Field of view, in radians.
+- `fovx`, `fovy`: Field of view.
 - `model`: Iharm model parameters.
 - `Rstop`: Backward-integration stopping radius.
 - `data`: GRMHD snapshot(s), already loaded with the `Rhigh` at which the
@@ -509,6 +521,8 @@ end
 GPU kernel launcher for [`calculate_gradients`](@ref): computes the image
 intensity together with its derivatives w.r.t. `θo` and `Rhigh`, tiled the
 same way as [`Imaging.raytrace_image_gpu!`](@ref).
+
+The calculation is the same as the CPU version ['autodiff_geo_traj_euler_method_grmhd!'](@ref), but on the GPU.
 """
 function raytrace_gradients_gpu!(
     d_traj, d_Image, d_dI_dθo, d_dI_dRhigh,
@@ -537,8 +551,8 @@ end
         nmaxstep, i_global, j_global, i_local, j_local, freq, fovx, fovy, Rout, Rstop,
         model, data=nothing)
 
-Per-pixel kernel body for [`raytrace_gradients_gpu!`](@ref). Computes the
-θo-sensitivity of the geodesic by carrying a linearized (`dX`, `dK`)
+Per-pixel kernel body for [`raytrace_gradients_gpu!`](@ref). Computes
+the per-pixel intensity and its derivatives w.r.t. `θo` and `Rhigh`, by carrying a linearized (`dX`, `dK`)
 tangent vector alongside the trajectory (via a single-perturbation
 `ForwardDiff.Dual` embedding evaluated through [`momentum_ode`](@ref) each step,
 avoiding the need for a materialized Jacobian), and combines it with the
@@ -710,6 +724,7 @@ a `ForwardDiff.Dual` and calling [`Imaging.calculate_pixel_intensity`](@ref).
 `traj` must be a pre-allocated `Vector{GeoTypes.OfTrajDual{ForwardDiff.Dual{Nothing,Float64,1}}}`
 sized to `nmaxstep`.
 
+This differs from [`autodiff_geo_traj_euler_method_grmhd!`](@ref) in that it does autodiff through the ODE solver, instead of integrating the sensitivities ODE.
 # Returns
 - A tuple `(I, dI_dθo)`.
 """

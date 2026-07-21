@@ -229,14 +229,6 @@ function approximate_solve(Ii, ji, ki, jf, kf, dl)
         If = Ii * efac + (javg / kavg) * (1.0 - efac)
     end
 
-    if isnan(If) || isinf(If)
-        @error "Invalid intensity computed" If
-        println("Ii = $Ii, ji = $ji, ki = $ki, jf = $jf, kf = $kf, dl = $dl")
-        println("dtau = $dtau, javg = $javg, kavg = $kavg")
-        println("efac = $(exp(-dtau))")
-        error("Invalid intensity computed: $If")
-    end
-
     return If
 end
 

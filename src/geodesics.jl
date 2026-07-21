@@ -20,7 +20,7 @@ using ..Metrics
 using ..Tetrads
 using ..DebugFunctions
 
-export init_XK!, get_pixel, CalculateGeodesics, Models_and_MKS_connection_analytic,
+export init_XK!, init_Kcon, get_pixel, CalculateGeodesics, Models_and_MKS_connection_analytic,
     FMKS_connection_analytic, get_connection_analytic, get_connection_analytic!,
     compute_dKcon, push_photon, push_photon!, get_connection, stepsize,
     stop_backward_integration, trace_geodesic
@@ -43,17 +43,16 @@ from camera pixel `(i, j)`.
 - `xoff`, `yoff`: Image plane offsets.
 """
 function init_XK!(X::AbstractVector{T}, Kcon::AbstractVector{T}, i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
-    Econ = MMatrix{4,4,T}(undef)
-    Ecov = MMatrix{4,4,T}(undef)
-    Kcon_tetrad = MVector{4,T}(undef)
-
     _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
     dxoff::Float64 = (i + 0.5 + xoff - 0.01) / nx - 0.5
     dyoff::Float64 = (j + 0.5 + yoff) / ny - 0.5
-    Kcon_tetrad[1] = zero(T)
-    Kcon_tetrad[2] = (dxoff * cos(zero(T)) - dyoff * sin(zero(T))) * fovx
-    Kcon_tetrad[3] = (dxoff * sin(zero(T)) + dyoff * cos(zero(T))) * fovy
-    Kcon_tetrad[4] = one(T)
+
+    Kcon_tetrad = SVector{4,T}(
+        zero(T),
+        (dxoff * cos(zero(T)) - dyoff * sin(zero(T))) * fovx,
+        (dxoff * sin(zero(T)) + dyoff * cos(zero(T))) * fovy,
+        one(T)
+    )
 
     Kcon_tetrad = Tetrads.null_normalize(Kcon_tetrad, one(T))
 
@@ -62,6 +61,42 @@ function init_XK!(X::AbstractVector{T}, Kcon::AbstractVector{T}, i::Int, j::Int,
     @inbounds for mu in 1:Constants.NDIM
         X[mu] = Xcam[mu]
     end
+end
+
+"""
+    init_Kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
+
+Non-mutating, GPU-safe variant of [`init_XK!`](@ref) that returns the
+initial photon 4-momentum directly. The initial position is always
+`Xcam`, so no position output is needed.
+
+# Arguments
+- `i`, `j`: Pixel indices in the image plane.
+- `Xcam`: Camera position in internal coordinates.
+- `nx`, `ny`: Image resolution.
+- `fovx`, `fovy`: Field of view, in radians.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters.
+- `xoff`, `yoff`: Image plane offsets.
+
+# Returns
+- The initial photon 4-momentum.
+"""
+function init_Kcon(i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
+    _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
+    dxoff::Float64 = (i + 0.5 + xoff - 0.01) / nx - 0.5
+    dyoff::Float64 = (j + 0.5 + yoff) / ny - 0.5
+
+    Kcon_tetrad = SVector{4,T}(
+        zero(T),
+        (dxoff * cos(zero(T)) - dyoff * sin(zero(T))) * fovx,
+        (dxoff * sin(zero(T)) + dyoff * cos(zero(T))) * fovy,
+        one(T)
+    )
+
+    Kcon_tetrad = Tetrads.null_normalize(Kcon_tetrad, one(T))
+
+    return Tetrads.tetrad_to_coordinate(Econ, Kcon_tetrad)
 end
 
 """
@@ -500,10 +535,8 @@ MKS or FMKS formula based on `model.metric`.
 @inline function get_connection_analytic(X::AbstractVector{T}, bhspin, model) where {T}
     if model.metric == Metrics.METRIC_MKS
         return Models_and_MKS_connection_analytic(X, bhspin, model)
-    elseif model.metric == Metrics.METRIC_FMKS
-        return FMKS_connection_analytic(X, bhspin, model)
     else
-        error("Unknown METRIC type for connection coefficients: $(model.metric)")
+        return FMKS_connection_analytic(X, bhspin, model)
     end
 end
 
@@ -522,10 +555,8 @@ into `lconn`.
 @inline function get_connection_analytic!(X::AbstractVector{T}, lconn, bhspin, model) where {T}
     if model.metric == Metrics.METRIC_MKS
         lconn .= Models_and_MKS_connection_analytic(X, bhspin, model)
-    elseif model.metric == Metrics.METRIC_FMKS
-        lconn .= FMKS_connection_analytic(X, bhspin, model)
     else
-        error("Unknown METRIC type for connection coefficients: $(model.metric)")
+        lconn .= FMKS_connection_analytic(X, bhspin, model)
     end
 end
 
@@ -714,20 +745,24 @@ Compute the adaptive step size for the geodesic integration.
 # Returns
 - The step size `dl`.
 """
-function stepsize(X, Kcon, cstartx::MVector{4,Float64}, cstopx::MVector{4,Float64}, eps_ipole::Float64=0.01)
-    deh::Float64 = min(abs(X[2] - cstartx[2]), 0.1)
-    dlx2 = eps_ipole * (10 * deh) / (abs(Kcon[2]) + Constants.SMALL * Constants.SMALL)
-    cut::Float64 = 0.02
-    lx3::Float64 = cstopx[3] - cstartx[3]
-    dpole::Float64 = min(abs(X[3] / lx3), abs((cstopx[3] - X[3]) / lx3))
-    d2fac::Float64 = (dpole < cut) ? dpole / 3 : min(cut / 3 + (dpole - cut) * 10.0, 1)
-    dlx3 = eps_ipole * d2fac / (abs(Kcon[3]) + Constants.SMALL * Constants.SMALL)
-
+function stepsize(X, Kcon, cstartx, cstopx, eps_ipole::Float64=0.01)
+ 
+    if (true)
+        deh::Float64 = min(abs(X[2] - cstartx[2]), 0.1)
+        dlx2 = eps_ipole * (10 * deh) / (abs(Kcon[2]) + Constants.SMALL * Constants.SMALL)
+        cut::Float64 = 0.02
+        lx3::Float64 = cstopx[3] - cstartx[3]
+        dpole::Float64 = min(abs(X[3] / lx3), abs((cstopx[3] - X[3]) / lx3))
+        d2fac::Float64 = (dpole < cut) ? dpole / 3 : min(cut / 3 + (dpole - cut) * 10.0, 1)
+        dlx3 = eps_ipole * d2fac / (abs(Kcon[3]) + Constants.SMALL * Constants.SMALL)
+    else
+        dlx2 = eps_ipole / (abs(Kcon[2]) + Constants.SMALL*Constants.SMALL)
+        dlx3 = eps_ipole * min(X[3], 1. - X[3]) / (abs(Kcon[3]) + Constants.SMALL*Constants.SMALL)
+    end
     dlx4 = eps_ipole / (abs(Kcon[4]) + Constants.SMALL * Constants.SMALL)
-    idlx2 = 1.0 / (abs(dlx2) + Constants.SMALL * Constants.SMALL)
-    idlx3 = 1.0 / (abs(dlx3) + Constants.SMALL * Constants.SMALL)
-    idlx4 = 1.0 / (abs(dlx4) + Constants.SMALL * Constants.SMALL)
-
+    idlx2 = 1.0 / (abs(dlx2) + Constants.SMALL*Constants.SMALL)
+    idlx3 = 1.0 / (abs(dlx3) + Constants.SMALL*Constants.SMALL)
+    idlx4 = 1.0 / (abs(dlx4) + Constants.SMALL*Constants.SMALL)
     return 1.0 / (idlx2 + idlx3 + idlx4)
 end
 

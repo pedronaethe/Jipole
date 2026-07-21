@@ -41,7 +41,6 @@ function gdet_func(gcov)
     U = F.U
 
     if any(abs(U[i, i]) < 1e-14 for i in 1:size(U, 1))
-        @warn "Singular matrix in gdet_func!"
         return -1.0
     end
 
@@ -141,60 +140,43 @@ stays differentiable when called on the autodiff path.
 function gcov_func(X, bhspin, model, R0::Float64=0.0)
     r, th = Coordinates.bl_coord(X, model, R0)
     T = promote_type(typeof(r), typeof(th), typeof(bhspin))
-    gcov = @MMatrix zeros(T, 4, 4)
-
-    fill!(gcov, 0.0)
 
     if model.metric == METRIC_MINKOWSKI
-        gcov[1, 1] = -1.0
-        gcov[2, 2] = 1.0
-        gcov[3, 3] = r * r
-        gcov[4, 4] = r * r * sin(th)^2
-        return gcov
+        return SMatrix{4,4,T}(
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, r * r, 0.0,
+            0.0, 0.0, 0.0, r * r * sin(th)^2
+        )
     elseif model.metric == METRIC_EMINKOWSKI
-        gcov[1, 1] = -1.0
-        gcov[2, 2] = r * r
-        gcov[3, 3] = r * r
-        gcov[4, 4] = r * r * sin(th)^2
-        return gcov
+        return SMatrix{4,4,T}(
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, r * r, 0.0, 0.0,
+            0.0, 0.0, r * r, 0.0,
+            0.0, 0.0, 0.0, r * r * sin(th)^2
+        )
     end
-
-    Gcov_ks = @MMatrix zeros(T, 4, 4)
 
     cth = cos(th)
     sth = sin(th)
     s2 = sth^2
     rho2 = r^2 + bhspin^2 * cth^2
 
-    Gcov_ks[1, 1] = -1.0 + 2.0 * r / rho2
-    Gcov_ks[1, 2] = 2.0 * r / rho2
-    Gcov_ks[1, 4] = -2.0 * bhspin * r * s2 / rho2
+    term1 = 1.0 + 2.0 * r / rho2
+    term2 = 2.0 * r / rho2
+    term3 = -2.0 * bhspin * r * s2 / rho2
+    term4 = -bhspin * s2 * term1
 
-    Gcov_ks[2, 1] = Gcov_ks[1, 2]
-    Gcov_ks[2, 2] = 1.0 + 2.0 * r / rho2
-    Gcov_ks[2, 4] = -bhspin * s2 * (1.0 + 2.0 * r / rho2)
-
-    Gcov_ks[3, 3] = rho2
-
-    Gcov_ks[4, 1] = Gcov_ks[1, 4]
-    Gcov_ks[4, 2] = Gcov_ks[2, 4]
-    Gcov_ks[4, 4] = s2 * (rho2 + bhspin^2 * s2 * (1.0 + 2.0 * r / rho2))
+    Gcov_ks = SMatrix{4,4,T}(
+        -1.0 + term2, term2, 0.0, term3,
+        term2, term1, 0.0, term4,
+        0.0, 0.0, rho2, 0.0,
+        term3, term4, 0.0, s2 * (rho2 + bhspin^2 * s2 * term1)
+    )
 
     dxdX = Coordinates.set_dxdX(X, model)
 
-    fill!(gcov, 0.0)
-    for mu in 1:4
-        for nu in 1:4
-            sum_val = 0.0
-            for lam in 1:4
-                for kap in 1:4
-                    sum_val += Gcov_ks[lam, kap] * dxdX[lam, mu] * dxdX[kap, nu]
-                end
-            end
-            gcov[mu, nu] = sum_val
-        end
-    end
-    return gcov
+    return transpose(dxdX) * Gcov_ks * dxdX
 end
 
 """
@@ -243,12 +225,6 @@ In-place version of [`gcon_func`](@ref), writing the result into `gcon`.
 """
 function gcon_func!(gcov, gcon)
     gcon .= inv(gcov)
-    if any(isnan.(gcon)) || any(isinf.(gcon))
-        @error "Singular gcov encountered in gcon"
-        DebugFunctions.print_matrix("gcov", gcov)
-        DebugFunctions.print_matrix("gcon", gcon)
-        error("Singular gcov encountered, cannot compute gcon.")
-    end
 end
 
 """
@@ -264,14 +240,7 @@ tensor.
 - The contravariant metric tensor.
 """
 function gcon_func(gcov)
-    gcon = inv(gcov)
-    if any(isnan.(gcon)) || any(isinf.(gcon))
-        @error "Singular gcov encountered in gcon"
-        DebugFunctions.print_matrix("gcov", gcov)
-        DebugFunctions.print_matrix("gcon", gcon)
-        error("Singular gcov encountered, cannot compute gcon.")
-    end
-    return gcon
+    return inv(gcov)
 end
 
 """

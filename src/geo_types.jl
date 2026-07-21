@@ -6,7 +6,7 @@ module GeoTypes
 
 using StaticArrays
 
-export OfTrajM, OfTrajS, OfTraj
+export OfTrajM, OfTrajS, OfTraj, OfTrajGRMHD
 
 """
 Mutable record of a single geodesic step, used while a trajectory is being
@@ -44,6 +44,22 @@ struct OfTraj
     dK_dθo::SVector{4,Float64}
     dX_da::SVector{4,Float64}
     dK_da::SVector{4,Float64}
+end
+
+
+"""
+Immutable record of a single geodesic step, extended with the derivatives
+of position/momentum with respect to observer inclination (`θo`).
+Primarily used for GPU version.
+"""
+struct OfTrajGRMHD
+    dl::Float64
+    X::SVector{4, Float64}
+    Kcon::SVector{4, Float64}
+    Xhalf::SVector{4, Float64}
+    Kconhalf::SVector{4, Float64}
+    dX_dθo::SVector{4, Float64}
+    dK_dθo::SVector{4, Float64}
 end
 
 end

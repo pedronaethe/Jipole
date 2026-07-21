@@ -25,7 +25,6 @@ include("maxwell_juettner.jl")
 include("grid.jl")
 include("radiation.jl")
 include("geodesics.jl")
-
 include("models/analytic.jl")
 include("models/thin_disk.jl")
 include("models/iharm.jl")
@@ -34,5 +33,6 @@ include("imaging.jl")
 include("slowlight.jl")
 include("autodiff.jl")
 include("gradientdescent.jl")
+include("utils_gpu.jl")
 
 end

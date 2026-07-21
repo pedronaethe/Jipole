@@ -4,8 +4,8 @@ Small linear-algebra helpers used when building tetrads.
 module Utils
 
 using StaticArrays
+using LinearAlgebra
 using ..Constants
-using ..Metrics
 
 export set_Econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
 
@@ -23,16 +23,14 @@ unit vector along `defdir`.
 - The resulting tetrad basis vector.
 """
 function set_Econ_from_trial(defdir::Int, trial)
-    Econ = MVector{4,eltype(trial)}(undef)
-    norm = sum(abs.(trial[2:4]))
-    for k in 1:4
-        if norm <= Constants.SMALL
-            Econ[k] = (k == defdir) ? 1.0 : 0.0
-        else
-            Econ[k] = trial[k]
-        end
+    T = eltype(trial)
+    norm = abs(trial[2]) + abs(trial[3]) + abs(trial[4])
+    if norm <= Constants.SMALL
+        return SVector{4,T}(defdir == 1 ? one(T) : zero(T), defdir == 2 ? one(T) : zero(T),
+            defdir == 3 ? one(T) : zero(T), defdir == 4 ? one(T) : zero(T))
+    else
+        return SVector{4,T}(trial[1], trial[2], trial[3], trial[4])
     end
-    return Econ
 end
 
 """
@@ -48,8 +46,6 @@ Rescale `vcon` so that `|v.v| = 1` under the metric `Gcov`.
 - The normalized vector.
 """
 function normalize_vector(vcon, Gcov)
-    vcon_out = copy(vcon)
-
     norm = 0.0
     for k in 1:4
         for l in 1:4
@@ -58,10 +54,8 @@ function normalize_vector(vcon, Gcov)
     end
 
     norm = sqrt(abs(norm))
-    for k in 1:4
-        vcon_out[k] /= norm
-    end
-    return vcon_out
+    T = eltype(vcon)
+    return SVector{4,T}(vcon[1] / norm, vcon[2] / norm, vcon[3] / norm, vcon[4] / norm)
 end
 
 """
@@ -92,11 +86,10 @@ function project_out(vcona, vconb, Gcov)
             adotb += vcona[k] * vconb[l] * Gcov[k, l]
         end
     end
-    vcona_out = copy(vcona)
-    for k in 1:4
-        vcona_out[k] -= vconb[k] * adotb / vconb_sq
-    end
-    return vcona_out
+    fac = adotb / vconb_sq
+    T = eltype(vcona)
+    return SVector{4,T}(vcona[1] - vconb[1] * fac, vcona[2] - vconb[2] * fac,
+        vcona[3] - vconb[3] * fac, vcona[4] - vconb[4] * fac)
 end
 
 """
@@ -130,16 +123,14 @@ Check the handedness of a tetrad basis.
   `-1` for a left-handed one.
 """
 function check_handedness(Econ, Gcov)
-    g = Metrics.gdet_func(Gcov)
-    if g < 0.0
-        @warn "Encountered singular gcov checking handedness!"
-        return (1, 0.0)
+    T = eltype(Econ)
+    g = det(Gcov)
+    if abs(g) < 1e-14
+        return (1, zero(T))
     end
-    dot_var = zero(eltype(Econ))
-    for i in 1:4, j in 1:4, l in 1:4, k in 1:4
-        dot_var += g * levi_civita(i - 1, j - 1, k - 1, l - 1) * Econ[1, i] * Econ[2, j] * Econ[3, k] * Econ[4, l]
-    end
+    g = sqrt(abs(g))
 
+    dot_var = g * det(Econ)
     return (0, dot_var)
 end
 

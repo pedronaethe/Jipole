@@ -4,7 +4,7 @@ electron distribution).
 """
 module MaxwellJuettner
 
-using SpecialFunctions
+using Bessels
 using ..Constants
 
 export get_nu_c, I_I, maxwell_juettner_dexter_I, maxwell_juettner_leung_I, maxwell_juettner_I
@@ -95,9 +95,6 @@ function maxwell_juettner_leung_I(Ne, ν, θe, B, θ)
     f = (x^(1.0 / 2.0) + 2.0^(11.0 / 12.0) * x^(1.0 / 6.0))^2
     j = (sqrt(2.0) * π * Constants.EE^2 * Ne * nus / (3.0 * Constants.CL * K2)) * f * exp(-x^(1.0 / 3.0))
 
-    if isnan(j) || isinf(j)
-        println("j nan in Leung fit: j $j f $f x $x nu $ν nus $nus nuc $nuc K2 $K2 Thetae $θe")
-    end
     return j
 end
 

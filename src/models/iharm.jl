@@ -8,6 +8,7 @@ using HDF5
 using Printf
 using StaticArrays
 using ForwardDiff
+using Adapt
 using ..Constants
 using ..AbstractModels
 using ..Coordinates
@@ -17,7 +18,7 @@ using ..Grid
 using ..Radiation
 using ..MaxwellJuettner
 
-export IharmParams, IharmData, read_header, load_data
+export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data
 
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
@@ -29,32 +30,111 @@ const USE_MIXED_TPTE = true
 A single GRMHD simulation snapshot: fluid primitives on the simulation
 grid, plus the derived electron/magnetic-field quantities used by the
 radiative transfer.
+
+Parametric over the array type `A` (`Array{Float64,3}` on the CPU,
+`CuArray{Float64,3}` on the GPU via [`Utils_GPU.copy_iharm_to_gpu`](@ref))
+so the same struct and the functions that consume it work unchanged in
+both contexts.
 """
-struct IharmData
+struct IharmData{A<:AbstractArray{Float64,3}}
     t::Float64
-    RHO::Array{Float64,3}
-    UU::Array{Float64,3}
-    U1::Array{Float64,3}
-    U2::Array{Float64,3}
-    U3::Array{Float64,3}
-    B1::Array{Float64,3}
-    B2::Array{Float64,3}
-    B3::Array{Float64,3}
-    ne::Array{Float64,3}
-    b::Array{Float64,3}
-    θe::Array{Float64,3}
-    sigma::Array{Float64,3}
-    beta::Array{Float64,3}
-    dθedRhi::Array{Float64,3}
+    RHO::A
+    UU::A
+    U1::A
+    U2::A
+    U3::A
+    B1::A
+    B2::A
+    B3::A
+    ne::A
+    b::A
+    θe::A
+    sigma::A
+    beta::A
+    dθedRhi::A
 end
 
-"""
-Parameters for the [`Iharm`](@ref) GRMHD emission model.
+Adapt.@adapt_structure IharmData
 
-Populated from a dump file's header via [`read_header`](@ref); most
-fields mirror `ipole`'s C `Params`/`Grid` globals.
 """
-mutable struct IharmParams <: AbstractModel
+Parameters for the [`Iharm`](@ref) GRMHD emission model, immutable and
+GPU-safe (`SVector` fields, no heap-allocated members) so it can be used
+directly both by the CPU raytracer and as a CUDA kernel argument.
+
+Built once by [`read_header`](@ref) from an [`IharmParamsBuilder`](@ref).
+"""
+struct IharmParams <: AbstractModel
+    metric::Int
+    ELECTRONS::Int
+    RADIATION::Int
+
+    gam::Float64
+    game::Float64
+    gamp::Float64
+    Te_unit::Float64
+    Thetae_unit::Float64
+
+    mu_i::Float64
+    mu_e::Float64
+    mu_tot::Float64
+    Ne_factor::Float64
+
+    M_unit::Float64
+    T_unit::Float64
+    L_unit::Float64
+    MBH::Float64
+    tp_over_te::Float64
+
+    RHO_unit::Float64
+    U_unit::Float64
+    B_unit::Float64
+
+    a::Float64
+    hslope::Float64
+    Rin::Float64
+    Rout::Float64
+    poly_xt::Float64
+    poly_alpha::Float64
+    mks_smooth::Float64
+    poly_norm::Float64
+
+    mks3R0::Float64
+    mks3H0::Float64
+    mks3MY1::Float64
+    mks3MY2::Float64
+    mks3MP0::Float64
+
+    N1::Int
+    N2::Int
+    N3::Int
+
+    dx::SVector{4,Float64}
+    startx::SVector{4,Float64}
+    stopx::SVector{4,Float64}
+    cstartx::SVector{4,Float64}
+    cstopx::SVector{4,Float64}
+
+    rmin_geo::Float64
+    rmax_geo::Float64
+
+    th_beg::Float64
+    trat_small::Float64
+    beta_crit::Float64
+    sigma_cut::Float64
+    sigma_cut_high::Float64
+
+    slow_light::Bool
+end
+
+
+"""
+Mutable, `MVector`-based scratch struct used only while
+[`read_header`](@ref) is incrementally parsing a dump file's header
+(most fields mirror `ipole`'s C `Params`/`Grid` globals). Once parsing is
+complete, `read_header` converts it to the immutable, GPU-safe
+[`IharmParams`](@ref) that the rest of the codebase uses.
+"""
+mutable struct IharmParamsBuilder <: AbstractModel
     metric::Int
     ELECTRONS::Int
     RADIATION::Int
@@ -116,13 +196,13 @@ mutable struct IharmParams <: AbstractModel
 end
 
 """
-    IharmParams()
+    IharmParamsBuilder()
 
-Default-constructed [`IharmParams`](@ref), used internally by
+Default-constructed [`IharmParamsBuilder`](@ref), used internally by
 [`read_header`](@ref) before the dump file's header is parsed into it.
 """
-function IharmParams()
-    return IharmParams(0, 0, 0,
+function IharmParamsBuilder()
+    return IharmParamsBuilder(0, 0, 0,
         5 / 3, 4 / 3, 5 / 3, 1.0, 1.0,
         1.0, 1.0, 1.0, 1.0,
         1.0, 1.0, 1.0, 1.0, 3.0,
@@ -139,6 +219,19 @@ function IharmParams()
         1.0, 100.0,
         1.74e-2, 1.0, 1.0, 1.0, -1.0, false)
 end
+
+"""
+    IharmParams(p::IharmParamsBuilder)
+
+Convert the mutable [`IharmParamsBuilder`](@ref) used during header
+parsing into the immutable, GPU-safe [`IharmParams`](@ref) used
+everywhere else.
+"""
+IharmParams(p::IharmParamsBuilder) = IharmParams(p.metric, p.ELECTRONS, p.RADIATION, p.gam, p.game, p.gamp, p.Te_unit, p.Thetae_unit, p.mu_i, p.mu_e, p.mu_tot, p.Ne_factor,
+p.M_unit, p.T_unit, p.L_unit, p.MBH, p.tp_over_te, p.RHO_unit, p.U_unit, p.B_unit, p.a, p.hslope, p.Rin, p.Rout, p.poly_xt, p.poly_alpha, p.mks_smooth, p.poly_norm, p.mks3R0,
+p.mks3H0, p.mks3MY1, p.mks3MY2, p.mks3MP0,p.N1,p.N2,p.N3,SVector(p.dx),SVector(p.startx),SVector(p.stopx),SVector(p.cstartx),SVector(p.cstopx),p.rmin_geo,p.rmax_geo,p.th_beg,
+p.trat_small,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light)
+
 
 """
     read_header(filename, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
@@ -169,7 +262,7 @@ the black hole mass `MBH` and `M_unit`.
 function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
     println("Initializing grid from: $filename")
 
-    params = IharmParams()
+    params = IharmParamsBuilder()
     params.th_beg = th_beg
     params.trat_small = trat_small
     params.beta_crit = beta_crit
@@ -366,7 +459,7 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta
     params.U_unit = params.RHO_unit * Constants.CL^2
     params.B_unit = Constants.CL * sqrt(4 * π * params.RHO_unit)
 
-    return params
+    return IharmParams(params)
 end
 
 function _read_single_primitive(file_handle, prim_name::String)
@@ -567,31 +660,54 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large
     end
 end
 
+"""
+    set_tinterp_ns(X, model, data)
+
+Select the two GRMHD snapshots used for time interpolation, along with
+the per-position time-interpolation factor. Returns `(dataA, dataB,
+tinterp)` — the snapshots themselves, rather than their indices into
+`data`.
+
+On the CPU, `data` is a `Vector` and this dispatches to the generic
+method below, branching on `model.slow_light` at runtime exactly as
+before. On the GPU, `data` is a `Tuple` of one (non-slow-light) or three
+(slow-light) snapshots; indexing a `Tuple` with a runtime-computed index
+isn't GPU-compilable (even inside a branch that's never actually taken,
+since `model.slow_light` is a runtime field, not a compile-time
+constant, so the compiler can't prove that branch dead and skip
+compiling it) — so the `Tuple`-specific methods below select on the
+tuple's length instead, which is resolved at compile time.
+"""
 function set_tinterp_ns(X, model::IharmParams, data)
     if model.slow_light
-        nA = 0
-        nB = 0
-        if X[1] < data[2].t
-            nA = 1
-            nB = 2
-        else
-            nA = 2
-            nB = 3
-        end
-        tinterp = 1.0 - (X[1] - data[nA].t) / (data[nB].t - data[nA].t)
-        return nA, nB, tinterp
+        nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
+        dataA, dataB = data[nA], data[nB]
+        tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
+        return dataA, dataB, tinterp
     else
-        return 1, 1, 0.0
+        return data[1], data[1], 0.0
     end
+end
+
+@inline set_tinterp_ns(X, model::IharmParams, data::Tuple{T}) where {T} = (data[1], data[1], 0.0)
+
+@inline function set_tinterp_ns(X, model::IharmParams, data::NTuple{3,T}) where {T}
+    if X[1] < data[2].t
+        dataA, dataB = data[1], data[2]
+    else
+        dataA, dataB = data[2], data[3]
+    end
+    tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
+    return dataA, dataB, tinterp
 end
 
 function get_model_sigma(X, model::IharmParams, data)
     if Grid.X_in_domain(X, model) == 0
         return 0.0
     end
-    nA, nB, tfac = set_tinterp_ns(X, model, data)
+    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
 
-    return Grid.interp_scalar_time(X, data[nA].sigma, data[nB].sigma, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(X, dataA.sigma, dataB.sigma, tfac, model.slow_light, model)
 end
 
 function get_sigma_smoothfac(sigma, model::IharmParams)
@@ -622,36 +738,36 @@ function get_model_ne(X, model::IharmParams, data)
         end
         sigma_smoothfac = get_sigma_smoothfac(sigma, model)
     end
-    nA, nB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, data[nA].ne, data[nB].ne, tfac, model.slow_light, model) * sigma_smoothfac
+    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(X, dataA.ne, dataB.ne, tfac, model.slow_light, model) * sigma_smoothfac
 end
 
 function get_model_thetae(X, model::IharmParams, data)
     if Grid.X_in_domain(X, model) == 0
         return 0.0
     end
-    nA, nB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, data[nA].θe, data[nB].θe, tfac, model.slow_light, model)
+    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(X, dataA.θe, dataB.θe, tfac, model.slow_light, model)
 end
 
 function get_model_thetae_deriv(X, model::IharmParams, data)
     if Grid.X_in_domain(X, model) == 0
         return 0.0
     end
-    nA, nB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, data[nA].dθedRhi, data[nB].dθedRhi, tfac, model.slow_light, model)
+    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(X, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light, model)
 end
 
 function get_model_b(X, model::IharmParams, data)
     if Grid.X_in_domain(X, model) == 0
         return 0.0
     end
-    nA, nB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, data[nA].b, data[nB].b, tfac, model.slow_light, model)
+    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(X, dataA.b, dataB.b, tfac, model.slow_light, model)
 end
 
 """
-    get_model_fourv!(Ucon, Ucov, Bcon, Bcov, X, Kcon, bhspin, model, data)
+    get_model_fourv(X, Kcon, bhspin, model, data)
 
 Compute the fluid 4-velocity and magnetic field 4-vector at `X`,
 interpolated from the GRMHD snapshot(s) in `data`.
@@ -660,74 +776,72 @@ interpolated from the GRMHD snapshot(s) in `data`.
 with the rest of the differentiable call path.
 
 # Arguments
-- `Ucon`, `Ucov`, `Bcon`, `Bcov`: Output vectors, overwritten in place.
 - `X`: Position four-vector in internal coordinates.
 - `Kcon`: Contravariant photon 4-momentum (unused; kept for interface
   symmetry with the other models' four-velocity functions).
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Iharm model parameters.
 - `data`: GRMHD snapshot(s).
+
+# Returns
+- A tuple `(Ucon, Ucov, Bcon, Bcov)`.
 """
-@inline function get_model_fourv!(Ucon, Ucov, Bcon, Bcov, X, Kcon, bhspin, model::IharmParams, data)
+@inline function get_model_fourv(X, Kcon, bhspin, model::IharmParams, data)
+    elT = eltype(X)
     gcov = Metrics.gcov_func(X, bhspin, model)
     gcon = Metrics.gcon_func(gcov)
 
     if Grid.X_in_domain(X, model) == 0
-        Ucov[1] = -1.0 / sqrt(-gcon[1, 1])
-        Ucov[2] = 0.0
-        Ucov[3] = 0.0
-        Ucov[4] = 0.0
-        Ucon[1] = 0.0
-        Ucon[2] = 0.0
-        Ucon[3] = 0.0
-        Ucon[4] = 0.0
+        Ucov1 = -one(elT) / sqrt(-gcon[1, 1])
 
-        for μ in 1:Constants.NDIM
-            Ucon[1] += Ucov[μ] * gcon[1, μ]
-            Ucon[2] += Ucov[μ] * gcon[2, μ]
-            Ucon[3] += Ucov[μ] * gcon[3, μ]
-            Ucon[4] += Ucov[μ] * gcon[4, μ]
-            Bcon[μ] = 0.0
-            Bcov[μ] = 0.0
-        end
-        return
+        Ucon1 = Ucov1 * gcon[1, 1]
+        Ucon2 = Ucov1 * gcon[2, 1]
+        Ucon3 = Ucov1 * gcon[3, 1]
+        Ucon4 = Ucov1 * gcon[4, 1]
+
+        Ucon = SVector{4,elT}(Ucon1, Ucon2, Ucon3, Ucon4)
+        Ucov = SVector{4,elT}(Ucov1, zero(elT), zero(elT), zero(elT))
+        zero_vec = SVector{4,elT}(0.0, 0.0, 0.0, 0.0)
+
+        return Ucon, Ucov, zero_vec, zero_vec
     end
-    Vcon = similar(X)
-    nA, nB, tfac = set_tinterp_ns(X, model, data)
-    Vcon[2] = Grid.interp_scalar_time(X, data[nA].U1, data[nB].U1, tfac, model.slow_light, model)
-    Vcon[3] = Grid.interp_scalar_time(X, data[nA].U2, data[nB].U2, tfac, model.slow_light, model)
-    Vcon[4] = Grid.interp_scalar_time(X, data[nA].U3, data[nB].U3, tfac, model.slow_light, model)
 
-    VdotV = 0.0
+    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
+    Vcon2 = Grid.interp_scalar_time(X, dataA.U1, dataB.U1, tfac, model.slow_light, model)
+    Vcon3 = Grid.interp_scalar_time(X, dataA.U2, dataB.U2, tfac, model.slow_light, model)
+    Vcon4 = Grid.interp_scalar_time(X, dataA.U3, dataB.U3, tfac, model.slow_light, model)
+    Vcon = SVector{4,elT}(0.0, Vcon2, Vcon3, Vcon4)
+
+    VdotV = zero(elT)
     for μ in 2:Constants.NDIM
         for ν in 2:Constants.NDIM
             VdotV += gcov[μ, ν] * Vcon[μ] * Vcon[ν]
         end
     end
 
-    Vfac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(VdotV)))
-    Ucon[1] = -Vfac * gcon[1, 1]
-    for μ in 2:Constants.NDIM
-        Ucon[μ] = Vcon[μ] - Vfac * gcon[1, μ]
-    end
+    Vfac = sqrt(-one(elT) / gcon[1, 1] * (one(elT) + abs(VdotV)))
 
-    Ucov_local = Coordinates.flip_index(Ucon, gcov)
+    Ucon1 = -Vfac * gcon[1, 1]
+    Ucon2 = Vcon[2] - Vfac * gcon[1, 2]
+    Ucon3 = Vcon[3] - Vfac * gcon[1, 3]
+    Ucon4 = Vcon[4] - Vfac * gcon[1, 4]
+    Ucon = SVector{4,elT}(Ucon1, Ucon2, Ucon3, Ucon4)
 
-    Bcon1 = Grid.interp_scalar_time(X, data[nA].B1, data[nB].B1, tfac, model.slow_light, model)
-    Bcon2 = Grid.interp_scalar_time(X, data[nA].B2, data[nB].B2, tfac, model.slow_light, model)
-    Bcon3 = Grid.interp_scalar_time(X, data[nA].B3, data[nB].B3, tfac, model.slow_light, model)
+    Ucov = Coordinates.flip_index(Ucon, gcov)
 
-    Bcon[1] = (Ucov_local[2] * Bcon1 + Ucov_local[3] * Bcon2 + Ucov_local[4] * Bcon3)
-    Bcon[2] = (Bcon1 + Ucon[2] * Bcon[1]) / Ucon[1]
-    Bcon[3] = (Bcon2 + Ucon[3] * Bcon[1]) / Ucon[1]
-    Bcon[4] = (Bcon3 + Ucon[4] * Bcon[1]) / Ucon[1]
+    Bcon1_interp = Grid.interp_scalar_time(X, dataA.B1, dataB.B1, tfac, model.slow_light, model)
+    Bcon2_interp = Grid.interp_scalar_time(X, dataA.B2, dataB.B2, tfac, model.slow_light, model)
+    Bcon3_interp = Grid.interp_scalar_time(X, dataA.B3, dataB.B3, tfac, model.slow_light, model)
 
-    Bcov_local = Coordinates.flip_index(Bcon, gcov)
+    Bcon1 = (Ucov[2] * Bcon1_interp + Ucov[3] * Bcon2_interp + Ucov[4] * Bcon3_interp)
+    Bcon2 = (Bcon1_interp + Ucon[2] * Bcon1) / Ucon[1]
+    Bcon3 = (Bcon2_interp + Ucon[3] * Bcon1) / Ucon[1]
+    Bcon4 = (Bcon3_interp + Ucon[4] * Bcon1) / Ucon[1]
+    Bcon = SVector{4,elT}(Bcon1, Bcon2, Bcon3, Bcon4)
 
-    for μ in 1:Constants.NDIM
-        Ucov[μ] = Ucov_local[μ]
-        Bcov[μ] = Bcov_local[μ]
-    end
+    Bcov = Coordinates.flip_index(Bcon, gcov)
+
+    return Ucon, Ucov, Bcon, Bcov
 end
 
 """
@@ -758,19 +872,14 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
 
     elT = promote_type(eltype(X), typeof(bhspin))
 
-    Ucon = MVector{4,elT}(undef)
-    Ucov = MVector{4,elT}(undef)
-    Bcon = MVector{4,elT}(undef)
-    Bcov = MVector{4,elT}(undef)
-
-    get_model_fourv!(Ucon, Ucov, Bcon, Bcov, X, Kcon, bhspin, model, data)
+    Ucon, Ucov, Bcon, Bcov = get_model_fourv(X, Kcon, bhspin, model, data)
     nu = Radiation.get_fluid_nu(Kcon, Ucov)
     nusq = nu * nu
     θ = Radiation.get_bk_angle(Kcon, Ucov, Bcon, Bcov)
     b = get_model_b(X, model, data)
 
     θe = get_model_thetae(X, model, data)
-    if θ <= 0.0 || θ >= π
+    if θ <= zero(elT) || θ >= elT(π)
         return (z_base, z_base, z_base, z_base)
     end
 
@@ -836,10 +945,8 @@ function Coordinates.bl_coord(X, model::IharmParams, R0::Float64=0.0)
         y = 2 * X[3] - 1.0
         thJ = model.poly_norm * y * (1.0 + ((y / model.poly_xt)^model.poly_alpha) / (model.poly_alpha + 1.0)) + 0.5 * π
         th = thG + exp(model.mks_smooth * (model.startx[2] - X[2])) * (thJ - thG)
-    elseif model.metric == Metrics.METRIC_MKS
-        th = π * X[3] + ((1.0 - model.hslope) / 2.0) * sin(2.0 * π * X[3])
     else
-        error("Unknown METRIC type: $(model.metric)")
+        th = π * X[3] + ((1.0 - model.hslope) / 2.0) * sin(2.0 * π * X[3])
     end
     return r, th
 end
@@ -857,10 +964,8 @@ Base.@inline function Coordinates.bl_coord!(rt, X, model::IharmParams, R0::Float
         y = 2 * X[3] - 1.0
         thJ = model.poly_norm * y * (1.0 + ((y / model.poly_xt)^model.poly_alpha) / (model.poly_alpha + 1.0)) + 0.5 * π
         rt[2] = thG + exp(model.mks_smooth * (model.startx[2] - X[2])) * (thJ - thG)
-    elseif model.metric == Metrics.METRIC_MKS
-        rt[2] = π * X[3] + ((1.0 - model.hslope) / 2.0) * sin(2.0 * π * X[3])
     else
-        error("Unknown METRIC type: $(model.metric)")
+        rt[2] = π * X[3] + ((1.0 - model.hslope) / 2.0) * sin(2.0 * π * X[3])
     end
 end
 
@@ -872,29 +977,26 @@ Compute the Jacobian matrix `dx/dX`, using the FMKS/MKS polar mapping.
 function Coordinates.set_dxdX(X, model::IharmParams)
     T = eltype(X)
 
-    dxdX = zeros(MMatrix{4,4,T})
-
-    dxdX[1, 1] = one(T)
-    dxdX[4, 4] = one(T)
-
-    dxdX[2, 2] = exp(X[2])
+    m22 = exp(X[2])
+    m32 = zero(T)
 
     if model.metric == Metrics.METRIC_MKS
-        dxdX[3, 3] = T(π) + (1 - model.hslope) * T(π) * cos(2 * T(π) * X[3])
-    elseif model.metric == Metrics.METRIC_FMKS
-        dxdX[3, 2] = -exp(model.mks_smooth * (model.startx[2] - X[2])) * model.mks_smooth * (π / 2 - π * X[3] + model.poly_norm * (2 * X[3] - 1) * (1 + ((-1 + 2 * X[3]) / model.poly_xt)^model.poly_alpha / (1 + model.poly_alpha)) - 0.5 * (1 - model.hslope) * sin(2 * π * X[3]))
-        dxdX[3, 3] = π + (1 - model.hslope) * π * cos(2 * π * X[3]) + exp(model.mks_smooth * (model.startx[2] - X[2])) * (-π + 2 * model.poly_norm * (1 + ((2 * X[3] - 1) / model.poly_xt)^model.poly_alpha / (model.poly_alpha + 1)) + (2 * model.poly_alpha * model.poly_norm * (2 * X[3] - 1) * ((2 * X[3] - 1) / model.poly_xt)^(model.poly_alpha - 1)) / ((1 + model.poly_alpha) * model.poly_xt) - (1 - model.hslope) * π * cos(2 * π * X[3]))
+        m33 = T(π) + (1 - model.hslope) * T(π) * cos(2 * T(π) * X[3])
     else
-        error("Unknown METRIC type: $(model.metric)")
+        m32 = -exp(model.mks_smooth * (model.startx[2] - X[2])) * model.mks_smooth * (π / 2 - π * X[3] + model.poly_norm * (2 * X[3] - 1) * (1 + ((-1 + 2 * X[3]) / model.poly_xt)^model.poly_alpha / (1 + model.poly_alpha)) - 0.5 * (1 - model.hslope) * sin(2 * π * X[3]))
+        m33 = π + (1 - model.hslope) * π * cos(2 * π * X[3]) + exp(model.mks_smooth * (model.startx[2] - X[2])) * (-π + 2 * model.poly_norm * (1 + ((2 * X[3] - 1) / model.poly_xt)^model.poly_alpha / (model.poly_alpha + 1)) + (2 * model.poly_alpha * model.poly_norm * (2 * X[3] - 1) * ((2 * X[3] - 1) / model.poly_xt)^(model.poly_alpha - 1)) / ((1 + model.poly_alpha) * model.poly_xt) - (1 - model.hslope) * π * cos(2 * π * X[3]))
     end
 
-    if dxdX[3, 3] <= 0.0
-        println("Warning! dxdX[3,3] is non-positive: ", dxdX[3, 3])
-        println("X[3] = ", X[3])
-        dxdX[3, 3] = T(1.0e-10)
+    if m33 <= 0.0
+        m33 = T(1.0e-10)
     end
 
-    return SMatrix(dxdX)
+    return SMatrix{4,4,T}(
+        one(T), zero(T), zero(T), zero(T),
+        zero(T), m22, m32, zero(T),
+        zero(T), zero(T), m33, zero(T),
+        zero(T), zero(T), zero(T), one(T)
+    )
 end
 
 """

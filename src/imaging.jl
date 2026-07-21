@@ -4,8 +4,13 @@ image/flux reporting.
 """
 module Imaging
 
+using CUDA
 using Printf
+using StaticArrays
 using ..Constants
+using ..GeoTypes
+using ..Camera
+using ..Geodesics
 using ..Radiation
 
 export IpoleGeoIntensityIntegration, OutputStokesParameters, CalculateScaleFactor
@@ -94,5 +99,111 @@ intensity to a flux density.
 function CalculateScaleFactor(sizex, sizey, pixelsx, pixelsy, SourceD, LengthUnit)
     return (sizex * LengthUnit / pixelsx) * (sizey * LengthUnit / pixelsy) / (SourceD * SourceD) / Constants.JY
 end
+
+
+function raytrace_image_GPU!(
+    d_traj, d_Image,
+    i_offset, j_offset, block_size_x, block_size_y, # New offset parameters
+    ro, θo, phi, bhspin, nx, ny, nmaxstep, 
+    freq, fovx, fovy, Rout, Rstop, data, params
+)
+    local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+
+    i = local_i - 1 + i_offset
+    j = local_j - 1 + j_offset
+
+    if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
+        
+        calculate_image!(
+            d_traj, d_Image, ro, θo, phi, bhspin, nx, ny, nmaxstep,
+            i, j, local_i, local_j, freq, fovx, fovy, Rout, Rstop, params, data
+        )
+    end
+    return nothing
+end
+
+
+function calculate_image!(
+    traj, d_Image, 
+    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, 
+    nx::Int64, ny::Int64, nmaxstep::Int64, 
+    i_global::Int64, j_global::Int64,
+    i_local::Int64, j_local::Int64, # Accept local matrix indices directly
+    freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, params,
+    data::T_data = nothing
+) where {T_data}
+
+    if (i_global >= nx || j_global >= ny)
+        return nothing
+    end
+    Xcam = Camera.camera_position(ro, θo, phi, bhspin, params)
+
+    Kcon0 = Geodesics.init_Kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, params)
+    Kcon = Kcon0 * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
+
+    dl_unit::Float64 = params.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
+    Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
+
+    X = Xcam
+    K = Kcon
+    Xhalf = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
+    Khalf = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
+    zero_vec = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
+    lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
+
+    step::Int64 = 1
+    @inbounds traj[i_local, j_local, step] = OfTrajGRMHD(
+        0.0, X, K, Xhalf, Khalf,
+        zero_vec, zero_vec
+    )
+    while (Geodesics.stop_backward_integration(X, K, Rh, Rstop) == 0 && (step < nmaxstep))
+        @inbounds begin
+            dl = Geodesics.stepsize(X, K, params.cstartx, params.cstopx)
+            scaled_dl = dl * dl_unit
+            X, K, Xhalf, Khalf = Geodesics.push_photon(X, K, -dl, lconn, bhspin, params)
+            step += 1
+            traj[i_local, j_local, step] = OfTrajGRMHD(
+                scaled_dl, X, K, Xhalf, Khalf,
+                zero_vec, zero_vec
+            )
+        end
+    end
+
+    # #Radiative Transfer Integration:
+
+    Intensity = 0.0
+
+    @inbounds Xi_S = traj[i_local, j_local, step].X
+    @inbounds Kconi_S = traj[i_local, j_local, step].Kcon
+
+    ji, ki = Radiation.get_jk(Xi_S, Kconi_S, freq, bhspin, params, data)
+
+    @inbounds for nstep in step:-1:2
+        Xi_S = traj[i_local, j_local, nstep].X
+        Xf_S = traj[i_local, j_local, nstep - 1].X
+        Kconi_S = traj[i_local, j_local, nstep].Kcon
+        Kconf_S = traj[i_local, j_local, nstep - 1].Kcon
+        dl_step = traj[i_local, j_local, nstep].dl
+
+        if !Radiation.radiating_region(Xf_S, params, Rh)
+            continue
+        end
+        jf, kf = Radiation.get_jk(Xf_S, Kconf_S, freq, bhspin, params, data)
+
+        Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, dl_step)
+
+        CUDA.@cuassert !(isnan(Intensity) || isinf(Intensity)) "NaN/Inf Intensity encountered!"
+
+        ji = jf
+        ki = kf
+    end
+
+    @inbounds d_Image[i_global + 1, j_global + 1] = Intensity * (freq^3)
+
+    return nothing
+end
+
+
 
 end

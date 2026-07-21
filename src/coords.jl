@@ -217,21 +217,19 @@ uncompressed exponential-radial mapping used by `Analytic`/`ThinDisk`;
 function set_dxdX(X, model::AbstractModel)
     T = eltype(X)
 
-    dxdX = zeros(MMatrix{4,4,T})
+    m22 = exp(X[2])
+    m33 = T(π)
 
-    dxdX[1, 1] = one(T)
-    dxdX[4, 4] = one(T)
-
-    dxdX[2, 2] = exp(X[2])
-    dxdX[3, 3] = T(π)
-
-    if dxdX[3, 3] <= 0.0
-        println("Warning! dxdX[3,3] is non-positive: ", dxdX[3, 3])
-        println("X[3] = ", X[3])
-        dxdX[3, 3] = T(1.0e-10)
+    if m33 <= 0.0
+        m33 = T(1.0e-10)
     end
 
-    return SMatrix(dxdX)
+    return SMatrix{4,4,T}(
+        one(T), zero(T), zero(T), zero(T),
+        zero(T), m22, zero(T), zero(T),
+        zero(T), zero(T), m33, zero(T),
+        zero(T), zero(T), zero(T), one(T)
+    )
 end
 
 """
@@ -249,7 +247,7 @@ Compute the covariant Kerr-Schild metric tensor at Boyer-Lindquist radius
 - The covariant metric tensor as an `SMatrix`.
 """
 Base.@inline function gcov_ks(r, th, bhspin)
-    gcov = zeros(MMatrix{4,4,Float64})
+    gcov = @MMatrix zeros(Float64, 4, 4)
     cth = cos(th)
     sth = sin(th)
 
@@ -368,13 +366,7 @@ Lower (or raise) the index of a 4-vector using the given metric tensor.
 - The flipped 4-vector.
 """
 function flip_index(vector, metric)
-    flipped_vector = zero(MVector{4,eltype(metric)})
-    for ν in 1:Constants.NDIM
-        for μ in 1:Constants.NDIM
-            flipped_vector[ν] += metric[ν, μ] * vector[μ]
-        end
-    end
-    return flipped_vector
+    return metric * vector
 end
 
 """

@@ -5,7 +5,7 @@ The connection-coefficient dispatch (`get_connection_analytic`) branches
 on `model.metric` directly rather than on the model's type: every model's
 parameters carry a `metric` (metric family) and `hslope` (polar
 compression) field, and the plain-MKS connection formula
-([`Models_and_MKS_connection_analytic`](@ref)) is mathematically exact
+([`models_and_mks_connection_analytic`](@ref)) is mathematically exact
 for `hslope == 1.0`, which is what `Analytic`/`ThinDisk` always use. Only
 `Iharm` ever uses `hslope != 1.0` or the FMKS branch.
 """
@@ -20,13 +20,13 @@ using ..Metrics
 using ..Tetrads
 using ..DebugFunctions
 
-export init_XK!, init_Kcon, get_pixel, CalculateGeodesics, Models_and_MKS_connection_analytic,
-    FMKS_connection_analytic, get_connection_analytic, get_connection_analytic!,
-    compute_dKcon, push_photon, push_photon!, get_connection, stepsize,
+export init_xk!, init_kcon, get_pixel, calculate_geodesics, models_and_mks_connection_analytic,
+    fmks_connection_analytic, get_connection_analytic, get_connection_analytic!,
+    compute_dkcon, push_photon, push_photon!, get_connection, stepsize,
     stop_backward_integration, trace_geodesic
 
 """
-    init_XK!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
+    init_xk!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
 
 Initialize the position and photon 4-momentum for the geodesic launched
 from camera pixel `(i, j)`.
@@ -42,7 +42,7 @@ from camera pixel `(i, j)`.
 - `model`: Model parameters.
 - `xoff`, `yoff`: Image plane offsets.
 """
-function init_XK!(X::AbstractVector{T}, Kcon::AbstractVector{T}, i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
+function init_xk!(X::AbstractVector{T}, Kcon::AbstractVector{T}, i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
     _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
     dxoff::Float64 = (i + 0.5 + xoff - 0.01) / nx - 0.5
     dyoff::Float64 = (j + 0.5 + yoff) / ny - 0.5
@@ -64,9 +64,9 @@ function init_XK!(X::AbstractVector{T}, Kcon::AbstractVector{T}, i::Int, j::Int,
 end
 
 """
-    init_Kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
+    init_kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
 
-Non-mutating, GPU-safe variant of [`init_XK!`](@ref) that returns the
+Non-mutating, GPU-safe variant of [`init_xk!`](@ref) that returns the
 initial photon 4-momentum directly. The initial position is always
 `Xcam`, so no position output is needed.
 
@@ -82,7 +82,7 @@ initial photon 4-momentum directly. The initial position is always
 # Returns
 - The initial photon 4-momentum.
 """
-function init_Kcon(i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
+function init_kcon(i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
     _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
     dxoff::Float64 = (i + 0.5 + xoff - 0.01) / nx - 0.5
     dyoff::Float64 = (j + 0.5 + yoff) / ny - 0.5
@@ -125,7 +125,7 @@ function get_pixel(traj::Vector{OfTrajS}, i::Int, j::Int, Xcam::MVector{4,Float6
     X_mut = MVector{4,Float64}(undef)
     Kcon_mut = MVector{4,Float64}(undef)
 
-    init_XK!(X_mut, Kcon_mut, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff, yoff)
+    init_xk!(X_mut, Kcon_mut, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff, yoff)
 
     X = SVector{4,Float64}(X_mut)
     Kcon = SVector{4,Float64}(Kcon_mut) * freq
@@ -140,7 +140,7 @@ function get_pixel(traj::Vector{OfTrajS}, i::Int, j::Int, Xcam::MVector{4,Float6
 end
 
 """
-    CalculateGeodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
+    calculate_geodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
 
 Trace the geodesics for every pixel of the image plane.
 
@@ -157,7 +157,7 @@ Trace the geodesics for every pixel of the image plane.
 # Returns
 - A matrix of geodesic trajectories, one per pixel.
 """
-function CalculateGeodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
+function calculate_geodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
     trajs = Matrix{Vector{OfTrajS}}(undef, nx, ny)
     freq_unitless = freq_cgs * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
@@ -176,7 +176,7 @@ function CalculateGeodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin
 end
 
 """
-    Models_and_MKS_connection_analytic(X, bhspin, model)
+    models_and_mks_connection_analytic(X, bhspin, model)
 
 Compute the analytic connection coefficients for the plain
 Modified-Kerr-Schild metric (`model.hslope`-compressed polar coordinate).
@@ -192,7 +192,7 @@ mapping.
 # Returns
 - The connection coefficients `Γ^μ_{αβ}`, as an `SArray`.
 """
-@inline function Models_and_MKS_connection_analytic(X::AbstractVector{T}, bhspin, model) where {T}
+@inline function models_and_mks_connection_analytic(X::AbstractVector{T}, bhspin, model) where {T}
     lconn = MArray{Tuple{4,4,4},T,3,64}(undef)
 
     r1 = exp(X[2])
@@ -318,7 +318,7 @@ mapping.
 end
 
 """
-    FMKS_connection_analytic(X, bhspin, model)
+    fmks_connection_analytic(X, bhspin, model)
 
 Compute the analytic connection coefficients for the Funky Modified
 Kerr-Schild (FMKS) metric, as used by `Iharm`.
@@ -333,7 +333,7 @@ Kerr-Schild (FMKS) metric, as used by `Iharm`.
 # Returns
 - The connection coefficients `Γ^μ_{αβ}`, as an `SArray`.
 """
-@inline function FMKS_connection_analytic(X::AbstractVector{T}, bhspin, model) where {T}
+@inline function fmks_connection_analytic(X::AbstractVector{T}, bhspin, model) where {T}
     lconn = MArray{Tuple{4,4,4},T,3,64}(undef)
 
     r1 = exp(X[2])
@@ -534,9 +534,9 @@ MKS or FMKS formula based on `model.metric`.
 """
 @inline function get_connection_analytic(X::AbstractVector{T}, bhspin, model) where {T}
     if model.metric == Metrics.METRIC_MKS
-        return Models_and_MKS_connection_analytic(X, bhspin, model)
+        return models_and_mks_connection_analytic(X, bhspin, model)
     else
-        return FMKS_connection_analytic(X, bhspin, model)
+        return fmks_connection_analytic(X, bhspin, model)
     end
 end
 
@@ -554,14 +554,14 @@ into `lconn`.
 """
 @inline function get_connection_analytic!(X::AbstractVector{T}, lconn, bhspin, model) where {T}
     if model.metric == Metrics.METRIC_MKS
-        lconn .= Models_and_MKS_connection_analytic(X, bhspin, model)
+        lconn .= models_and_mks_connection_analytic(X, bhspin, model)
     else
-        lconn .= FMKS_connection_analytic(X, bhspin, model)
+        lconn .= fmks_connection_analytic(X, bhspin, model)
     end
 end
 
 """
-    compute_dKcon(dl, lconn, Kcon)
+    compute_dkcon(dl, lconn, Kcon)
 
 Compute the change in photon 4-momentum over a step of size `dl`, given
 the connection coefficients `lconn`.
@@ -574,7 +574,7 @@ the connection coefficients `lconn`.
 # Returns
 - The change in 4-momentum, `dKcon`.
 """
-@inline function compute_dKcon(dl, lconn, Kcon::SVector{4,T}) where {T}
+@inline function compute_dkcon(dl, lconn, Kcon::SVector{4,T}) where {T}
     dK1 = dK2 = dK3 = dK4 = zero(T)
     @inbounds for i in 1:4, j in 1:4
         term = Kcon[i] * Kcon[j] * dl
@@ -605,12 +605,12 @@ backward, depending on its sign), using a midpoint (RK2) integrator.
 """
 Base.@inline function push_photon(X::SVector{4,T}, Kcon::SVector{4,T}, dl, bhspin, model) where {T}
     lconn_half = get_connection_analytic(X, bhspin, model)
-    dKcon_half = compute_dKcon(0.5 * dl, lconn_half, Kcon)
+    dKcon_half = compute_dkcon(0.5 * dl, lconn_half, Kcon)
     Kconhalf = Kcon + dKcon_half
     Xhalf = X + (0.5 * dl) * Kcon
 
     lconn_full = get_connection_analytic(Xhalf, bhspin, model)
-    dKcon_full = compute_dKcon(dl, lconn_full, Kconhalf)
+    dKcon_full = compute_dkcon(dl, lconn_full, Kconhalf)
     new_Kcon = Kcon + dKcon_full
     new_X = X + dl * Kconhalf
 

@@ -103,7 +103,7 @@ function gcov_func!(X, bhspin, model, gcov, R0::Float64=0.0)
     Gcov_ks[4, 2] = Gcov_ks[2, 4]
     Gcov_ks[4, 4] = s2 * (rho2 + bhspin^2 * s2 * (1.0 + 2.0 * r / rho2))
 
-    dxdX = Coordinates.set_dxdX(X, model)
+    dxdX = Coordinates.set_ks_jacobian(X, model)
 
     fill!(gcov, 0.0)
     for mu in 1:4
@@ -174,7 +174,7 @@ function gcov_func(X, bhspin, model, R0::Float64=0.0)
         term3, term4, 0.0, s2 * (rho2 + bhspin^2 * s2 * term1)
     )
 
-    dxdX = Coordinates.set_dxdX(X, model)
+    dxdX = Coordinates.set_ks_jacobian(X, model)
 
     return transpose(dxdX) * Gcov_ks * dxdX
 end
@@ -183,7 +183,7 @@ end
     gcov_func_fd(X, bhspin, model, R0=0.0)
 
 Compute the covariant metric tensor via [`Coordinates.gcov_ks`](@ref) and
-the Jacobian from [`Coordinates.set_dxdX`](@ref) (used as a finite-
+the Jacobian from [`Coordinates.set_ks_jacobian`](@ref) (used as a finite-
 difference-friendly alternative to [`gcov_func`](@ref)).
 
 # Arguments
@@ -201,7 +201,7 @@ function gcov_func_fd(X, bhspin, model, R0::Float64=0.0)
     gcov = @MMatrix zeros(T, 4, 4)
     Gcov_ks = Coordinates.gcov_ks(r, th, bhspin)
 
-    dxdX = Coordinates.set_dxdX(X, model)
+    dxdX = Coordinates.set_ks_jacobian(X, model)
     for μ in 1:Constants.NDIM
         for ν in 1:Constants.NDIM
             for λ in 1:Constants.NDIM

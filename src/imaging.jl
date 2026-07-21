@@ -14,10 +14,10 @@ using ..Camera
 using ..Geodesics
 using ..Radiation
 
-export IpoleGeoIntensityIntegration, OutputStokesParameters, calculate_scale_factor, calculate_pixel_intensity
+export ipole_geo_intensity_integration, output_stokes_parameters, calculate_scale_factor, calculate_pixel_intensity
 
 """
-    IpoleGeoIntensityIntegration(traj, freq_cgs, nx, ny, bhspin, model, data=nothing)
+    ipole_geo_intensity_integration(traj, freq_cgs, nx, ny, bhspin, model, data=nothing)
 
 Integrate the emission along the geodesic trajectory of every pixel.
 
@@ -32,7 +32,7 @@ Integrate the emission along the geodesic trajectory of every pixel.
 # Returns
 - The integrated intensity image.
 """
-function IpoleGeoIntensityIntegration(traj, freq_cgs, nx::Int, ny::Int, bhspin, model, data=nothing)
+function ipole_geo_intensity_integration(traj, freq_cgs, nx::Int, ny::Int, bhspin, model, data=nothing)
     Image = zeros(Float64, nx, ny)
     Threads.@threads for i in 0:(nx-1)
         for j in 0:(ny-1)
@@ -44,7 +44,7 @@ function IpoleGeoIntensityIntegration(traj, freq_cgs, nx::Int, ny::Int, bhspin, 
 end
 
 """
-    OutputStokesParameters(Image, freq_cgs, scale_factor, res, Dsource)
+    output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
 
 Print the total flux, average and peak intensity, and `nuLnu` for the
 computed image.
@@ -57,7 +57,7 @@ computed image.
 - `res`: Image resolution (assumed square).
 - `Dsource`: Distance to the source, in cm.
 """
-function OutputStokesParameters(Image, freq_cgs, scale_factor, res, Dsource)
+function output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
     println("Image processing complete. Calculating total flux and averages...")
     Ftot::Float64 = 0.0
     Iavg::Float64 = 0.0
@@ -102,10 +102,39 @@ function calculate_scale_factor(sizex, sizey, pixelsx, pixelsy, SourceD, LengthU
 end
 
 
-function raytrace_image_GPU!(
+"""
+    raytrace_image_gpu!(d_traj, d_Image, i_offset, j_offset, block_size_x, block_size_y,
+        ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rout, Rstop, data, params)
+
+GPU kernel launcher for [`calculate_image!`](@ref): raytraces and
+integrates the emission for one tile of the image plane (the tile given by
+`i_offset`/`j_offset`, of size `block_size_x`×`block_size_y`), writing the
+resulting intensities into `d_Image`. Call once per tile from a
+`for`-loop over the full image, since `d_traj`'s size limits how much of
+the image a single launch can cover.
+
+# Arguments
+- `d_traj`: Pre-allocated `CuArray{OfTrajGRMHD}` scratch buffer, sized
+  `(block_size_x, block_size_y, nmaxstep)`.
+- `d_Image`: Output image, overwritten in-place.
+- `i_offset`, `j_offset`: Pixel offset of this tile within the full image.
+- `block_size_x`, `block_size_y`: Tile size (must match `d_traj`'s first
+  two dimensions and the launch's thread/block configuration).
+- `ro`, `θo`, `phi`: Camera radial distance, inclination, and azimuth.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `nx`, `ny`: Full image resolution.
+- `nmaxstep`: Maximum number of geodesic integration steps.
+- `freq`: Pivotal frequency, in cgs units.
+- `fovx`, `fovy`: Field of view, in radians.
+- `Rout`: Outer simulation-grid radius.
+- `Rstop`: Backward-integration stopping radius.
+- `data`: Model-specific auxiliary data (e.g. `Iharm`'s GRMHD snapshots).
+- `params`: Model parameters.
+"""
+function raytrace_image_gpu!(
     d_traj, d_Image,
     i_offset, j_offset, block_size_x, block_size_y, # New offset parameters
-    ro, θo, phi, bhspin, nx, ny, nmaxstep, 
+    ro, θo, phi, bhspin, nx, ny, nmaxstep,
     freq, fovx, fovy, Rout, Rstop, data, params
 )
     local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -125,10 +154,38 @@ function raytrace_image_GPU!(
 end
 
 
+"""
+    calculate_image!(traj, d_Image, ro, θo, phi, bhspin, nx, ny, nmaxstep, i_global,
+        j_global, i_local, j_local, freq, fovx, fovy, Rout, Rstop, params, data=nothing)
+
+GPU per-pixel kernel body for [`raytrace_image_gpu!`](@ref): traces the
+geodesic for pixel `(i_global, j_global)` backward from the camera,
+storing each step into `traj[i_local, j_local, :]`, then integrates the
+radiative transfer equation forward along the stored trajectory (from the
+far end back to the camera), writing the result into `d_Image`.
+
+# Arguments
+- `traj`: Pre-allocated `CuDeviceArray{OfTrajGRMHD}` scratch buffer for
+  this tile, indexed by the pixel's local (within-tile) coordinates.
+- `d_Image`: Output image, overwritten in-place at `(i_global, j_global)`.
+- `ro`, `θo`, `phi`: Camera radial distance, inclination, and azimuth.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `nx`, `ny`: Full image resolution.
+- `nmaxstep`: Maximum number of geodesic integration steps.
+- `i_global`, `j_global`: Pixel indices in the full image plane.
+- `i_local`, `j_local`: Pixel indices within this tile's `traj` buffer.
+- `freq`: Pivotal frequency, in cgs units.
+- `fovx`, `fovy`: Field of view, in radians.
+- `Rout`: Outer simulation-grid radius (unused; kept for call-signature
+  symmetry with [`raytrace_image_gpu!`](@ref)).
+- `Rstop`: Backward-integration stopping radius.
+- `params`: Model parameters.
+- `data`: Model-specific auxiliary data (e.g. `Iharm`'s GRMHD snapshots).
+"""
 function calculate_image!(
-    traj, d_Image, 
-    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, 
-    nx::Int64, ny::Int64, nmaxstep::Int64, 
+    traj, d_Image,
+    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64,
+    nx::Int64, ny::Int64, nmaxstep::Int64,
     i_global::Int64, j_global::Int64,
     i_local::Int64, j_local::Int64, # Accept local matrix indices directly
     freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, params,
@@ -140,7 +197,7 @@ function calculate_image!(
     end
     Xcam = Camera.camera_position(ro, θo, phi, bhspin, params)
 
-    Kcon0 = Geodesics.init_Kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, params)
+    Kcon0 = Geodesics.init_kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, params)
     Kcon = Kcon0 * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
 
     dl_unit::Float64 = params.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
@@ -227,7 +284,7 @@ function calculate_pixel_intensity(traj, ro, θo::T, phi, bhspin, i::Int, j::Int
     nx::Int, ny::Int, fovx, fovy, freq, Rstop, nmaxstep::Int, model, data=nothing) where {T}
 
     Xcam = SVector{4,T}(Camera.camera_position(ro, θo, phi, bhspin, model))
-    Kcon0 = Geodesics.init_Kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Kcon0 = Geodesics.init_kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
     Kcon = Kcon0 .* T(freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
     dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
     Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)

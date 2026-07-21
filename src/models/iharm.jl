@@ -462,6 +462,22 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta
     return IharmParams(params)
 end
 
+"""
+    _read_single_primitive(file_handle, prim_name)
+
+Read one named primitive variable's 3D array from an open GRMHD dump
+file's `"prims"` dataset, permuting it from the dump's `(prim, k, j, i)`
+storage order to `(i, j, k)`.
+
+# Arguments
+- `file_handle`: Open HDF5 file handle.
+- `prim_name`: Primitive variable name (case-insensitive; must appear in
+  `VALID_PRIMS`).
+
+# Returns
+- The primitive's 3D array, or `nothing` if `prim_name` isn't a known
+  primitive.
+"""
 function _read_single_primitive(file_handle, prim_name::String)
     if "prims" in keys(file_handle)
         prims = read(file_handle["prims"])
@@ -533,7 +549,7 @@ function load_data(filename::String, trat_large::Float64, model::IharmParams; ad
     Threads.@threads for i in 1:(model.N1)
         for j in 1:(model.N2)
             X = zeros(MVector{4,Float64})
-            Grid.ijktoX(i - 1, j - 1, 0, X, model)
+            Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
             gcov = zeros(MMatrix{4,4,Float64})
             gcon = zeros(MMatrix{4,4,Float64})
             Metrics.gcov_func!(X, model.a, model, gcov)
@@ -541,7 +557,7 @@ function load_data(filename::String, trat_large::Float64, model::IharmParams; ad
             g = Grid.gdet_zone(i - 1, j - 1, 0, model)
 
             for k in 1:(model.N3)
-                Grid.ijktoX(i - 1, j - 1, k, X, model)
+                Grid.ijk_to_x(i - 1, j - 1, k, X, model)
 
                 Ufields = (data_array[1].U1, data_array[1].U2, data_array[1].U3)
                 UdotU = 0.0
@@ -598,6 +614,22 @@ function load_data(filename::String, trat_large::Float64, model::IharmParams; ad
     return data_array[1]
 end
 
+"""
+    init_physical_quantities(data, n, model, trat_large)
+
+Compute the derived electron-density, magnetic-field-strength,
+electron-temperature, magnetization (`sigma`), and plasma-beta arrays
+(and the `Rhigh`-derivative of electron temperature) for snapshot
+`data[n]`, from its loaded fluid primitives (`RHO`, `UU`, `b`), using the
+Ressler/Athena mixed electron-temperature model.
+
+# Arguments
+- `data`: Vector of loaded [`IharmData`](@ref) snapshots.
+- `n`: Index of the snapshot to process.
+- `model`: Iharm model parameters.
+- `trat_large`: Electron/ion temperature ratio at high magnetization
+  (`Rhigh`).
+"""
 function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large::Float64)
     rescale_factor_sqrt = 1.0
     rho_factor = model.RHO_unit / (Constants.MP + Constants.ME) * model.Ne_factor
@@ -689,8 +721,23 @@ function set_tinterp_ns(X, model::IharmParams, data)
     end
 end
 
+"""
+    set_tinterp_ns(X, model, data::Tuple{T}) where {T}
+
+GPU, non-slow-light variant of [`set_tinterp_ns`](@ref): `data` is a
+1-tuple, so there's nothing to interpolate between.
+"""
 @inline set_tinterp_ns(X, model::IharmParams, data::Tuple{T}) where {T} = (data[1], data[1], 0.0)
 
+"""
+    set_tinterp_ns(X, model, data::NTuple{3,T}) where {T}
+
+GPU, slow-light variant of [`set_tinterp_ns`](@ref): `data` is a 3-tuple
+of snapshots, and the pair to interpolate between is selected by
+comparing `X[1]` against the middle snapshot's time (resolved at compile
+time via the tuple's length, unlike the `Vector` method's runtime
+`model.slow_light` branch).
+"""
 @inline function set_tinterp_ns(X, model::IharmParams, data::NTuple{3,T}) where {T}
     if X[1] < data[2].t
         dataA, dataB = data[1], data[2]
@@ -701,15 +748,45 @@ end
     return dataA, dataB, tinterp
 end
 
+"""
+    get_model_sigma(X, model, data)
+
+Interpolate the magnetization `sigma` (ratio of magnetic to matter energy
+density) at position `X`.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Iharm model parameters.
+- `data`: GRMHD snapshot(s).
+
+# Returns
+- The interpolated magnetization, or `0` if `X` is outside the grid.
+"""
 function get_model_sigma(X, model::IharmParams, data)
     T = eltype(X)
-    if Grid.X_in_domain(X, model) == 0
+    if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
     return Grid.interp_scalar_time(X, dataA.sigma, dataB.sigma, tfac, model.slow_light, model)
 end
 
+"""
+    get_sigma_smoothfac(sigma, model)
+
+Compute the smooth cutoff factor that tapers the electron density to zero
+as the magnetization `sigma` approaches `model.sigma_cut`/
+`model.sigma_cut_high`, avoiding a hard discontinuity at the cutoff.
+
+# Arguments
+- `sigma`: Magnetization at the position of interest.
+- `model`: Iharm model parameters (`model.sigma_cut`,
+  `model.sigma_cut_high`).
+
+# Returns
+- `1` well below the cutoff, `0` well above it, and a smooth cosine
+  taper in between.
+"""
 function get_sigma_smoothfac(sigma, model::IharmParams)
     T = typeof(sigma)
     sigma_above = model.sigma_cut
@@ -726,9 +803,25 @@ function get_sigma_smoothfac(sigma, model::IharmParams)
     return cos(π / 2.0 / dsig * (sigma - model.sigma_cut))
 end
 
+"""
+    get_model_ne(X, model, data)
+
+Interpolate the electron number density at position `X`, applying the
+geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
+[`get_sigma_smoothfac`](@ref)) if `USE_GEODESIC_SIGMACUT` is enabled.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Iharm model parameters.
+- `data`: GRMHD snapshot(s).
+
+# Returns
+- The electron number density, or `0` if `X` is outside the grid or above
+  the magnetization cutoff.
+"""
 function get_model_ne(X, model::IharmParams, data)
     T = eltype(X)
-    if Grid.X_in_domain(X, model) == 0
+    if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
     sigma_smoothfac = one(T)
@@ -743,27 +836,68 @@ function get_model_ne(X, model::IharmParams, data)
     return Grid.interp_scalar_time(X, dataA.ne, dataB.ne, tfac, model.slow_light, model) * sigma_smoothfac
 end
 
+"""
+    get_model_thetae(X, model, data)
+
+Interpolate the dimensionless electron temperature at position `X`.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Iharm model parameters.
+- `data`: GRMHD snapshot(s).
+
+# Returns
+- The dimensionless electron temperature, or `0` if `X` is outside the
+  grid.
+"""
 function get_model_thetae(X, model::IharmParams, data)
     T = eltype(X)
-    if Grid.X_in_domain(X, model) == 0
+    if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
     return Grid.interp_scalar_time(X, dataA.θe, dataB.θe, tfac, model.slow_light, model)
 end
 
+"""
+    get_model_thetae_deriv(X, model, data)
+
+Interpolate the derivative of the dimensionless electron temperature with
+respect to `Rhigh`, at position `X`.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Iharm model parameters.
+- `data`: GRMHD snapshot(s).
+
+# Returns
+- `dθe/dRhigh`, or `0` if `X` is outside the grid.
+"""
 function get_model_thetae_deriv(X, model::IharmParams, data)
     T = eltype(X)
-    if Grid.X_in_domain(X, model) == 0
+    if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
     return Grid.interp_scalar_time(X, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light, model)
 end
 
+"""
+    get_model_b(X, model, data)
+
+Interpolate the magnetic field strength at position `X`.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Iharm model parameters.
+- `data`: GRMHD snapshot(s).
+
+# Returns
+- The magnetic field strength, or `0` if `X` is outside the grid.
+"""
 function get_model_b(X, model::IharmParams, data)
     T = eltype(X)
-    if Grid.X_in_domain(X, model) == 0
+    if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
@@ -795,7 +929,7 @@ with the rest of the differentiable call path.
     gcov = Metrics.gcov_func(X, bhspin, model)
     gcon = Metrics.gcon_func(gcov)
 
-    if Grid.X_in_domain(X, model) == 0
+    if Grid.x_in_domain(X, model) == 0
         Ucov1 = -one(elT) / sqrt(-gcon[1, 1])
 
         Ucon1 = Ucov1 * gcon[1, 1]
@@ -887,10 +1021,10 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
         return (z_base, z_base, z_base, z_base)
     end
 
-    #j = MaxwellJuettner.maxwell_juettner_I(b, θ, θe, nu, Ne) / nusq
-    j = MaxwellJuettner.maxwell_juettner_leung_I(Ne, nu, θe, b, θ) / nusq
+    #j = MaxwellJuettner.maxwell_juettner_i(b, θ, θe, nu, Ne) / nusq
+    j = MaxwellJuettner.maxwell_juettner_leung_i(Ne, nu, θe, b, θ) / nusq
 
-    Bnuinv = Radiation.Bnu_inv(nu, θe)
+    Bnuinv = Radiation.bnu_inv(nu, θe)
     z_jk = zero(typeof(j))
 
     k = (Bnuinv > 0) ? j / Bnuinv : z_jk
@@ -901,10 +1035,10 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
         v_Ne = ForwardDiff.value(Ne); v_nusq = ForwardDiff.value(nusq); v_θe = ForwardDiff.value(θe)
         v_Bnuinv = ForwardDiff.value(Bnuinv); v_j = ForwardDiff.value(j)
 
-        dj_dθe = ForwardDiff.derivative(t -> MaxwellJuettner.maxwell_juettner_leung_I(v_Ne, v_nu, t, v_b, v_θ) / v_nusq, v_θe)
+        dj_dθe = ForwardDiff.derivative(t -> MaxwellJuettner.maxwell_juettner_leung_i(v_Ne, v_nu, t, v_b, v_θ) / v_nusq, v_θe)
 
         if v_Bnuinv > 0
-            dBnuinv_dθe = ForwardDiff.derivative(t -> Radiation.Bnu_inv(v_nu, t), v_θe)
+            dBnuinv_dθe = ForwardDiff.derivative(t -> Radiation.bnu_inv(v_nu, t), v_θe)
             dk_dθe = (dj_dθe * v_Bnuinv - v_j * dBnuinv_dθe) / (v_Bnuinv * v_Bnuinv)
         else
             dk_dθe = zero(dj_dθe)
@@ -945,8 +1079,8 @@ Dual-X specialization, which is otherwise fatal to compile.
     if θ <= zero(elT) || θ >= elT(π)
         return (z_base, z_base)
     end
-    j = MaxwellJuettner.maxwell_juettner_leung_I(Ne, nu, θe, b, θ) / nusq
-    Bnuinv = Radiation.Bnu_inv(nu, θe)
+    j = MaxwellJuettner.maxwell_juettner_leung_i(Ne, nu, θe, b, θ) / nusq
+    Bnuinv = Radiation.bnu_inv(nu, θe)
     z_jk = zero(typeof(j))
     k = (Bnuinv > 0) ? j / Bnuinv : z_jk
     return (j, k)
@@ -1014,11 +1148,11 @@ Base.@inline function Coordinates.bl_coord!(rt, X, model::IharmParams, R0::Float
 end
 
 """
-    Coordinates.set_dxdX(X, model::IharmParams)
+    Coordinates.set_ks_jacobian(X, model::IharmParams)
 
 Compute the Jacobian matrix `dx/dX`, using the FMKS/MKS polar mapping.
 """
-function Coordinates.set_dxdX(X, model::IharmParams)
+function Coordinates.set_ks_jacobian(X, model::IharmParams)
     T = eltype(X)
 
     m22 = exp(X[2])

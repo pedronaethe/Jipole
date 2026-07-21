@@ -98,14 +98,14 @@ end
 
 Always `false`: the thin disk model has no volumetric emission, only
 boundary-crossing emission (see [`thindisk_region`](@ref) /
-[`GetTDBoundaryCondition`](@ref)).
+[`get_td_boundary_condition`](@ref)).
 """
 function Radiation.radiating_region(X, model::ThinDiskParams, Rh::Float64)
     return false
 end
 
 """
-    GetTDBoundaryCondition(X, Kcon, bhspin, Rh, model)
+    get_td_boundary_condition(X, Kcon, bhspin, Rh, model)
 
 Compute the disk-surface intensity where the geodesic crosses the thin
 disk.
@@ -120,7 +120,7 @@ disk.
 # Returns
 - The disk-surface intensity, or `0.0` if inside the event horizon.
 """
-function GetTDBoundaryCondition(X, Kcon, bhspin, Rh::Float64, model::ThinDiskParams)
+function get_td_boundary_condition(X, Kcon, bhspin, Rh::Float64, model::ThinDiskParams)
     r, _ = Coordinates.bl_coord(X, model)
 
     if r > Rh
@@ -410,7 +410,7 @@ function Radiation.integrate_emission!(traj::Vector{OfTrajS}, nsteps::Int, Image
             Kconi[k] = traj[nstep].Kcon[k]
         end
         if thindisk_region(Xi, Xf, model)
-            Intensity = GetTDBoundaryCondition(Xi, Kconi, bhspin, Rh, model)
+            Intensity = get_td_boundary_condition(Xi, Kconi, bhspin, Rh, model)
         end
     end
     Image[I, J] = Intensity

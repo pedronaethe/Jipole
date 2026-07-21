@@ -16,7 +16,7 @@ using ..GeoTypes
 using ..AbstractModels
 using ..DebugFunctions
 
-export get_fluid_nu, Bnu_inv, get_jk, integrate_emission!, get_bk_angle,
+export get_fluid_nu, bnu_inv, get_jk, integrate_emission!, get_bk_angle,
     approximate_solve, radiating_region
 
 """
@@ -37,7 +37,7 @@ function get_fluid_nu(Kcon, Ucov)
 end
 
 """
-    Bnu_inv(nu, θe)
+    bnu_inv(nu, θe)
 
 Compute the invariant Planck function `Bnu / nu^3`.
 
@@ -48,7 +48,7 @@ Compute the invariant Planck function `Bnu / nu^3`.
 # Returns
 - The invariant Planck function.
 """
-function Bnu_inv(nu, θe)
+function bnu_inv(nu, θe)
     x = Constants.HPL * nu / (Constants.ME * Constants.CL * Constants.CL * θe)
 
     if x < 2.e-3

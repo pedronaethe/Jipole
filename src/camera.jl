@@ -19,7 +19,7 @@ polar angle.
 
 The solution is first estimated using [`root_find_ipole`](@ref) and then
 refined with a single Newton iteration, where the derivative of
-[`Coordinates.get_theta_from_X`](@ref) is approximated using finite
+[`Coordinates.get_theta_from_x`](@ref) is approximated using finite
 differences.
 
 # Arguments
@@ -45,9 +45,9 @@ function root_find_std(x, model)
 
     x_eval_eps = @SVector [c1, c2, x3_val + eps, c4]
 
-    slope = (Coordinates.get_theta_from_X(x_eval_eps, model) - Coordinates.get_theta_from_X(x_eval, model)) / eps
+    slope = (Coordinates.get_theta_from_x(x_eval_eps, model) - Coordinates.get_theta_from_x(x_eval, model)) / eps
 
-    return x3_val - (Coordinates.get_theta_from_X(x_eval, model) - x[3]) / slope
+    return x3_val - (Coordinates.get_theta_from_x(x_eval, model) - x[3]) / slope
 end
 
 """
@@ -92,8 +92,8 @@ function root_find_ipole(x, model)
 
     tol::Float64 = 1.e-9
 
-    tha = Coordinates.get_theta_from_X(@SVector[c1, c2, xa3, c4], model)
-    thb = Coordinates.get_theta_from_X(@SVector[c1, c2, xb3, c4], model)
+    tha = Coordinates.get_theta_from_x(@SVector[c1, c2, xa3, c4], model)
+    thb = Coordinates.get_theta_from_x(@SVector[c1, c2, xb3, c4], model)
 
     if abs(tha - th) < tol
         return xa3
@@ -105,7 +105,7 @@ function root_find_ipole(x, model)
 
     for i in 1:1000
         xc3 = 0.5 * (xa3 + xb3)
-        thc = Coordinates.get_theta_from_X(@SVector[c1, c2, xc3, c4], model)
+        thc = Coordinates.get_theta_from_x(@SVector[c1, c2, xc3, c4], model)
 
         if (thc - th) * (thb - th) < 0.0
             xa3 = xc3
@@ -134,7 +134,7 @@ this with a numerical inversion of the coordinate mapping, via
 
 `bhspin` is kept as an explicit argument (rather than reading `model.a`)
 so that it can carry a `ForwardDiff.Dual` when this function sits on the
-autodiff path (see `Autodiff.AutoDiffGeoTrajEulerMethod!`).
+autodiff path (see `Autodiff.autodiff_geo_traj_euler_method!`).
 
 # Arguments
 - `cam_dist`: Radial distance of the camera from the black hole.

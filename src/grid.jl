@@ -8,10 +8,10 @@ using LinearAlgebra
 using ..Coordinates
 using ..Metrics
 
-export Xtoijk_ghost, X_in_domain, ijktoX, interp_scalar, interp_scalar_time, gdet_zone
+export x_to_ijk_ghost, x_in_domain, ijk_to_x, interp_scalar, interp_scalar_time, gdet_zone
 
 """
-    Xtoijk_ghost(X, model)
+    x_to_ijk_ghost(X, model)
 
 Locate the grid zone and interpolation weights for the position `X` on
 `model`'s simulation grid.
@@ -26,7 +26,7 @@ Locate the grid zone and interpolation weights for the position `X` on
 - A tuple `(i, j, k, del2, del3, del4)`: the 1-based zone indices and the
   interpolation weights within that zone.
 """
-function Xtoijk_ghost(X, model)
+function x_to_ijk_ghost(X, model)
     i_logical = trunc(Int, ((X[2] - model.startx[2]) / model.dx[2]) - 0.5 + 1000) - 1000
     j_logical = trunc(Int, ((X[3] - model.startx[3]) / model.dx[3]) - 0.5 + 1000) - 1000
 
@@ -54,7 +54,7 @@ function Xtoijk_ghost(X, model)
 end
 
 """
-    X_in_domain(X, model)
+    x_in_domain(X, model)
 
 Check whether the position `X` lies within `model`'s simulation grid
 bounds.
@@ -67,7 +67,7 @@ bounds.
 # Returns
 - `1` if `X` is within bounds, `0` otherwise.
 """
-function X_in_domain(X, model)
+function x_in_domain(X, model)
     if X[2] < model.cstartx[2] || X[2] > model.cstopx[2] || X[3] < model.cstartx[3] || X[3] > model.cstopx[3]
         return 0
     end
@@ -75,7 +75,7 @@ function X_in_domain(X, model)
 end
 
 """
-    ijktoX(i, j, k, X, model)
+    ijk_to_x(i, j, k, X, model)
 
 Compute the internal coordinates `X` at the center of grid zone
 `(i, j, k)`.
@@ -86,7 +86,7 @@ Compute the internal coordinates `X` at the center of grid zone
 - `model`: Model parameters, providing the grid geometry (`model.startx`,
   `model.dx`).
 """
-function ijktoX(i, j, k, X, model)
+function ijk_to_x(i, j, k, X, model)
     X[2] = model.startx[2] + (i + 0.5) * model.dx[2]
     X[3] = model.startx[3] + (j + 0.5) * model.dx[3]
     X[4] = model.startx[4] + (k + 0.5) * model.dx[4]
@@ -107,7 +107,7 @@ Quadrilinearly interpolate the scalar field `data` at the position `X`.
 - The interpolated scalar value.
 """
 function interp_scalar(X, data, model)
-    i, j, k, del2, del3, del4 = Xtoijk_ghost(X, model)
+    i, j, k, del2, del3, del4 = x_to_ijk_ghost(X, model)
 
     (N1_data, N2_data, N3_data) = size(data)
 
@@ -190,7 +190,7 @@ function gdet_zone(i, j, k, model)
 
     gcovKS = Coordinates.gcov_ks(r, th, model.a)
 
-    dxdX = Coordinates.set_dxdX(X, model)
+    dxdX = Coordinates.set_ks_jacobian(X, model)
 
     gcov = transpose(dxdX) * gcovKS * dxdX
     return Metrics.gdet_func(gcov)

@@ -3,7 +3,7 @@ Coordinate transformations between the internal (simulation) coordinates,
 Kerr-Schild coordinates, and Boyer-Lindquist coordinates.
 
 The functions that depend on the coordinate mapping used by a given model
-(`bl_coord`, `bl_coord!`, `set_dxdX`) are generic on `model::AbstractModel`:
+(`bl_coord`, `bl_coord!`, `set_ks_jacobian`) are generic on `model::AbstractModel`:
 the method defined here is the default (matching the exponential-radial,
 uncompressed-polar mapping used by `Analytic`/`ThinDisk`), and `Iharm`
 overrides them with its metric-dependent (MKS/FMKS) mapping.
@@ -15,11 +15,11 @@ using LinearAlgebra
 using ..Constants
 using ..AbstractModels
 
-export get_theta_from_X, bl_to_ks, ks_to_bl, vec_to_bl, vec_to_ks, set_dxdX,
-    gcov_ks, set_dXdx, vec_from_ks, bl_coord, bl_coord!, flip_index, flip_index!
+export get_theta_from_x, bl_to_ks, ks_to_bl, vec_to_bl, vec_to_ks, set_ks_jacobian,
+    gcov_ks, set_ks_jacobian_inverse, vec_from_ks, bl_coord, bl_coord!, flip_index, flip_index!
 
 """
-    get_theta_from_X(X, model)
+    get_theta_from_x(X, model)
 
 Compute the polar coordinate `th` from the internal coordinates `X`.
 
@@ -30,7 +30,7 @@ Compute the polar coordinate `th` from the internal coordinates `X`.
 # Returns
 - The polar coordinate `th`.
 """
-function get_theta_from_X(X, model)
+function get_theta_from_x(X, model)
     _, th = bl_coord(X, model)
     return th
 end
@@ -142,7 +142,7 @@ stays differentiable when called on the autodiff path.
 """
 function vec_to_bl(X, v_nat, bhspin, model)
     v_ks = zero(MVector{4,Float64})
-    dxdX = set_dxdX(X, model)
+    dxdX = set_ks_jacobian(X, model)
     for μ in 1:Constants.NDIM
         for ν in 1:Constants.NDIM
             v_ks[μ] += dxdX[μ, ν] * v_nat[ν]
@@ -188,7 +188,7 @@ Kerr-Schild coordinates.
 """
 function vec_to_ks(X, v_nat, model)
     v_ks = zero(MVector{4,Float64})
-    dxdX = set_dxdX(X, model)
+    dxdX = set_ks_jacobian(X, model)
 
     for μ in 1:Constants.NDIM
         for ν in 1:Constants.NDIM
@@ -200,7 +200,7 @@ function vec_to_ks(X, v_nat, model)
 end
 
 """
-    set_dxdX(X, model)
+    set_ks_jacobian(X, model)
 
 Compute the Jacobian matrix `dx/dX` for the transformation from Kerr-Schild
 coordinates to internal coordinates. This default method implements the
@@ -214,7 +214,7 @@ uncompressed exponential-radial mapping used by `Analytic`/`ThinDisk`;
 # Returns
 - The Jacobian matrix `dx/dX` as an `SMatrix`.
 """
-function set_dxdX(X, model::AbstractModel)
+function set_ks_jacobian(X, model::AbstractModel)
     T = eltype(X)
 
     m22 = exp(X[2])
@@ -271,7 +271,7 @@ Base.@inline function gcov_ks(r, th, bhspin)
 end
 
 """
-    set_dXdx(X, model)
+    set_ks_jacobian_inverse(X, model)
 
 Compute the inverse Jacobian matrix `dX/dx` for the transformation from
 internal coordinates to Kerr-Schild coordinates.
@@ -283,8 +283,8 @@ internal coordinates to Kerr-Schild coordinates.
 # Returns
 - The inverse Jacobian matrix `dX/dx`.
 """
-function set_dXdx(X, model)
-    dxdX = set_dxdX(X, model)
+function set_ks_jacobian_inverse(X, model)
+    dxdX = set_ks_jacobian(X, model)
     return inv(dxdX)
 end
 
@@ -304,7 +304,7 @@ coordinate system.
 """
 function vec_from_ks(X, v_ks, model)
     v_nat = zero(MVector{4,eltype(v_ks)})
-    dXdx = set_dXdx(X, model)
+    dXdx = set_ks_jacobian_inverse(X, model)
 
     for μ in 1:Constants.NDIM
         for ν in 1:Constants.NDIM

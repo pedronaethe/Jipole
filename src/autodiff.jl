@@ -20,10 +20,10 @@ using ..Radiation
 using ..DebugFunctions
 using ..ThinDisk
 using ..Imaging
-export AutoDiffGeoTrajEulerMethod!, AutoDiffGeoTrajEulerMethod_GRMHD!, raytrace_gradients_GPU!, calculate_gradients, differentiate_pixel_intensity
+export autodiff_geo_traj_euler_method!, autodiff_geo_traj_euler_method_grmhd!, raytrace_gradients_gpu!, calculate_gradients, differentiate_pixel_intensity
 
 """
-    Mom4ODE(X, Kcon, bhspin, model)
+    momentum_ode(X, Kcon, bhspin, model)
 
 Right-hand side of the photon geodesic ODE, `dK^μ/dλ = -Γ^μ_{αβ} K^α K^β`.
 
@@ -36,7 +36,7 @@ Right-hand side of the photon geodesic ODE, `dK^μ/dλ = -Γ^μ_{αβ} K^α K^β
 # Returns
 - `dKcon/dλ`.
 """
-function Mom4ODE(X::AbstractVector, Kcon::AbstractVector, bhspin, model)
+function momentum_ode(X::AbstractVector, Kcon::AbstractVector, bhspin, model)
     T = promote_type(eltype(X), eltype(Kcon))
 
     lconn = Geodesics.get_connection_analytic(X, bhspin, model)
@@ -54,7 +54,7 @@ function Mom4ODE(X::AbstractVector, Kcon::AbstractVector, bhspin, model)
 end
 
 """
-    CalculateK(ro, θo, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model)
+    calculate_kcon(ro, θo, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model)
 
 Compute the unitless photon 4-momentum launched from camera pixel
 `(i, j)`.
@@ -71,17 +71,17 @@ Compute the unitless photon 4-momentum launched from camera pixel
 # Returns
 - The unitless contravariant photon 4-momentum.
 """
-function CalculateK(ro, θo, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model)
+function calculate_kcon(ro, θo, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model)
     Xcam = Camera.camera_position(ro, θo, phi, bhspin, model)
     T = eltype(Xcam)
     Kcon = MVector{4,T}(undef)
     X = MVector{4,T}(undef)
-    Geodesics.init_XK!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Geodesics.init_xk!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
     return SVector(Kcon) * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
 end
 
 """
-    RadTransferDiff(Xi, Kconi, freq, Ii, bhspin, model, data)
+    rad_transfer_diff(Xi, Kconi, freq, Ii, bhspin, model, data)
 
 Right-hand side of the (linearized) radiative transfer equation at a
 single point, `dI/dλ = j - k I`.
@@ -98,7 +98,7 @@ single point, `dI/dλ = j - k I`.
 # Returns
 - `dI/dλ`.
 """
-function RadTransferDiff(Xi, Kconi, freq, Ii, bhspin, model, data)
+function rad_transfer_diff(Xi, Kconi, freq, Ii, bhspin, model, data)
     ji, ki = Radiation.get_jk(Xi, Kconi, freq, bhspin, model, data, Val(false))
     return ji - ki * Ii
 end
@@ -131,12 +131,12 @@ function transfer_step(I_prev, X_curr, K_curr, X_next, K_next, dl, freq, bhspin,
 end
 
 """
-    AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out, intensity_out, dI_da_out, ro, θo, phi, bhspin, nx, ny, nmaxstep, i, j, freq, fovx, fovy, model, Rstop, data=nothing)
+    autodiff_geo_traj_euler_method!(traj, dI_dθo_out, intensity_out, dI_da_out, ro, θo, phi, bhspin, nx, ny, nmaxstep, i, j, freq, fovx, fovy, model, Rstop, data=nothing)
 
 Compute the intensity and its derivatives with respect to `θo` and `a`
 for pixel `(i, j)`, using forward-mode autodiff through the geodesic
 integration (`Analytic`/`ThinDisk` models only — `Iharm` uses
-[`AutoDiffGeoTrajEulerMethod_GRMHD!`](@ref)).
+[`autodiff_geo_traj_euler_method_grmhd!`](@ref)).
 
 # Arguments
 - `traj`: Scratch trajectory vector, emptied by this function.
@@ -152,13 +152,13 @@ integration (`Analytic`/`ThinDisk` models only — `Iharm` uses
 - `Rstop`: Backward-integration stopping radius.
 - `data`: Model-specific auxiliary data.
 """
-function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64}, ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64, i::Int64, j::Int64, freq::Float64, fovx::Float64, fovy::Float64, model, Rstop::Float64, data=nothing)
+function autodiff_geo_traj_euler_method!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_da_out::Base.RefValue{Float64}, ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64, i::Int64, j::Int64, freq::Float64, fovx::Float64, fovy::Float64, model, Rstop::Float64, data=nothing)
     Xcam = MVector{4,Float64}(Camera.camera_position(ro, θo, phi, bhspin, model))
     Kcon = MVector{4,Float64}(undef)
     X = MVector{4,Float64}(undef)
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
-    Geodesics.init_XK!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Geodesics.init_xk!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
     Kcon .*= freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
     dl_unit::Float64 = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
 
@@ -168,16 +168,16 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
 
     jac = MMatrix{4,9,Float64}(undef)
     dX_dθo = ForwardDiff.derivative(x -> Camera.camera_position(ro, x, phi, bhspin, model), θo)
-    dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model), θo)
+    dK_dθo = ForwardDiff.derivative(x -> calculate_kcon(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model), θo)
 
     dX_da = ForwardDiff.derivative(x -> Camera.camera_position(ro, θo, phi, x, model), bhspin)
-    dK_da = ForwardDiff.derivative(x -> CalculateK(ro, θo, phi, i, j, nx, ny, fovx, fovy, x, freq, model), bhspin)
+    dK_da = ForwardDiff.derivative(x -> calculate_kcon(ro, θo, phi, i, j, nx, ny, fovx, fovy, x, freq, model), bhspin)
 
     systemODEs_flat = XK -> begin
         Xs = SVector{4}(XK[1], XK[2], XK[3], XK[4])
         Ks = SVector{4}(XK[5], XK[6], XK[7], XK[8])
         spin = XK[9]
-        Mom4ODE(Xs, Ks, spin, model)
+        momentum_ode(Xs, Ks, spin, model)
     end
 
     XK = MVector{9,Float64}(undef)
@@ -276,7 +276,7 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
 
         if model isa ThinDisk.ThinDiskParams
             if ThinDisk.thindisk_region(Xi_S, Xf_S, model)
-                Intensity = ThinDisk.GetTDBoundaryCondition(Xi_S, Kconi_S, bhspin, Rh, model)
+                Intensity = ThinDisk.get_td_boundary_condition(Xi_S, Kconi_S, bhspin, Rh, model)
             end
             continue
         end
@@ -285,10 +285,10 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
             continue
         end
 
-        rad_x = x -> RadTransferDiff(x, Kconi_S, freq, Intensity, bhspin, model, data)
-        rad_k = k -> RadTransferDiff(Xi_S, k, freq, Intensity, bhspin, model, data)
-        rad_a = spin -> RadTransferDiff(Xi_S, Kconi_S, freq, Intensity, spin, model, data)
-        rad_i = intens -> RadTransferDiff(Xi_S, Kconi_S, freq, intens, bhspin, model, data)
+        rad_x = x -> rad_transfer_diff(x, Kconi_S, freq, Intensity, bhspin, model, data)
+        rad_k = k -> rad_transfer_diff(Xi_S, k, freq, Intensity, bhspin, model, data)
+        rad_a = spin -> rad_transfer_diff(Xi_S, Kconi_S, freq, Intensity, spin, model, data)
+        rad_i = intens -> rad_transfer_diff(Xi_S, Kconi_S, freq, intens, bhspin, model, data)
 
         ForwardDiff.gradient!(jac_I_X, rad_x, Xi_S)
         ForwardDiff.gradient!(jac_I_K, rad_k, Kconi_S)
@@ -320,7 +320,7 @@ function AutoDiffGeoTrajEulerMethod!(traj, dI_dθo_out::Base.RefValue{Float64}, 
 end
 
 """
-    AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out, intensity_out, dI_dRhigh_out, ro, θo, phi, bhspin, nx, ny, nmaxstep, i, j, freq, fovx, fovy, model, Rstop, data=nothing)
+    autodiff_geo_traj_euler_method_grmhd!(traj, dI_dθo_out, intensity_out, dI_dRhigh_out, ro, θo, phi, bhspin, nx, ny, nmaxstep, i, j, freq, fovx, fovy, model, Rstop, data=nothing)
 
 Compute the intensity and its derivatives with respect to `θo` and
 `Rhigh` for pixel `(i, j)`, using forward-mode autodiff through the
@@ -342,7 +342,7 @@ from [`Iharm.jar_calc`](@ref) for `Rhigh`.
 - `data`: GRMHD snapshot(s), already loaded with the `Rhigh` at which the
   derivative is requested.
 """
-function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_dRhigh_out::Base.RefValue{Float64}, ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64, i::Int64, j::Int64, freq::Float64, fovx::Float64, fovy::Float64, model, Rstop::Float64, data::T_data=nothing) where {T_data}
+function autodiff_geo_traj_euler_method_grmhd!(traj, dI_dθo_out::Base.RefValue{Float64}, intensity_out::Base.RefValue{Float64}, dI_dRhigh_out::Base.RefValue{Float64}, ro::Float64, θo::Float64, phi::Float64, bhspin::Float64, nx::Int64, ny::Int64, nmaxstep::Int64, i::Int64, j::Int64, freq::Float64, fovx::Float64, fovy::Float64, model, Rstop::Float64, data::T_data=nothing) where {T_data}
     empty!(traj)
 
     Xcam = MVector{4,Float64}(Camera.camera_position(ro, θo, phi, bhspin, model))
@@ -351,7 +351,7 @@ function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Floa
     X = MVector{4,Float64}(undef)
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
-    Geodesics.init_XK!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Geodesics.init_xk!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
     Kcon .*= freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
     dl_unit::Float64 = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
 
@@ -361,7 +361,7 @@ function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Floa
 
     jac = MMatrix{4,9,Float64}(undef)
     dX_dθo = ForwardDiff.derivative(x -> Camera.camera_position(ro, x, phi, bhspin, model), θo)
-    dK_dθo = ForwardDiff.derivative(x -> CalculateK(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model), θo)
+    dK_dθo = ForwardDiff.derivative(x -> calculate_kcon(ro, x, phi, i, j, nx, ny, fovx, fovy, bhspin, freq, model), θo)
     XK = MVector{9,Float64}(undef)
     XK[9] = bhspin
 
@@ -369,7 +369,7 @@ function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Floa
         Xs = SVector{4}(xk[1], xk[2], xk[3], xk[4])
         Ks = SVector{4}(xk[5], xk[6], xk[7], xk[8])
         spin = xk[9]
-        Mom4ODE(Xs, Ks, spin, model)
+        momentum_ode(Xs, Ks, spin, model)
     end
 
     push!(traj, OfTraj(
@@ -502,15 +502,15 @@ function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Floa
 end
 
 """
-    raytrace_gradients_GPU!(d_traj, d_Image, d_dI_dθo, d_dI_dRhigh, i_offset, j_offset,
+    raytrace_gradients_gpu!(d_traj, d_Image, d_dI_dθo, d_dI_dRhigh, i_offset, j_offset,
         block_size_x, block_size_y, ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx,
         fovy, Rout, Rstop, data, params)
 
 GPU kernel launcher for [`calculate_gradients`](@ref): computes the image
 intensity together with its derivatives w.r.t. `θo` and `Rhigh`, tiled the
-same way as [`Imaging.raytrace_image_GPU!`](@ref).
+same way as [`Imaging.raytrace_image_gpu!`](@ref).
 """
-function raytrace_gradients_GPU!(
+function raytrace_gradients_gpu!(
     d_traj, d_Image, d_dI_dθo, d_dI_dRhigh,
     i_offset, j_offset, block_size_x, block_size_y,
     ro, θo, phi, bhspin, nx, ny, nmaxstep,
@@ -537,10 +537,10 @@ end
         nmaxstep, i_global, j_global, i_local, j_local, freq, fovx, fovy, Rout, Rstop,
         model, data=nothing)
 
-Per-pixel kernel body for [`raytrace_gradients_GPU!`](@ref). Computes the
+Per-pixel kernel body for [`raytrace_gradients_gpu!`](@ref). Computes the
 θo-sensitivity of the geodesic by carrying a linearized (`dX`, `dK`)
 tangent vector alongside the trajectory (via a single-perturbation
-`ForwardDiff.Dual` embedding evaluated through [`Mom4ODE`](@ref) each step,
+`ForwardDiff.Dual` embedding evaluated through [`momentum_ode`](@ref) each step,
 avoiding the need for a materialized Jacobian), and combines it with the
 analytic `Rhigh`-derivative from [`Iharm.jar_calc`](@ref) using a
 2-component `ForwardDiff.Dual` in the radiative-transfer integration.
@@ -566,12 +566,12 @@ function calculate_gradients(
 
     dK_dθo = ForwardDiff.derivative(x -> begin
         Xcam_dual = Camera.camera_position(ro, x, phi, bhspin, model)
-        K_init = Geodesics.init_Kcon(i_global, j_global, Xcam_dual, nx, ny, fovx, fovy, bhspin, model)
+        K_init = Geodesics.init_kcon(i_global, j_global, Xcam_dual, nx, ny, fovx, fovy, bhspin, model)
         return K_init * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
     end, θo)
 
     Xcam = SVector{4,Float64}(Camera.camera_position(ro, θo, phi, bhspin, model))
-    Kcon = Geodesics.init_Kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Kcon = Geodesics.init_kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, model)
     Kcon = Kcon * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
 
     dl_unit::Float64 = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
@@ -598,7 +598,7 @@ function calculate_gradients(
             X_dual = ForwardDiff.Dual{Nothing}.(X, dX)
             K_dual = ForwardDiff.Dual{Nothing}.(K, dK)
 
-            dK_dual = Mom4ODE(X_dual, K_dual, bhspin, model)
+            dK_dual = momentum_ode(X_dual, K_dual, bhspin, model)
 
             d_dK_dl = SVector{4}(
                 ForwardDiff.partials(dK_dual[1], 1),

@@ -72,10 +72,10 @@ function make_plasma_tetrad(Ucon, Kcon, Bcon, Gcov)
     T = eltype(Ucon)
     ones_vector = SVector{4,T}(1.0, 1.0, 1.0, 1.0)
 
-    e1 = Utils.set_Econ_from_trial(1, Ucon)
-    e2 = Utils.set_Econ_from_trial(4, ones_vector)
-    e3 = Utils.set_Econ_from_trial(3, Bcon)
-    e4 = Utils.set_Econ_from_trial(4, Kcon)
+    e1 = Utils.set_econ_from_trial(1, Ucon)
+    e2 = Utils.set_econ_from_trial(4, ones_vector)
+    e3 = Utils.set_econ_from_trial(3, Bcon)
+    e4 = Utils.set_econ_from_trial(4, Kcon)
 
     e1 = Utils.normalize_vector(e1, Gcov)
 

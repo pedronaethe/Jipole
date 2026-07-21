@@ -7,10 +7,10 @@ using StaticArrays
 using LinearAlgebra
 using ..Constants
 
-export set_Econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
+export set_econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
 
 """
-    set_Econ_from_trial(defdir, trial)
+    set_econ_from_trial(defdir, trial)
 
 Copy the trial vector; if its spatial norm is too small, fall back to the
 unit vector along `defdir`.
@@ -22,7 +22,7 @@ unit vector along `defdir`.
 # Returns
 - The resulting tetrad basis vector.
 """
-function set_Econ_from_trial(defdir::Int, trial)
+function set_econ_from_trial(defdir::Int, trial)
     T = eltype(trial)
     norm = abs(trial[2]) + abs(trial[3]) + abs(trial[4])
     if norm <= Constants.SMALL

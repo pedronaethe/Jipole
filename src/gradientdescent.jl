@@ -19,9 +19,9 @@ using ..Autodiff
 using ..Imaging
 using ..Iharm
 
-export cost_func, GradientofCostFunction, FiniteDifferencesθ, FiniteDifferencesTrat,
-    FiniteDifferences_a, armijo_line_search!, true_conjugate_gradient_optimization,
-    true_conjugate_gradient_optimization_GRMHD
+export cost_func, gradient_of_cost_function, FiniteDifferencesθ, finite_differences_trat,
+    finite_differences_a, armijo_line_search!, true_conjugate_gradient_optimization,
+    true_conjugate_gradient_optimization_grmhd
 
 """
     cost_func(ImageObs, ImageTest)
@@ -51,7 +51,7 @@ function cost_func(ImageObs, ImageTest)
 end
 
 """
-    GradientofCostFunction(ImageObs, ImageTest, dI_dθo, dI_da)
+    gradient_of_cost_function(ImageObs, ImageTest, dI_dθo, dI_da)
 
 Gradient of [`cost_func`](@ref) with respect to `θo` and the second
 sensitivity parameter (`a` or `Rhigh`).
@@ -65,7 +65,7 @@ sensitivity parameter (`a` or `Rhigh`).
 # Returns
 - A tuple `(grad_θo, grad_a)`.
 """
-function GradientofCostFunction(ImageObs, ImageTest, dI_dθo, dI_da)
+function gradient_of_cost_function(ImageObs, ImageTest, dI_dθo, dI_da)
     if size(ImageObs) != size(ImageTest)
         throw(ArgumentError("ImageObs and ImageTest must have the same shape"))
     end
@@ -119,6 +119,13 @@ function FiniteDifferencesθ(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, So
     scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
     println("scale_factor = $scale_factor")
 
+    """
+        trace_image(Xcamera, description)
+
+    Trace geodesics from camera position `Xcamera` and integrate the
+    emission into a full image, printing `description` as a progress
+    label.
+    """
     function trace_image(Xcamera, description)
         println("Calculating $description...")
 
@@ -159,7 +166,7 @@ function FiniteDifferencesθ(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, So
 end
 
 """
-    FiniteDifferencesTrat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h_trat, bhspin, model, Rstop, trat_large, dump_filepath)
+    finite_differences_trat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h_trat, bhspin, model, Rstop, trat_large, dump_filepath)
 
 Finite-differences sensitivity of the image intensity to `trat_large`
 (`Rhigh`), reloading the GRMHD data at each of `trat_large ± h_trat`.
@@ -182,7 +189,7 @@ Finite-differences sensitivity of the image intensity to `trat_large`
 # Returns
 - A tuple `(dI_dRhigh, Imagec)`.
 """
-function FiniteDifferencesTrat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h_trat, bhspin, model, Rstop, trat_large, dump_filepath)
+function finite_differences_trat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h_trat, bhspin, model, Rstop, trat_large, dump_filepath)
     fovx = DXsize / ro
     fovy = DYsize / ro
     Xcam = MVector{4,Float64}(Camera.camera_position(ro, th, phi, bhspin, model))
@@ -190,6 +197,12 @@ function FiniteDifferencesTrat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, 
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
     scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
 
+    """
+        trace_variant(target_trat, description)
+
+    Reload the GRMHD data at `Rhigh = target_trat` and trace the full
+    image, printing `description` as a progress label.
+    """
     function trace_variant(target_trat, description)
         println("\n=== Processing $description ===")
 
@@ -242,7 +255,7 @@ function FiniteDifferencesTrat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, 
 end
 
 """
-    FiniteDifferences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h, bhspin, model, Rstop)
+    finite_differences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h, bhspin, model, Rstop)
 
 Finite-differences sensitivity of the image intensity to `a` (black hole
 spin), tracing full geodesics at each of `bhspin ± h`.
@@ -262,7 +275,7 @@ spin), tracing full geodesics at each of `bhspin ± h`.
 # Returns
 - A tuple `(dI_da, Imagec)`.
 """
-function FiniteDifferences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h, bhspin, model, Rstop)
+function finite_differences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, SourceD, freq, maxnstep, h, bhspin, model, Rstop)
     ah = bhspin + h
     al = bhspin - h
 
@@ -273,11 +286,11 @@ function FiniteDifferences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, So
     Xcaml = MVector{4,Float64}(Camera.camera_position(ro, th, phi, al, model))
 
     scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
-    trajectoryh = Geodesics.CalculateGeodesics(Xcamh, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, ah, Rstop, model)
-    trajectoryl = Geodesics.CalculateGeodesics(Xcaml, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, al, Rstop, model)
+    trajectoryh = Geodesics.calculate_geodesics(Xcamh, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, ah, Rstop, model)
+    trajectoryl = Geodesics.calculate_geodesics(Xcaml, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, al, Rstop, model)
 
-    Imageh = Imaging.IpoleGeoIntensityIntegration(trajectoryh, freq, pixels_x, pixels_y, ah, model)
-    Imagel = Imaging.IpoleGeoIntensityIntegration(trajectoryl, freq, pixels_x, pixels_y, al, model)
+    Imageh = Imaging.ipole_geo_intensity_integration(trajectoryh, freq, pixels_x, pixels_y, ah, model)
+    Imagel = Imaging.ipole_geo_intensity_integration(trajectoryl, freq, pixels_x, pixels_y, al, model)
 
     trajectoryh = nothing
     trajectoryl = nothing
@@ -285,8 +298,8 @@ function FiniteDifferences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, So
     dI_da = (Imageh - Imagel) / (2 * h)
 
     Xcam = MVector{4,Float64}(Camera.camera_position(ro, th, phi, bhspin, model))
-    trajectory = Geodesics.CalculateGeodesics(Xcam, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, bhspin, Rstop, model)
-    Imagec = Imaging.IpoleGeoIntensityIntegration(trajectory, freq, pixels_x, pixels_y, bhspin, model)
+    trajectory = Geodesics.calculate_geodesics(Xcam, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, bhspin, Rstop, model)
+    Imagec = Imaging.ipole_geo_intensity_integration(trajectory, freq, pixels_x, pixels_y, bhspin, model)
     trajectory = nothing
 
     return dI_da, Imagec
@@ -405,7 +418,7 @@ end
 Recover the observer inclination `θo` and/or black hole spin `a` that
 best reproduce the observed image `Iobs`, via conjugate-gradient descent
 on [`cost_func`](@ref) using the autodiff sensitivities from
-[`Autodiff.AutoDiffGeoTrajEulerMethod!`](@ref) (`Analytic`/`ThinDisk`
+[`Autodiff.autodiff_geo_traj_euler_method!`](@ref) (`Analytic`/`ThinDisk`
 models).
 
 # Arguments
@@ -466,6 +479,16 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
     dI_da = Matrix{Float64}(undef, nx, ny)
     I_calc = Matrix{Float64}(undef, nx, ny)
 
+    """
+        compute_cost_and_gradients(x_scaled_val, σ_pixels=0.0)
+
+    Compute the image, cost, and (θo, a)-gradient at the scaled parameter
+    vector `x_scaled_val`, optionally Gaussian-smoothing the image and
+    its derivatives by `σ_pixels` pixels first.
+
+    # Returns
+    - A tuple `(cost, grad_scaled)`.
+    """
     function compute_cost_and_gradients(x_scaled_val, σ_pixels=0.0)
         θo_val = x_scaled_val[1] * θo_scale
         a_val = x_scaled_val[2] * a_scale
@@ -477,7 +500,7 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
                 intensity_out = Ref{Float64}()
                 dI_da_out = Ref{Float64}()
 
-                Autodiff.AutoDiffGeoTrajEulerMethod!(thread_trajs[tid], dI_dθo_out, intensity_out, dI_da_out,
+                Autodiff.autodiff_geo_traj_euler_method!(thread_trajs[tid], dI_dθo_out, intensity_out, dI_da_out,
                     ro, θo_val, 0.0, a_val, nx, ny, nmaxstep, i, j, freq, fovx, fovy, model, Rstop)
 
                 I_calc[i+1, j+1] = intensity_out[]
@@ -489,7 +512,7 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
         dI_dθo = imfilter(dI_dθo, Kernel.gaussian(σ_pixels))
         dI_da = imfilter(dI_da, Kernel.gaussian(σ_pixels))
         cost = cost_func(Iobs, I_calc)
-        grad_θo, grad_a = GradientofCostFunction(Iobs, I_calc, dI_dθo, dI_da)
+        grad_θo, grad_a = gradient_of_cost_function(Iobs, I_calc, dI_dθo, dI_da)
 
         grad_scaled = [grad_θo * θo_scale, grad_a * a_scale]
 
@@ -503,6 +526,12 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
         return cost, grad_scaled
     end
 
+    """
+        constrained_armijo_line_search!(cost_func, x, grad, direction, bounds, scales, args...; kwargs...)
+
+    [`armijo_line_search!`](@ref), with `direction` first zeroed out along
+    any parameter component not being optimized (per `optimize_param`).
+    """
     function constrained_armijo_line_search!(cost_func, x, grad, direction, bounds, scales, args...; kwargs...)
         constrained_direction = copy(direction)
         if !optimize_theta
@@ -515,6 +544,16 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
         return armijo_line_search!(cost_func, x, grad, constrained_direction, bounds, scales, args...; kwargs...)
     end
 
+    """
+        check_convergence(cost, grad, cost_history, iteration)
+
+    Check whether the optimization has converged, by cost tolerance,
+    gradient norm, or stagnant relative improvement over the last 10
+    iterations.
+
+    # Returns
+    - `true` if any convergence criterion is met.
+    """
     function check_convergence(cost, grad, cost_history, iteration)
         cost_converged = cost < cost_tol
 
@@ -548,6 +587,14 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
     last_cost = nothing
     last_grad = nothing
 
+    """
+        cached_compute_cost_and_gradients(x_scaled_val, σ_pixels=0.0)
+
+    [`compute_cost_and_gradients`](@ref), reusing the last result instead
+    of recomputing if `x_scaled_val` is (approximately) unchanged since
+    the previous call — avoids redundant work when a line search
+    re-evaluates the same point.
+    """
     function cached_compute_cost_and_gradients(x_scaled_val, σ_pixels=0.0)
         if last_x_computed !== nothing && last_x_computed ≈ x_scaled_val
             println("Using cached computation for x = $x_scaled_val")
@@ -760,12 +807,12 @@ function true_conjugate_gradient_optimization(Iobs, ro, θoi, ai, freq, nx, ny, 
 end
 
 """
-    true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq, nx, ny, nmaxstep, fovx, fovy, phi, DXsize, DYsize, SourceD, model, Rstop, dump_filepath; kwargs...)
+    true_conjugate_gradient_optimization_grmhd(Iobs, ro, θoi, Rhighi, freq, nx, ny, nmaxstep, fovx, fovy, phi, DXsize, DYsize, SourceD, model, Rstop, dump_filepath; kwargs...)
 
 Recover the observer inclination `θo` and/or `Rhigh` that best reproduce
 the observed image `Iobs`, via conjugate-gradient descent on
 [`cost_func`](@ref), using either the autodiff sensitivities from
-[`Autodiff.AutoDiffGeoTrajEulerMethod_GRMHD!`](@ref) or finite differences
+[`Autodiff.autodiff_geo_traj_euler_method_grmhd!`](@ref) or finite differences
 (`Iharm` model).
 
 # Arguments
@@ -800,7 +847,7 @@ the observed image `Iobs`, via conjugate-gradient descent on
 # Returns
 - A tuple `(θos, Rhighs, costs, niter)`.
 """
-function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq, nx, ny, nmaxstep,
+function true_conjugate_gradient_optimization_grmhd(Iobs, ro, θoi, Rhighi, freq, nx, ny, nmaxstep,
     fovx, fovy, phi, DXsize, DYsize, SourceD, model, Rstop, dump_filepath;
     cost_tol=2e-11, param_tol=1e-8, grad_tol=1e-10,
     max_iterations=200, cg_restart_freq=20,
@@ -844,6 +891,20 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
     dI_dRhigh = Matrix{Float64}(undef, nx, ny)
     I_calc = Matrix{Float64}(undef, nx, ny)
 
+    """
+        compute_cost_and_gradients(x_scaled_val, compute_gradients, σ_pixels=0.0, simulation_data=nothing, sensemode="AD")
+
+    Compute the image, cost, and (if `compute_gradients`) the (θo,
+    Rhigh)-gradient at the scaled parameter vector `x_scaled_val`, via
+    either autodiff (`sensemode="AD"`) or finite differences
+    (`sensemode="FD"`, `θo` only). Reloads the GRMHD data at the current
+    `Rhigh` if it's being optimized. Optionally Gaussian-smooths the
+    image and its derivatives by `σ_pixels` pixels first.
+
+    # Returns
+    - A tuple `(cost, grad_scaled)` (`grad_scaled` is `zeros(2)` if
+      `compute_gradients` is `false`).
+    """
     function compute_cost_and_gradients(x_scaled_val, compute_gradients, σ_pixels=0.0, simulation_data=nothing, sensemode="AD")
         θo_val = x_scaled_val[1] * θo_scale
         Rhigh_val = x_scaled_val[2] * Rhigh_scale
@@ -860,7 +921,7 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
                         intensity_out = Ref{Float64}()
                         dI_dRhigh_out = Ref{Float64}()
 
-                        Autodiff.AutoDiffGeoTrajEulerMethod_GRMHD!(thread_trajs[tid], dI_dθo_out, intensity_out, dI_dRhigh_out,
+                        Autodiff.autodiff_geo_traj_euler_method_grmhd!(thread_trajs[tid], dI_dθo_out, intensity_out, dI_dRhigh_out,
                             ro, θo_val, phi, model.a, nx, ny, nmaxstep, i, j, freq, fovx, fovy, model, Rstop, simulation_data)
                         I_calc[i+1, j+1] = intensity_out[]
                         dI_dRhigh[i+1, j+1] = dI_dRhigh_out[]
@@ -880,7 +941,7 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
             dI_dθo = imfilter(dI_dθo, Kernel.gaussian(σ_pixels))
             dI_dRhigh = imfilter(dI_dRhigh, Kernel.gaussian(σ_pixels))
             cost = cost_func(Iobs, I_calc)
-            grad_θo, grad_Rhigh = GradientofCostFunction(Iobs, I_calc, dI_dθo, dI_dRhigh)
+            grad_θo, grad_Rhigh = gradient_of_cost_function(Iobs, I_calc, dI_dθo, dI_dRhigh)
 
             grad_scaled = [grad_θo * θo_scale, grad_Rhigh * Rhigh_scale]
 
@@ -912,6 +973,12 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
         return cost, zeros(2)
     end
 
+    """
+        constrained_armijo_line_search!(cost_func, x, grad, direction, bounds, scales, args...; kwargs...)
+
+    [`armijo_line_search!`](@ref), with `direction` first zeroed out along
+    any parameter component not being optimized (per `optimize_param`).
+    """
     function constrained_armijo_line_search!(cost_func, x, grad, direction, bounds, scales, args...; kwargs...)
         constrained_direction = copy(direction)
         if !optimize_theta
@@ -924,6 +991,16 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
         return armijo_line_search!(cost_func, x, grad, constrained_direction, bounds, scales, args...; kwargs...)
     end
 
+    """
+        check_convergence(cost, grad, cost_history, iteration)
+
+    Check whether the optimization has converged, by cost tolerance,
+    gradient norm, or stagnant relative improvement over the last 10
+    iterations.
+
+    # Returns
+    - `true` if any convergence criterion is met.
+    """
     function check_convergence(cost, grad, cost_history, iteration)
         cost_converged = cost < cost_tol
 
@@ -953,6 +1030,14 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
         return cost_converged || grad_converged || rel_improvement_converged
     end
 
+    """
+        cached_compute_cost_and_gradients(x_scaled_val, compute_gradients, σ_pixels=0.0, simulation_data=nothing, sensemode="AD")
+
+    Thin wrapper around [`compute_cost_and_gradients`](@ref) (kept
+    separate for naming symmetry with
+    [`true_conjugate_gradient_optimization`](@ref)'s cached variant; this
+    GRMHD version does not itself cache).
+    """
     function cached_compute_cost_and_gradients(x_scaled_val, compute_gradients, σ_pixels=0.0, simulation_data=nothing, sensemode="AD")
         c, g = compute_cost_and_gradients(x_scaled_val, compute_gradients, σ_pixels, simulation_data, sensemode)
         return c, g

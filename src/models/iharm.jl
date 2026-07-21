@@ -18,7 +18,7 @@ using ..Grid
 using ..Radiation
 using ..MaxwellJuettner
 
-export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data
+export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data, jar_calc_ad
 
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
@@ -702,39 +702,40 @@ end
 end
 
 function get_model_sigma(X, model::IharmParams, data)
+    T = eltype(X)
     if Grid.X_in_domain(X, model) == 0
-        return 0.0
+        return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-
     return Grid.interp_scalar_time(X, dataA.sigma, dataB.sigma, tfac, model.slow_light, model)
 end
 
 function get_sigma_smoothfac(sigma, model::IharmParams)
+    T = typeof(sigma)
     sigma_above = model.sigma_cut
     if model.sigma_cut_high > 0.0
         sigma_above = model.sigma_cut_high
     end
     if sigma < model.sigma_cut
-        return 1.0
+        return one(T)
     end
     if sigma > sigma_above
-        return 0.0
+        return zero(T)
     end
     dsig = sigma_above - model.sigma_cut
     return cos(π / 2.0 / dsig * (sigma - model.sigma_cut))
 end
 
 function get_model_ne(X, model::IharmParams, data)
+    T = eltype(X)
     if Grid.X_in_domain(X, model) == 0
-        return 0.0
+        return zero(T)
     end
-    sigma_smoothfac = 1.0
-
+    sigma_smoothfac = one(T)
     if USE_GEODESIC_SIGMACUT
         sigma = get_model_sigma(X, model, data)
         if sigma > model.sigma_cut
-            return 0.0
+            return zero(T)
         end
         sigma_smoothfac = get_sigma_smoothfac(sigma, model)
     end
@@ -743,24 +744,27 @@ function get_model_ne(X, model::IharmParams, data)
 end
 
 function get_model_thetae(X, model::IharmParams, data)
+    T = eltype(X)
     if Grid.X_in_domain(X, model) == 0
-        return 0.0
+        return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
     return Grid.interp_scalar_time(X, dataA.θe, dataB.θe, tfac, model.slow_light, model)
 end
 
 function get_model_thetae_deriv(X, model::IharmParams, data)
+    T = eltype(X)
     if Grid.X_in_domain(X, model) == 0
-        return 0.0
+        return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
     return Grid.interp_scalar_time(X, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light, model)
 end
 
 function get_model_b(X, model::IharmParams, data)
+    T = eltype(X)
     if Grid.X_in_domain(X, model) == 0
-        return 0.0
+        return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
     return Grid.interp_scalar_time(X, dataA.b, dataB.b, tfac, model.slow_light, model)
@@ -883,7 +887,9 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
         return (z_base, z_base, z_base, z_base)
     end
 
-    j = MaxwellJuettner.maxwell_juettner_I(b, θ, θe, nu, Ne) / nusq
+    #j = MaxwellJuettner.maxwell_juettner_I(b, θ, θe, nu, Ne) / nusq
+    j = MaxwellJuettner.maxwell_juettner_leung_I(Ne, nu, θe, b, θ) / nusq
+
     Bnuinv = Radiation.Bnu_inv(nu, θe)
     z_jk = zero(typeof(j))
 
@@ -891,12 +897,17 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
 
     if B
         dθe_dRhigh = get_model_thetae_deriv(X, model, data)
-        dj_dθe = ForwardDiff.derivative(θe -> MaxwellJuettner.maxwell_juettner_I(b, θ, θe, nu, Ne) / nusq, θe)
+        v_b = ForwardDiff.value(b); v_θ = ForwardDiff.value(θ); v_nu = ForwardDiff.value(nu)
+        v_Ne = ForwardDiff.value(Ne); v_nusq = ForwardDiff.value(nusq); v_θe = ForwardDiff.value(θe)
+        v_Bnuinv = ForwardDiff.value(Bnuinv); v_j = ForwardDiff.value(j)
 
-        if Bnuinv > 0
-            dk_dθe = (dj_dθe * Bnuinv - j * ForwardDiff.derivative(θe -> Radiation.Bnu_inv(nu, θe), θe)) / (Bnuinv * Bnuinv)
+        dj_dθe = ForwardDiff.derivative(t -> MaxwellJuettner.maxwell_juettner_leung_I(v_Ne, v_nu, t, v_b, v_θ) / v_nusq, v_θe)
+
+        if v_Bnuinv > 0
+            dBnuinv_dθe = ForwardDiff.derivative(t -> Radiation.Bnu_inv(v_nu, t), v_θe)
+            dk_dθe = (dj_dθe * v_Bnuinv - v_j * dBnuinv_dθe) / (v_Bnuinv * v_Bnuinv)
         else
-            dk_dθe = z_jk
+            dk_dθe = zero(dj_dθe)
         end
 
         dj_dRhigh = dj_dθe * dθe_dRhigh
@@ -906,6 +917,39 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
     else
         return (j, k, z_jk, z_jk)
     end
+end
+
+
+"""
+    jar_calc_ad(X, Kcon, bhspin, model, data)
+
+Variant of [`jar_calc`](@ref) with no `Val{B}` branch, for use when `X`/`Kcon`
+are already `ForwardDiff.Dual` (the θo-sensitivity embedding used by
+[`Autodiff.calculate_gradients`](@ref)). Keeping this separate from `jar_calc`
+avoids GPU-compiling `jar_calc`'s nested-derivative `Val{true}` branch for the
+Dual-X specialization, which is otherwise fatal to compile.
+"""
+@inline function jar_calc_ad(X, Kcon, bhspin, model::IharmParams, data)
+    z_base = zero(eltype(X))
+    Ne = get_model_ne(X, model, data)
+    if Ne == 0.0
+        return (z_base, z_base)
+    end
+    elT = promote_type(eltype(X), typeof(bhspin))
+    Ucon, Ucov, Bcon, Bcov = get_model_fourv(X, Kcon, bhspin, model, data)
+    nu = Radiation.get_fluid_nu(Kcon, Ucov)
+    nusq = nu * nu
+    θ = Radiation.get_bk_angle(Kcon, Ucov, Bcon, Bcov)
+    b = get_model_b(X, model, data)
+    θe = get_model_thetae(X, model, data)
+    if θ <= zero(elT) || θ >= elT(π)
+        return (z_base, z_base)
+    end
+    j = MaxwellJuettner.maxwell_juettner_leung_I(Ne, nu, θe, b, θ) / nusq
+    Bnuinv = Radiation.Bnu_inv(nu, θe)
+    z_jk = zero(typeof(j))
+    k = (Bnuinv > 0) ? j / Bnuinv : z_jk
+    return (j, k)
 end
 
 """

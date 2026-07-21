@@ -54,7 +54,7 @@ function normalize_vector(vcon, Gcov)
     end
 
     norm = sqrt(abs(norm))
-    T = eltype(vcon)
+    T = promote_type(eltype(vcon), eltype(Gcov))
     return SVector{4,T}(vcon[1] / norm, vcon[2] / norm, vcon[3] / norm, vcon[4] / norm)
 end
 
@@ -87,7 +87,7 @@ function project_out(vcona, vconb, Gcov)
         end
     end
     fac = adotb / vconb_sq
-    T = eltype(vcona)
+    T = promote_type(eltype(vcona), eltype(vconb), eltype(Gcov))
     return SVector{4,T}(vcona[1] - vconb[1] * fac, vcona[2] - vconb[2] * fac,
         vcona[3] - vconb[3] * fac, vcona[4] - vconb[4] * fac)
 end
@@ -123,7 +123,7 @@ Check the handedness of a tetrad basis.
   `-1` for a left-handed one.
 """
 function check_handedness(Econ, Gcov)
-    T = eltype(Econ)
+    T = promote_type(eltype(Econ), eltype(Gcov))
     g = det(Gcov)
     if abs(g) < 1e-14
         return (1, zero(T))

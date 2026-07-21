@@ -5,9 +5,32 @@ electron distribution).
 module MaxwellJuettner
 
 using Bessels
+using ForwardDiff
 using ..Constants
-
 export get_nu_c, I_I, maxwell_juettner_dexter_I, maxwell_juettner_leung_I, maxwell_juettner_I
+
+
+"""
+    Bessels.besselk(v::Real, x::ForwardDiff.Dual{T,V,N}) where {T,V,N}
+
+Compute the modified Bessel function of the second kind for a ForwardDiff.Dual number. 
+This is a patch because the Bessels.jl package does not natively support ForwardDiff.Dual types.
+
+# Arguments
+- `v`: Order of the Bessel function.
+- `x`: Input value, which can be a ForwardDiff.Dual number.
+
+# Returns
+- The value of the modified Bessel function of the second kind evaluated at `x` and its derivative with respect to `x`.
+"""
+function Bessels.besselk(v::Real, x::ForwardDiff.Dual{T,V,N}) where {T,V,N}
+    val = ForwardDiff.value(x)
+    partials = ForwardDiff.partials(x)
+    kv = Bessels.besselk(v, val)
+    kv_minus = Bessels.besselk(v - 1, val)
+    deriv = -kv_minus - (v / val) * kv
+    return ForwardDiff.Dual{T}(kv, deriv * partials)
+end
 
 """
     get_nu_c(B)
@@ -84,17 +107,16 @@ Leung et al. (2011) fit for the thermal synchrotron emissivity.
 - The emissivity (erg/s/cm^3).
 """
 function maxwell_juettner_leung_I(Ne, ν, θe, B, θ)
-    K2 = max(besselk(2, 1.0 / θe), Constants.SMALL)
+    T = promote_type(typeof(Ne), typeof(ν), typeof(θe), typeof(B), typeof(θ))
+    K2 = max(besselk(2, 1.0 / θe), T(Constants.SMALL))
     nuc = Constants.EE * B / (2.0 * π * Constants.ME * Constants.CL)
     nus = (2.0 / 9.0) * nuc * θe * θe * sin(θ)
     if ν > 1.e12 * nus
-        return 0.0
+        return zero(T)
     end
-
     x = ν / nus
     f = (x^(1.0 / 2.0) + 2.0^(11.0 / 12.0) * x^(1.0 / 6.0))^2
     j = (sqrt(2.0) * π * Constants.EE^2 * Ne * nus / (3.0 * Constants.CL * K2)) * f * exp(-x^(1.0 / 3.0))
-
     return j
 end
 

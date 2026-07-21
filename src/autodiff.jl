@@ -9,6 +9,8 @@ module Autodiff
 using LinearAlgebra
 using StaticArrays
 using ForwardDiff
+using CUDA
+using ..Iharm
 using ..Constants
 using ..GeoTypes
 using ..Coordinates
@@ -18,7 +20,7 @@ using ..Radiation
 using ..DebugFunctions
 using ..ThinDisk
 
-export AutoDiffGeoTrajEulerMethod!, AutoDiffGeoTrajEulerMethod_GRMHD!
+export AutoDiffGeoTrajEulerMethod!, AutoDiffGeoTrajEulerMethod_GRMHD!, raytrace_gradients_GPU!, calculate_gradients
 
 """
     Mom4ODE(X, Kcon, bhspin, model)
@@ -35,7 +37,7 @@ Right-hand side of the photon geodesic ODE, `dK^μ/dλ = -Γ^μ_{αβ} K^α K^β
 - `dKcon/dλ`.
 """
 function Mom4ODE(X::AbstractVector, Kcon::AbstractVector, bhspin, model)
-    T = eltype(Kcon)
+    T = promote_type(eltype(X), eltype(Kcon))
 
     lconn = Geodesics.get_connection_analytic(X, bhspin, model)
 
@@ -496,6 +498,205 @@ function AutoDiffGeoTrajEulerMethod_GRMHD!(traj, dI_dθo_out::Base.RefValue{Floa
     dI_dRhigh_out[] = dI_dRhigh * freq^3
     intensity_out[] = Intensity * freq^3
     empty!(traj)
+    return nothing
+end
+
+"""
+    raytrace_gradients_GPU!(d_traj, d_Image, d_dI_dθo, d_dI_dRhigh, i_offset, j_offset,
+        block_size_x, block_size_y, ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx,
+        fovy, Rout, Rstop, data, params)
+
+GPU kernel launcher for [`calculate_gradients`](@ref): computes the image
+intensity together with its derivatives w.r.t. `θo` and `Rhigh`, tiled the
+same way as [`Imaging.raytrace_image_GPU!`](@ref).
+"""
+function raytrace_gradients_GPU!(
+    d_traj, d_Image, d_dI_dθo, d_dI_dRhigh,
+    i_offset, j_offset, block_size_x, block_size_y,
+    ro, θo, phi, bhspin, nx, ny, nmaxstep,
+    freq, fovx, fovy, Rout, Rstop, data, params
+)
+    local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+
+    i = local_i - 1 + i_offset
+    j = local_j - 1 + j_offset
+
+    if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
+        calculate_gradients(
+            d_traj, d_Image, d_dI_dθo, d_dI_dRhigh,
+            ro, θo, phi, bhspin, nx, ny, nmaxstep,
+            i, j, local_i, local_j, freq, fovx, fovy, Rout, Rstop, params, data
+        )
+    end
+    return nothing
+end
+
+"""
+    calculate_gradients(traj, d_Image, d_dI_dθo, d_dI_dRhigh, ro, θo, phi, bhspin, nx, ny,
+        nmaxstep, i_global, j_global, i_local, j_local, freq, fovx, fovy, Rout, Rstop,
+        model, data=nothing)
+
+Per-pixel kernel body for [`raytrace_gradients_GPU!`](@ref). Computes the
+θo-sensitivity of the geodesic by carrying a linearized (`dX`, `dK`)
+tangent vector alongside the trajectory (via a single-perturbation
+`ForwardDiff.Dual` embedding evaluated through [`Mom4ODE`](@ref) each step,
+avoiding the need for a materialized Jacobian), and combines it with the
+analytic `Rhigh`-derivative from [`Iharm.jar_calc`](@ref) using a
+2-component `ForwardDiff.Dual` in the radiative-transfer integration.
+"""
+function calculate_gradients(
+    traj, d_Image, d_dI_dθo, d_dI_dRhigh,
+    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64,
+    nx::Int64, ny::Int64, nmaxstep::Int64,
+    i_global::Int64, j_global::Int64,
+    i_local::Int64, j_local::Int64,
+    freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, model,
+    data::T_data=nothing
+) where {T_data}
+
+    if (i_global >= nx || j_global >= ny)
+        return nothing
+    end
+
+    dX_dθo = ForwardDiff.derivative(
+        x -> Camera.camera_position(ro, x, phi, bhspin, model),
+        θo
+    )
+
+    dK_dθo = ForwardDiff.derivative(x -> begin
+        Xcam_dual = Camera.camera_position(ro, x, phi, bhspin, model)
+        K_init = Geodesics.init_Kcon(i_global, j_global, Xcam_dual, nx, ny, fovx, fovy, bhspin, model)
+        return K_init * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
+    end, θo)
+
+    Xcam = SVector{4,Float64}(Camera.camera_position(ro, θo, phi, bhspin, model))
+    Kcon = Geodesics.init_Kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Kcon = Kcon * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
+
+    dl_unit::Float64 = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
+    Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
+
+    X = Xcam
+    K = Kcon
+    Xhalf = SVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
+    Khalf = SVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
+
+    dX = dX_dθo
+    dK = dK_dθo
+
+    step::Int64 = 1
+    @inbounds traj[i_local, j_local, step] = GeoTypes.OfTrajGRMHD(
+        0.0, X, K, Xhalf, Khalf, dX, dK
+    )
+
+    while (Geodesics.stop_backward_integration(X, K, Rh, Rstop) == 0 && (step < nmaxstep))
+        @inbounds begin
+            dl = Geodesics.stepsize(X, K, model.cstartx, model.cstopx)
+            scaled_dl = dl * dl_unit
+
+            X_dual = ForwardDiff.Dual{Nothing}.(X, dX)
+            K_dual = ForwardDiff.Dual{Nothing}.(K, dK)
+
+            dK_dual = Mom4ODE(X_dual, K_dual, bhspin, model)
+
+            d_dK_dl = SVector{4}(
+                ForwardDiff.partials(dK_dual[1], 1),
+                ForwardDiff.partials(dK_dual[2], 1),
+                ForwardDiff.partials(dK_dual[3], 1),
+                ForwardDiff.partials(dK_dual[4], 1)
+            )
+
+            next_dX = dX - dl * dK
+            next_dK = dK - dl * d_dK_dl
+
+            X, K, Xhalf, Khalf = Geodesics.push_photon(X, K, -dl, bhspin, model)
+
+            dX = next_dX
+            dK = next_dK
+
+            step += 1
+            traj[i_local, j_local, step] = GeoTypes.OfTrajGRMHD(
+                scaled_dl, X, K, Xhalf, Khalf, dX, dK
+            )
+        end
+    end
+
+    Intensity = 0.0
+    dI_dθo = 0.0
+    dI_dRhigh = 0.0
+
+    @inbounds Xi_S = traj[i_local, j_local, step].X
+    @inbounds Kconi_S = traj[i_local, j_local, step].Kcon
+    @inbounds dX_dθo_i = traj[i_local, j_local, step].dX_dθo
+    @inbounds dK_dθo_i = traj[i_local, j_local, step].dK_dθo
+
+    ji, ki, dji_dRhigh, dki_dRhigh = Radiation.get_jk(Xi_S, Kconi_S, freq, bhspin, model, data, Val(true))
+
+    Xi_dual = ForwardDiff.Dual{Nothing}.(Xi_S, dX_dθo_i)
+    Ki_dual = ForwardDiff.Dual{Nothing}.(Kconi_S, dK_dθo_i)
+    ji_dual_theta, ki_dual_theta = Iharm.jar_calc_ad(Xi_dual, Ki_dual, bhspin, model, data)
+
+    need_recalc_duals = false
+
+    @inbounds for nstep in step:-1:2
+        Xf_S = traj[i_local, j_local, nstep-1].X
+
+        if !Radiation.radiating_region(Xf_S, model, Rh)
+            need_recalc_duals = true
+            continue
+        end
+
+        if need_recalc_duals
+            Xi_S_bound = traj[i_local, j_local, nstep].X
+            Kconi_S_bound = traj[i_local, j_local, nstep].Kcon
+            dX_dθo_i_bound = traj[i_local, j_local, nstep].dX_dθo
+            dK_dθo_i_bound = traj[i_local, j_local, nstep].dK_dθo
+
+            Xi_dual_bound = ForwardDiff.Dual{Nothing}.(Xi_S_bound, dX_dθo_i_bound)
+            Ki_dual_bound = ForwardDiff.Dual{Nothing}.(Kconi_S_bound, dK_dθo_i_bound)
+            ji_dual_theta, ki_dual_theta = Iharm.jar_calc_ad(Xi_dual_bound, Ki_dual_bound, bhspin, model, data)
+
+            need_recalc_duals = false
+        end
+
+        Kconf_S = traj[i_local, j_local, nstep-1].Kcon
+        dX_dθo_f = traj[i_local, j_local, nstep-1].dX_dθo
+        dK_dθo_f = traj[i_local, j_local, nstep-1].dK_dθo
+        dl_step = traj[i_local, j_local, nstep].dl
+
+        jf, kf, djf_dRhigh, dkf_dRhigh = Radiation.get_jk(Xf_S, Kconf_S, freq, bhspin, model, data, Val(true))
+
+        Xf_dual = ForwardDiff.Dual{Nothing}.(Xf_S, dX_dθo_f)
+        Kf_dual = ForwardDiff.Dual{Nothing}.(Kconf_S, dK_dθo_f)
+        jf_dual_theta, kf_dual_theta = Iharm.jar_calc_ad(Xf_dual, Kf_dual, bhspin, model, data)
+
+        P2 = ForwardDiff.Partials{2,Float64}
+        ji_comb = ForwardDiff.Dual{Nothing}(ji, P2((ForwardDiff.partials(ji_dual_theta, 1), dji_dRhigh)))
+        ki_comb = ForwardDiff.Dual{Nothing}(ki, P2((ForwardDiff.partials(ki_dual_theta, 1), dki_dRhigh)))
+        jf_comb = ForwardDiff.Dual{Nothing}(jf, P2((ForwardDiff.partials(jf_dual_theta, 1), djf_dRhigh)))
+        kf_comb = ForwardDiff.Dual{Nothing}(kf, P2((ForwardDiff.partials(kf_dual_theta, 1), dkf_dRhigh)))
+
+        I_comb_in = ForwardDiff.Dual{Nothing}(Intensity, P2((dI_dθo, dI_dRhigh)))
+
+        I_comb_out = Radiation.approximate_solve(I_comb_in, ji_comb, ki_comb, jf_comb, kf_comb, dl_step)
+
+        Intensity = ForwardDiff.value(I_comb_out)
+        dI_dθo    = ForwardDiff.partials(I_comb_out, 1)
+        dI_dRhigh = ForwardDiff.partials(I_comb_out, 2)
+
+        CUDA.@cuassert !(isnan(Intensity) || isinf(Intensity)) "NaN/Inf encountered!"
+
+        ji = jf; ki = kf
+        dji_dRhigh = djf_dRhigh; dki_dRhigh = dkf_dRhigh
+        ji_dual_theta = jf_dual_theta; ki_dual_theta = kf_dual_theta
+    end
+
+    freq3 = freq^3
+    @inbounds d_Image[i_global+1, j_global+1]    = Intensity * freq3
+    @inbounds d_dI_dθo[i_global+1, j_global+1]   = dI_dθo * freq3
+    @inbounds d_dI_dRhigh[i_global+1, j_global+1] = dI_dRhigh * freq3
+
     return nothing
 end
 

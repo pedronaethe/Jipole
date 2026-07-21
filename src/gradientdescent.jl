@@ -116,7 +116,7 @@ function FiniteDifferencesθ(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, So
     Xcaml = MVector{4,Float64}(Camera.camera_position(ro, θl, phi, bhspin, model))
     Xcamc = MVector{4,Float64}(Camera.camera_position(ro, th, phi, bhspin, model))
 
-    scale_factor = Imaging.CalculateScaleFactor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
+    scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
     println("scale_factor = $scale_factor")
 
     function trace_image(Xcamera, description)
@@ -188,7 +188,7 @@ function FiniteDifferencesTrat(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, 
     Xcam = MVector{4,Float64}(Camera.camera_position(ro, th, phi, bhspin, model))
     freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
-    scale_factor = Imaging.CalculateScaleFactor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
+    scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
 
     function trace_variant(target_trat, description)
         println("\n=== Processing $description ===")
@@ -272,7 +272,7 @@ function FiniteDifferences_a(ro, th, phi, DXsize, DYsize, pixels_x, pixels_y, So
     Xcamh = MVector{4,Float64}(Camera.camera_position(ro, th, phi, ah, model))
     Xcaml = MVector{4,Float64}(Camera.camera_position(ro, th, phi, al, model))
 
-    scale_factor = Imaging.CalculateScaleFactor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
+    scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
     trajectoryh = Geodesics.CalculateGeodesics(Xcamh, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, ah, Rstop, model)
     trajectoryl = Geodesics.CalculateGeodesics(Xcaml, fovx, fovy, freq, maxnstep, pixels_x, pixels_y, al, Rstop, model)
 
@@ -895,7 +895,7 @@ function true_conjugate_gradient_optimization_GRMHD(Iobs, ro, θoi, Rhighi, freq
         else
             println("\n Computing image with \e[32mθo = $θo_val\e[0m, \e[32mRhigh = $Rhigh_val\e[0m and applying σ_pixels = \e[32m$σ_pixels\e[0m filter")
             Xcamera = MVector{4,Float64}(Camera.camera_position(ro, θo_val, phi, model.a, model))
-            scale_factor = Imaging.CalculateScaleFactor(DXsize, DYsize, nx, ny, SourceD, model.L_unit)
+            scale_factor = Imaging.calculate_scale_factor(DXsize, DYsize, nx, ny, SourceD, model.L_unit)
             Threads.@threads for i in 0:(nx-1)
                 tid = Threads.threadid()
                 for j in 0:(ny-1)

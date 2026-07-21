@@ -4,6 +4,7 @@ image/flux reporting.
 """
 module Imaging
 
+using ForwardDiff
 using CUDA
 using Printf
 using StaticArrays
@@ -13,7 +14,7 @@ using ..Camera
 using ..Geodesics
 using ..Radiation
 
-export IpoleGeoIntensityIntegration, OutputStokesParameters, CalculateScaleFactor
+export IpoleGeoIntensityIntegration, OutputStokesParameters, calculate_scale_factor, calculate_pixel_intensity
 
 """
     IpoleGeoIntensityIntegration(traj, freq_cgs, nx, ny, bhspin, model, data=nothing)
@@ -52,7 +53,7 @@ computed image.
 - `Image`: Computed intensity image.
 - `freq_cgs`: Frequency, in cgs units.
 - `scale_factor`: Scale factor for the image intensity (see
-  [`CalculateScaleFactor`](@ref)).
+  [`calculate_scale_factor`](@ref)).
 - `res`: Image resolution (assumed square).
 - `Dsource`: Distance to the source, in cm.
 """
@@ -82,7 +83,7 @@ function OutputStokesParameters(Image, freq_cgs, scale_factor, res, Dsource)
 end
 
 """
-    CalculateScaleFactor(sizex, sizey, pixelsx, pixelsy, SourceD, LengthUnit)
+    calculate_scale_factor(sizex, sizey, pixelsx, pixelsy, SourceD, LengthUnit)
 
 Compute the scale factor for the image, converting the per-pixel
 intensity to a flux density.
@@ -96,7 +97,7 @@ intensity to a flux density.
 # Returns
 - The scale factor.
 """
-function CalculateScaleFactor(sizex, sizey, pixelsx, pixelsy, SourceD, LengthUnit)
+function calculate_scale_factor(sizex, sizey, pixelsx, pixelsy, SourceD, LengthUnit)
     return (sizex * LengthUnit / pixelsx) * (sizey * LengthUnit / pixelsy) / (SourceD * SourceD) / Constants.JY
 end
 
@@ -204,6 +205,68 @@ function calculate_image!(
     return nothing
 end
 
+"""
+    calculate_pixel_intensity(traj, ro, θo, phi, bhspin, i, j, nx, ny, fovx, fovy,
+        freq, Rstop, nmaxstep, model, data=nothing)
 
+Compute pixel `(i, j)`'s intensity by carrying `θo` as-is through the
+entire computation (geodesic integration and radiative transfer) — unlike
+[`Autodiff.calculate_gradients`](@ref)'s linearized-tangent-vector
+approach, this differentiates through the whole process directly, so it
+works for `θo::Float64` (an ordinary intensity) just as well as
+`θo::ForwardDiff.Dual` (differentiable). CPU/GPU-agnostic: `traj` must be
+a pre-allocated, indexable buffer of `OfTrajDual{typeof(θo)}` sized to
+`nmaxstep` (a plain `Vector` on the CPU, or a `CuDeviceArray` slice from a
+GPU kernel) — nothing here is CUDA-specific.
+
+Note: the adaptive step size itself is computed from the *value* of
+`X`/`Kcon` (not their sensitivity) — it's a numerical step-size heuristic,
+not physics you actually want a θo-derivative of.
+"""
+function calculate_pixel_intensity(traj, ro, θo::T, phi, bhspin, i::Int, j::Int,
+    nx::Int, ny::Int, fovx, fovy, freq, Rstop, nmaxstep::Int, model, data=nothing) where {T}
+
+    Xcam = SVector{4,T}(Camera.camera_position(ro, θo, phi, bhspin, model))
+    Kcon0 = Geodesics.init_Kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
+    Kcon = Kcon0 .* T(freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
+    dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
+    Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
+
+    X = Xcam
+    K = Kcon
+    @inbounds traj[1] = GeoTypes.OfTrajDual{T}(zero(T), X, K)
+
+    step = 1
+    Xv = SVector{4,Float64}(ForwardDiff.value.(X))
+    Kv = SVector{4,Float64}(ForwardDiff.value.(K))
+    while Geodesics.stop_backward_integration(Xv, Kv, Rh, Rstop) == 0 && step < nmaxstep
+        dl = Geodesics.stepsize(Xv, Kv, model.cstartx, model.cstopx)
+        Xnew, Knew, _, _ = Geodesics.push_photon(X, K, -dl, bhspin, model)
+        X, K = Xnew, Knew
+        Xv = SVector{4,Float64}(ForwardDiff.value.(X))
+        Kv = SVector{4,Float64}(ForwardDiff.value.(K))
+        step += 1
+        @inbounds traj[step] = GeoTypes.OfTrajDual{T}(dl * dl_unit, X, K)
+    end
+
+    Intensity = zero(T)
+    @inbounds Xi = traj[step].X
+    @inbounds Ki = traj[step].Kcon
+    ji, ki, _, _ = Radiation.get_jk(Xi, Ki, freq, bhspin, model, data)
+
+    @inbounds for nstep in step:-1:2
+        Xf = traj[nstep-1].X
+        Xf_v = SVector{4,Float64}(ForwardDiff.value.(Xf))
+        if !Radiation.radiating_region(Xf_v, model, Rh)
+            continue
+        end
+        Kf = traj[nstep-1].Kcon
+        jf, kf, _, _ = Radiation.get_jk(Xf, Kf, freq, bhspin, model, data)
+        Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep].dl)
+        ji = jf
+        ki = kf
+    end
+    return Intensity * T(freq^3)
+end
 
 end

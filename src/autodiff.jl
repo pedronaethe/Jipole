@@ -19,8 +19,8 @@ using ..Geodesics
 using ..Radiation
 using ..DebugFunctions
 using ..ThinDisk
-
-export AutoDiffGeoTrajEulerMethod!, AutoDiffGeoTrajEulerMethod_GRMHD!, raytrace_gradients_GPU!, calculate_gradients
+using ..Imaging
+export AutoDiffGeoTrajEulerMethod!, AutoDiffGeoTrajEulerMethod_GRMHD!, raytrace_gradients_GPU!, calculate_gradients, differentiate_pixel_intensity
 
 """
     Mom4ODE(X, Kcon, bhspin, model)
@@ -698,6 +698,26 @@ function calculate_gradients(
     @inbounds d_dI_dRhigh[i_global+1, j_global+1] = dI_dRhigh * freq3
 
     return nothing
+end
+
+
+"""
+    differentiate_pixel_intensity(θo, i, j, bhspin, model, data, ro, phi, nx, ny,
+        fovx, fovy, freq, Rstop, nmaxstep, traj)
+
+Compute pixel `(i, j)`'s intensity and its θo-derivative by seeding `θo` as
+a `ForwardDiff.Dual` and calling [`Imaging.calculate_pixel_intensity`](@ref).
+`traj` must be a pre-allocated `Vector{GeoTypes.OfTrajDual{ForwardDiff.Dual{Nothing,Float64,1}}}`
+sized to `nmaxstep`.
+
+# Returns
+- A tuple `(I, dI_dθo)`.
+"""
+function differentiate_pixel_intensity(θo::Float64, i::Int, j::Int, bhspin, model, data,
+    ro, phi, nx::Int, ny::Int, fovx, fovy, freq, Rstop, nmaxstep::Int, traj)
+    d = ForwardDiff.Dual{Nothing}(θo, 1.0)
+    out = Imaging.calculate_pixel_intensity(traj, ro, d, phi, bhspin, i, j, nx, ny, fovx, fovy, freq, Rstop, nmaxstep, model, data)
+    return ForwardDiff.value(out), ForwardDiff.partials(out, 1)
 end
 
 end

@@ -574,8 +574,8 @@ the connection coefficients `lconn`.
 # Returns
 - The change in 4-momentum, `dKcon`.
 """
-@inline function compute_dKcon(dl::Float64, lconn, Kcon::SVector{4,Float64})
-    dK1 = dK2 = dK3 = dK4 = 0.0
+@inline function compute_dKcon(dl, lconn, Kcon::SVector{4,T}) where {T}
+    dK1 = dK2 = dK3 = dK4 = zero(T)
     @inbounds for i in 1:4, j in 1:4
         term = Kcon[i] * Kcon[j] * dl
         dK1 -= lconn[1, i, j] * term
@@ -583,7 +583,7 @@ the connection coefficients `lconn`.
         dK3 -= lconn[3, i, j] * term
         dK4 -= lconn[4, i, j] * term
     end
-    return SVector{4,Float64}(dK1, dK2, dK3, dK4)
+    return SVector{4,T}(dK1, dK2, dK3, dK4)
 end
 
 """
@@ -603,7 +603,7 @@ backward, depending on its sign), using a midpoint (RK2) integrator.
 # Returns
 - A tuple `(new_X, new_Kcon, Xhalf, Kconhalf)`.
 """
-Base.@inline function push_photon(X::SVector{4,Float64}, Kcon::SVector{4,Float64}, dl::Float64, bhspin::Float64, model)
+Base.@inline function push_photon(X::SVector{4,T}, Kcon::SVector{4,T}, dl, bhspin, model) where {T}
     lconn_half = get_connection_analytic(X, bhspin, model)
     dKcon_half = compute_dKcon(0.5 * dl, lconn_half, Kcon)
     Kconhalf = Kcon + dKcon_half

@@ -62,4 +62,16 @@ struct OfTrajGRMHD
     dK_dθo::SVector{4, Float64}
 end
 
+"""
+Immutable record of a single geodesic step, generic over element type `T`
+so it can carry `ForwardDiff.Dual` (used when differentiating the full
+geodesic + radiative-transfer computation directly, as opposed to the
+separate linearized-tangent-vector approach `OfTrajGRMHD` is used for).
+"""
+struct OfTrajDual{T}
+    dl::T
+    X::SVector{4,T}
+    Kcon::SVector{4,T}
+end
+
 end

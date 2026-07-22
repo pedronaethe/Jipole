@@ -1,31 +1,68 @@
+"""
+Coordinate transformations between the internal (simulation) coordinates,
+Kerr-Schild coordinates, and Boyer-Lindquist coordinates.
 
-export theta_func
+The functions that depend on the coordinate mapping used by a given model
+(`bl_coord`, `bl_coord!`, `set_ks_jacobian`) are generic on `model::AbstractModel`:
+the method defined here is the default (matching the exponential-radial,
+uncompressed-polar mapping used by `Analytic`/`ThinDisk`), and `Iharm`
+overrides them with its metric-dependent (MKS/FMKS) mapping.
 
+Some of the functions here are reminescent from previous versions of the code and
+attempts to integrate with different packages. They are not gonna be deleted because 
+they might be useful in the future.
+"""
+module Coordinates
 
-function theta_func(X)
-    """
-    Computes the theta coordinate from the internal coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    """
-    _, th = bl_coord(X)
+using StaticArrays
+using LinearAlgebra
+using ..Constants
+using ..AbstractModels
+
+export get_theta_from_x, bl_to_ks, ks_to_bl, vec_to_bl, vec_to_ks, set_ks_jacobian,
+    gcov_ks, set_ks_jacobian_inverse, vec_from_ks, bl_coord, bl_coord!, flip_index, flip_index!
+
+"""
+    get_theta_from_x(X, model)
+
+Compute the polar coordinate `th` from the internal coordinates `X`.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The polar coordinate `th`.
+"""
+function get_theta_from_x(X, model)
+    _, th = bl_coord(X, model)
     return th
 end
 
+"""
+    bl_to_ks(X, ucon_bl, bhspin, model)
 
+Convert a contravariant 4-vector from Boyer-Lindquist to Kerr-Schild
+coordinates.
 
-function bl_to_ks(X, ucon_bl, bhspin)
-    """
-    Converts the 4-velocity from Boyer-Lindquist coordinates to Kerr-Schild coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    @ucon_bl: Contravariant 4-velocity in Boyer-Lindquist coordinates.
-    """
-    T = promote_type(eltype(X), eltype(ucon_bl), typeof(bhspin))  # Ensure correct type
-    ucon_ks = MVector{4, T}((zero(T), zero(T), zero(T), zero(T)))
+`bhspin` is a separate argument (rather than `model.a`) so this function
+stays differentiable when called on the autodiff path.
 
-    r, th = bl_coord(X)
-    trans = MMatrix{4, 4, T}(undef)
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `ucon_bl`: Contravariant 4-vector in Boyer-Lindquist coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The contravariant 4-vector in Kerr-Schild coordinates.
+"""
+function bl_to_ks(X, ucon_bl, bhspin, model)
+    T = promote_type(eltype(X), eltype(ucon_bl), typeof(bhspin))
+    ucon_ks = MVector{4,T}((zero(T), zero(T), zero(T), zero(T)))
+
+    r, _ = bl_coord(X, model)
+    trans = MMatrix{4,4,T}(undef)
     for μ in 1:4
         for ν in 1:4
             trans[μ, ν] = μ == ν ? one(T) : zero(T)
@@ -45,80 +82,93 @@ function bl_to_ks(X, ucon_bl, bhspin)
     return ucon_ks
 end
 
+"""
+    ks_to_bl(X, ucon_ks, bhspin, model)
 
+Convert a contravariant 4-vector from Kerr-Schild to Boyer-Lindquist
+coordinates.
 
+`bhspin` is a separate argument (rather than `model.a`) so this function
+stays differentiable when called on the autodiff path.
 
-function ks_to_bl(X, ucon_ks, bhspin::Float64)
-    """
-    Converts the 4-velocity from Kerr-Schild coordinates to Boyer-Lindquist coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    @ucon_ks: Contravariant 4-velocity in Kerr-Schild coordinates.
-    """
-    ucon_bl = zero(MVec4)
-    r, _ = bl_coord(X)
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `ucon_ks`: Contravariant 4-vector in Kerr-Schild coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters, used to select the coordinate mapping.
 
-    trans = MMat4(undef)
-    for μ in 1:NDIM
-        for ν in 1:NDIM
+# Returns
+- The contravariant 4-vector in Boyer-Lindquist coordinates.
+"""
+function ks_to_bl(X, ucon_ks, bhspin, model)
+    ucon_bl = zero(MVector{4,Float64})
+    r, _ = bl_coord(X, model)
+
+    trans = MMatrix{4,4,Float64}(undef)
+    for μ in 1:Constants.NDIM
+        for ν in 1:Constants.NDIM
             trans[μ, ν] = μ == ν ? 1.0 : 0.0
         end
     end
 
-    trans[1,2] = 2.0 * r / (r * r - 2.0 * r + bhspin * bhspin)
-    trans[4,2] = bhspin / (r * r - 2.0 * r + bhspin * bhspin)
+    trans[1, 2] = 2.0 * r / (r * r - 2.0 * r + bhspin * bhspin)
+    trans[4, 2] = bhspin / (r * r - 2.0 * r + bhspin * bhspin)
 
-    # Invert the transformation matrix
     rev_trans = inv(trans)
 
-    for μ in 1:NDIM
+    for μ in 1:Constants.NDIM
         ucon_bl[μ] = 0.0
-        for ν in 1:NDIM
+        for ν in 1:Constants.NDIM
             ucon_bl[μ] += rev_trans[μ, ν] * ucon_ks[ν]
         end
     end
 
     return ucon_bl
 end
-    
 
-    
-function vec_to_bl(X::MVec4, v_nat::MVec4, bhspin::Float64)
-    """
-    Converts a 4-vector from the native coordinate system to Boyer-Lindquist coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    @v_nat: 4-vector in the native coordinate system.
-    """
+"""
+    vec_to_bl(X, v_nat, bhspin, model)
 
-    #First, convert the vector to Kerr-Schild coordinates
-    v_ks = zero(MVec4)
-    dxdX = MMat4(undef)
-    dxdX = set_dxdX(X)
-    for μ in 1:NDIM
-        for ν in 1:NDIM
+Convert a 4-vector from the native (internal) coordinate system to
+Boyer-Lindquist coordinates, via Kerr-Schild coordinates.
+
+`bhspin` is a separate argument (rather than `model.a`) so this function
+stays differentiable when called on the autodiff path.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `v_nat`: 4-vector in the native coordinate system.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The 4-vector in Boyer-Lindquist coordinates.
+"""
+function vec_to_bl(X, v_nat, bhspin, model)
+    v_ks = zero(MVector{4,Float64})
+    dxdX = set_ks_jacobian(X, model)
+    for μ in 1:Constants.NDIM
+        for ν in 1:Constants.NDIM
             v_ks[μ] += dxdX[μ, ν] * v_nat[ν]
         end
     end
 
-    #Now, convert the Kerr-Schild vector to Boyer-Lindquist coordinates
-    vec_bl = zero(MVec4)
-    r, _ = bl_coord(X)
-    trans = MMat4(undef)
-    for μ in 1:NDIM
-        for ν in 1:NDIM
-            trans[μ, ν] = if μ == ν 1.0 else 0.0 end
+    vec_bl = zero(MVector{4,Float64})
+    r, _ = bl_coord(X, model)
+    trans = MMatrix{4,4,Float64}(undef)
+    for μ in 1:Constants.NDIM
+        for ν in 1:Constants.NDIM
+            trans[μ, ν] = μ == ν ? 1.0 : 0.0
         end
     end
-    trans[1,2] = 2.0 * r / (r * r - 2.0 * r + bhspin * bhspin)
-    trans[4,2] = bhspin / (r * r - 2.0 * r + bhspin * bhspin)
+    trans[1, 2] = 2.0 * r / (r * r - 2.0 * r + bhspin * bhspin)
+    trans[4, 2] = bhspin / (r * r - 2.0 * r + bhspin * bhspin)
 
-    # Invert the transformation matrix
     rev_trans = inv(trans)
 
-    for μ in 1:NDIM
-        ucon_bl[μ] = 0.0
-        for ν in 1:NDIM
+    for μ in 1:Constants.NDIM
+        vec_bl[μ] = 0.0
+        for ν in 1:Constants.NDIM
             vec_bl[μ] += rev_trans[μ, ν] * v_ks[ν]
         end
     end
@@ -126,19 +176,26 @@ function vec_to_bl(X::MVec4, v_nat::MVec4, bhspin::Float64)
     return vec_bl
 end
 
-function vec_to_ks(X::MVec4, v_nat::MVec4)
-    """
-    Converts a 4-vector from the native coordinate system to Kerr-Schild coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    @v_nat: 4-vector in the native coordinate system.
-    """
-    v_ks = zero(MVec4)
-    dxdX = MMat4(undef)
-    dxdX = set_dxdX(X)
+"""
+    vec_to_ks(X, v_nat, model)
 
-    for μ in 1:NDIM
-        for ν in 1:NDIM
+Convert a 4-vector from the native (internal) coordinate system to
+Kerr-Schild coordinates.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `v_nat`: 4-vector in the native coordinate system.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The 4-vector in Kerr-Schild coordinates.
+"""
+function vec_to_ks(X, v_nat, model)
+    v_ks = zero(MVector{4,Float64})
+    dxdX = set_ks_jacobian(X, model)
+
+    for μ in 1:Constants.NDIM
+        for ν in 1:Constants.NDIM
             v_ks[μ] += dxdX[μ, ν] * v_nat[ν]
         end
     end
@@ -146,103 +203,115 @@ function vec_to_ks(X::MVec4, v_nat::MVec4)
     return v_ks
 end
 
-function set_dxdX(X)
-    """
-    Computes the Jacobian matrix dxdX for the transformation from Kerr-Schild coordinates to internal coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    """
+"""
+    set_ks_jacobian(X, model)
+
+Compute the Jacobian matrix `dx/dX` for the transformation from Kerr-Schild
+coordinates to internal coordinates. This default method implements the
+uncompressed exponential-radial mapping used by `Analytic`/`ThinDisk`;
+`Iharm` provides a metric-dependent override.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The Jacobian matrix `dx/dX` as an `SMatrix`.
+"""
+function set_ks_jacobian(X, model::AbstractModel)
     T = eltype(X)
-    
-    # 1. Initialize an AD-safe, zeroed mutable static matrix
-    dxdX = zeros(MMatrix{4, 4, T})
-    
-    # 2. Set the trivial diagonal elements. 
-    # We use `one(T)` instead of `1.0` so it automatically becomes a Dual number if T is a Dual!
-    dxdX[1, 1] = one(T)
-    dxdX[4, 4] = one(T)
-    
-    # 3. Set the dynamic elements
-    dxdX[2, 2] = exp(X[2])
-    
-    if MODEL == "analytic" || MODEL == "thin_disk"
-        dxdX[3, 3] = T(π) # Cast to T for AD-safety
-    elseif MODEL == "iharm"
-        if params.metric == METRIC_MKS
-            dxdX[3, 3] = T(π) + (1 - params.hslope) * T(π) * cos(2 * T(π) * X[3])
-        elseif params.metric == METRIC_FMKS
-            dxdX[3, 2] = -exp(params.mks_smooth * (params.startx[2] - X[2])) * params.mks_smooth * (π/2 - π*X[3] +params.poly_norm * (2*X[3] - 1) * (1 + ((-1 + 2*X[3])/params.poly_xt)^params.poly_alpha / (1 + params.poly_alpha)) - 0.5 * (1 - params.hslope) * sin(2*π*X[3]))
-            dxdX[3, 3] = π + (1 - params.hslope) * π * cos(2*π*X[3]) +exp(params.mks_smooth * (params.startx[2] - X[2])) * (-π +2 * params.poly_norm * (1 + ((2*X[3]-1)/params.poly_xt)^params.poly_alpha / (params.poly_alpha + 1)) +(2 * params.poly_alpha * params.poly_norm * (2*X[3]-1) * ((2*X[3]-1)/params.poly_xt)^(params.poly_alpha-1)) / ((1 + params.poly_alpha) * params.poly_xt) -(1 - params.hslope) * π * cos(2*π*X[3]))
-        else
-            error("Unknown METRIC type: $METRIC")
-        end
+
+    m22 = exp(X[2])
+    m33 = T(π)
+
+    if m33 <= 0.0
+        m33 = T(1.0e-10)
     end
-    
-    if dxdX[3, 3] <= 0.0
-        println("Warning! dxdX[3,3] is non-positive: ", dxdX[3,3])
-        println("X[3] = ", X[3])
-        dxdX[3, 3] = T(1.0e-10)  # Cast to T for AD-safety
-    end
-    
-    # 4. FREEZE IT! Convert to an immutable SMatrix before returning.
-    # This completely eliminates the heap allocation.
-    return SMatrix(dxdX)
+
+    return SMatrix{4,4,T}(
+        one(T), zero(T), zero(T), zero(T),
+        zero(T), m22, zero(T), zero(T),
+        zero(T), zero(T), m33, zero(T),
+        zero(T), zero(T), zero(T), one(T)
+    )
 end
 
+"""
+    gcov_ks(r, th, bhspin)
+
+Compute the covariant Kerr-Schild metric tensor at Boyer-Lindquist radius
+`r` and polar angle `th`.
+
+# Arguments
+- `r`: Radial coordinate in Boyer-Lindquist coordinates.
+- `th`: Polar coordinate in Boyer-Lindquist coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+
+# Returns
+- The covariant metric tensor as an `SMatrix`.
+"""
 Base.@inline function gcov_ks(r, th, bhspin)
-    gcov = zeros(MMatrix{4, 4, Float64})
+    gcov = @MMatrix zeros(Float64, 4, 4)
     cth = cos(th)
     sth = sin(th)
 
     s2 = sth * sth
     rho2 = r * r + bhspin * bhspin * cth * cth
 
-    gcov[1,1] = -1. + 2. * r/rho2
-    gcov[1,2] = 2. * r/rho2
-    gcov[1,4] = -2. * bhspin * r * s2 / rho2
+    gcov[1, 1] = -1.0 + 2.0 * r / rho2
+    gcov[1, 2] = 2.0 * r / rho2
+    gcov[1, 4] = -2.0 * bhspin * r * s2 / rho2
 
-    gcov[2,1] = gcov[1,2]
-    gcov[2,2] = 1. + 2. * r/rho2
-    gcov[2,4] = -bhspin * s2 * (1. + 2. * r/rho2)
+    gcov[2, 1] = gcov[1, 2]
+    gcov[2, 2] = 1.0 + 2.0 * r / rho2
+    gcov[2, 4] = -bhspin * s2 * (1.0 + 2.0 * r / rho2)
 
-    gcov[3,3] = rho2
+    gcov[3, 3] = rho2
 
-    gcov[4,1] = gcov[1,4]
-    gcov[4,2] = gcov[2,4]
-    gcov[4,4] = s2 * (rho2 + bhspin * bhspin * s2 * (1. + 2. * r/rho2))
+    gcov[4, 1] = gcov[1, 4]
+    gcov[4, 2] = gcov[2, 4]
+    gcov[4, 4] = s2 * (rho2 + bhspin * bhspin * s2 * (1.0 + 2.0 * r / rho2))
     return SMatrix(gcov)
 end
 
-function set_dXdx(X)
-    """
-    Computes the inverse Jacobian matrix dXdx for the transformation from internal coordinates to Kerr-Schild coordinates.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    """
-    T = eltype(X)
-    dxdX = TMMat4{T}(undef)
-    dxdX = set_dxdX(X)
-    #invert matrix to find dXdx from dxdX using linear algebra package
-    dXdx = inv(dxdX)
+"""
+    set_ks_jacobian_inverse(X, model)
 
-    return dXdx
+Compute the inverse Jacobian matrix `dX/dx` for the transformation from
+internal coordinates to Kerr-Schild coordinates.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The inverse Jacobian matrix `dX/dx`.
+"""
+function set_ks_jacobian_inverse(X, model)
+    dxdX = set_ks_jacobian(X, model)
+    return inv(dxdX)
 end
 
+"""
+    vec_from_ks(X, v_ks, model)
 
-function vec_from_ks(X, v_ks)
-    """
-    Converts a 4-vector from Kerr-Schild coordinates to the native coordinate system.
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    @v_ks: 4-vector in Kerr-Schild coordinates.
-    """
-    v_nat = zero(TMVec4{eltype(v_ks)})
-    T = eltype(X)
-    dXdx = TMMat4{T}(undef)
-    dXdx = set_dXdx(X)
+Convert a 4-vector from Kerr-Schild coordinates to the native (internal)
+coordinate system.
 
-    for μ in 1:NDIM
-        for ν in 1:NDIM
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `v_ks`: 4-vector in Kerr-Schild coordinates.
+- `model`: Model parameters, used to select the coordinate mapping.
+
+# Returns
+- The 4-vector in the native coordinate system.
+"""
+function vec_from_ks(X, v_ks, model)
+    v_nat = zero(MVector{4,eltype(v_ks)})
+    dXdx = set_ks_jacobian_inverse(X, model)
+
+    for μ in 1:Constants.NDIM
+        for ν in 1:Constants.NDIM
             v_nat[μ] += dXdx[μ, ν] * v_ks[ν]
         end
     end
@@ -250,79 +319,78 @@ function vec_from_ks(X, v_ks)
     return v_nat
 end
 
+"""
+    bl_coord(X, model, R0=0.0)
 
-function bl_coord(X, R0::Float64 = 0.0)
-    """
-    Returns Boyer-Lindquist coordinates (r, th) from internal coordinates (X[2], X[3]).
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates coordinates.
-    """
-    r = exp(X[2]) + R0;
+Compute the Boyer-Lindquist coordinates `(r, th)` from the internal
+coordinates `X`. This default method implements the uncompressed
+exponential-radial mapping used by `Analytic`/`ThinDisk`; `Iharm` provides
+a metric-dependent override.
 
-    if(MODEL == "analytic" || MODEL == "thin_disk")
-        th = π *X[3]
-    elseif(MODEL == "iharm")
-        if(params.metric == METRIC_FMKS)
-            thG = π * X[3] + ((1. - params.hslope) / 2.) * sin(2. * π * X[3]);
-            y = 2 * X[3] - 1.;
-            thJ = params.poly_norm * y* (1. + ((y / params.poly_xt)^params.poly_alpha) / (params.poly_alpha + 1.)) + 0.5 * π;
-            th = thG + exp(params.mks_smooth * (params.startx[2] - X[2])) * (thJ - thG); 
-        elseif(params.metric == METRIC_MKS)
-            th = π * X[3] + ((1. - params.hslope) / 2.) * sin(2. * π * X[3]);
-        else
-            error("Unknown METRIC type: $(params.metric)")
-        end
-    end
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Model parameters, used to select the coordinate mapping.
+- `R0`: Optional radial coordinate shift.
+
+# Returns
+- A tuple `(r, th)`.
+"""
+function bl_coord(X, model::AbstractModel, R0::Float64=0.0)
+    r = exp(X[2]) + R0
+    th = π * X[3]
     return r, th
 end
 
-Base.@inline function bl_coord!(rt, X, R0::Float64 = 0.0)
-    """
-    Returns Boyer-Lindquist coordinates (r, th) from internal coordinates (X[2], X[3]).
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates coordinates.
-    """
-    rt[1] = exp(X[2]) + R0;
+"""
+    bl_coord!(rt, X, model, R0=0.0)
 
-    if(MODEL == "analytic" || MODEL == "thin_disk")
-        rt[2] = π *X[3]
-    elseif(MODEL == "iharm")
-        if(params.metric == METRIC_FMKS)
-            thG = π * X[3] + ((1. - params.hslope) / 2.) * sin(2. * π * X[3]);
-            y = 2 * X[3] - 1.;
-            thJ = params.poly_norm * y* (1. + ((y / params.poly_xt)^params.poly_alpha) / (params.poly_alpha + 1.)) + 0.5 * π;
-            rt[2] = thG + exp(params.mks_smooth * (params.startx[2] - X[2])) * (thJ - thG); 
-        elseif(params.metric == METRIC_MKS)
-            rt[2] = π * X[3] + ((1. - params.hslope) / 2.) * sin(2. * π * X[3]);
-        else
-            error("Unknown METRIC type: $(params.metric)")
-        end
-    end
+In-place version of [`bl_coord`](@ref), writing `(r, th)` into `rt`.
+
+# Arguments
+- `rt`: Output vector, overwritten with `(r, th)`.
+- `X`: Position four-vector in internal coordinates.
+- `model`: Model parameters, used to select the coordinate mapping.
+- `R0`: Optional radial coordinate shift.
+"""
+Base.@inline function bl_coord!(rt, X, model::AbstractModel, R0::Float64=0.0)
+    rt[1] = exp(X[2]) + R0
+    rt[2] = π * X[3]
 end
 
+"""
+    flip_index(vector, metric)
+
+Lower (or raise) the index of a 4-vector using the given metric tensor.
+
+# Arguments
+- `vector`: 4-vector whose index is to be flipped.
+- `metric`: Metric tensor used for flipping.
+
+# Returns
+- The flipped 4-vector.
+"""
 function flip_index(vector, metric)
-    """
-    Returns the flipped index of a vector using the metric tensor.
-    
-    Parameters:
-    @vector: Vector to be flipped.
-    @metric: Metric tensor used for flipping.
-    """
-    flipped_vector = zero(TMVec4{eltype(metric)})
-    for ν in 1:NDIM
-        for μ in 1:NDIM
-            flipped_vector[ν] += metric[ν, μ] * vector[μ]
-        end
-    end
-    return flipped_vector
+    return metric * vector
 end
 
+"""
+    flip_index!(flipped_vector, vector, metric)
+
+In-place version of [`flip_index`](@ref).
+
+# Arguments
+- `flipped_vector`: Output vector, overwritten with the flipped result.
+- `vector`: 4-vector whose index is to be flipped.
+- `metric`: Metric tensor used for flipping.
+"""
 @inline function flip_index!(flipped_vector, vector, metric)
-    @inbounds for ν in 1:NDIM
+    @inbounds for ν in 1:Constants.NDIM
         s = zero(eltype(vector))
-        for μ in 1:NDIM
+        for μ in 1:Constants.NDIM
             s += metric[ν, μ] * vector[μ]
         end
         flipped_vector[ν] = s
     end
+end
+
 end

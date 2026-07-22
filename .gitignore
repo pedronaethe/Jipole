@@ -4,6 +4,7 @@ scripts/*
 .CondaPkg
 # Ignore all txt by default
 *.txt
+#Except the table for the thin disk model!
 !Tables/ch24_vals.txt
 
 *.uvfits

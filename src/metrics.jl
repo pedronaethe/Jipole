@@ -1,17 +1,46 @@
+"""
+Metric tensor construction and inversion.
+
+`METRIC_*` are the metric-family identifiers shared by every model's
+`metric` field.
+"""
+module Metrics
+
 using LinearAlgebra
+using StaticArrays
+using ..Constants
+using ..Coordinates
+using ..DebugFunctions
 
+export METRIC_MKS, METRIC_BHACMKS, METRIC_FMKS, METRIC_MKS3, METRIC_EKS,
+    METRIC_MINKOWSKI, METRIC_EMINKOWSKI,
+    gdet_func, gcov_func!, gcov_func, gcov_func_fd, gcon_func!, gcon_func, gcov_bl!
+
+const METRIC_MKS = 0
+const METRIC_BHACMKS = 1
+const METRIC_FMKS = 2
+const METRIC_MKS3 = 3
+const METRIC_EKS = 4
+const METRIC_MINKOWSKI = 5
+const METRIC_EMINKOWSKI = 6
+
+"""
+    gdet_func(gcov)
+
+Compute the square root of the absolute determinant of the covariant
+metric tensor, via LU decomposition.
+
+# Arguments
+- `gcov`: Covariant metric tensor.
+
+# Returns
+- `sqrt(abs(det(gcov)))`, or `-1.0` if `gcov` is numerically singular.
+"""
 function gdet_func(gcov)
-    """
-    Returns the determinant of the covariant metric tensor.
-
-    Parameters:
-    @gcov: Covariant metric tensor in Kerr-Schild coordinates.
-    """
     F = lu(gcov)
     U = F.U
 
     if any(abs(U[i, i]) < 1e-14 for i in 1:size(U, 1))
-        @warn "Singular matrix in gdet_func!"
         return -1.0
     end
 
@@ -19,70 +48,63 @@ function gdet_func(gcov)
     return sqrt(abs(gdet))
 end
 
+"""
+    gcov_func!(X, bhspin, model, gcov, R0=0.0)
 
+In-place version of [`gcov_func`](@ref), writing the result into `gcov`.
 
-function gcov_func!(X, bhspin, gcov, R0::Float64 = 0.0)
-    """
-    Returns g_{munu} at location specified by X.
-    Adapted from ipole C code logic.
-    """
-    
-    # Get Boyer-Lindquist coordinates (r, theta)
-    r, th = bl_coord(X) 
+`bhspin` is a separate argument (rather than `model.a`) so this function
+stays differentiable when called on the autodiff path.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters (metric family via `model.metric`).
+- `gcov`: Output matrix, overwritten with the covariant metric tensor.
+- `R0`: Optional radial coordinate shift, reminescent from old MKS models.
+"""
+function gcov_func!(X, bhspin, model, gcov, R0::Float64=0.0)
+    r, th = Coordinates.bl_coord(X, model, R0)
     T = promote_type(typeof(r), typeof(th), typeof(bhspin))
-    # Initialize metric to zero
     fill!(gcov, 0.0)
 
-    
-    #Minkowski (Spherical Polar)
-    if params.metric == METRIC_MINKOWSKI
+    if model.metric == METRIC_MINKOWSKI
         gcov[1, 1] = -1.0
         gcov[2, 2] = 1.0
         gcov[3, 3] = r * r
         gcov[4, 4] = r * r * sin(th)^2
         return
-
-    # E-Minkowski (Exponential Radial, Spherical Polar)
-    elseif params.metric == METRIC_EMINKOWSKI
+    elseif model.metric == METRIC_EMINKOWSKI
         gcov[1, 1] = -1.0
-        gcov[2, 2] = r * r 
+        gcov[2, 2] = r * r
         gcov[3, 3] = r * r
         gcov[4, 4] = r * r * sin(th)^2
         return
-
-    # FMKS (Funky Modified Kerr-Schild)
-    elseif params.metric == METRIC_FMKS
-        sth = sin(th)
-        cth = cos(th)
-        s2 = sth^2
-        rho2 = r^2 + bhspin^2 * cth^2
     end
 
-    #MKS 
     Gcov_ks = @MMatrix zeros(T, 4, 4)
-    
+
     cth = cos(th)
     sth = sin(th)
     s2 = sth^2
     rho2 = r^2 + bhspin^2 * cth^2
-    
+
     Gcov_ks[1, 1] = -1.0 + 2.0 * r / rho2
     Gcov_ks[1, 2] = 2.0 * r / rho2
     Gcov_ks[1, 4] = -2.0 * bhspin * r * s2 / rho2
-    
+
     Gcov_ks[2, 1] = Gcov_ks[1, 2]
     Gcov_ks[2, 2] = 1.0 + 2.0 * r / rho2
     Gcov_ks[2, 4] = -bhspin * s2 * (1.0 + 2.0 * r / rho2)
-    
+
     Gcov_ks[3, 3] = rho2
-    
+
     Gcov_ks[4, 1] = Gcov_ks[1, 4]
     Gcov_ks[4, 2] = Gcov_ks[2, 4]
     Gcov_ks[4, 4] = s2 * (rho2 + bhspin^2 * s2 * (1.0 + 2.0 * r / rho2))
 
+    dxdX = Coordinates.set_ks_jacobian(X, model)
 
-    dxdX = set_dxdX(X)
-    
     fill!(gcov, 0.0)
     for mu in 1:4
         for nu in 1:4
@@ -97,103 +119,94 @@ function gcov_func!(X, bhspin, gcov, R0::Float64 = 0.0)
     end
 end
 
+"""
+    gcov_func(X, bhspin, model, R0=0.0)
 
-function gcov_func(X, bhspin, R0::Float64 = 0.0)
-    """
-    Returns g_{munu} at location specified by X.
-    Adapted from ipole C code logic.
-    """
-    
-    # Get Boyer-Lindquist coordinates (r, theta)
-    r, th = bl_coord(X) 
+Compute the covariant metric tensor `g_{mu,nu}` at the position `X`.
+Adapted from `ipole`'s C code logic.
+
+`bhspin` is a separate argument (rather than `model.a`) so this function
+stays differentiable when called on the autodiff path.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters (metric family via `model.metric`).
+- `R0`: Optional radial coordinate shift.
+
+# Returns
+- The covariant metric tensor.
+"""
+function gcov_func(X, bhspin, model, R0::Float64=0.0)
+    r, th = Coordinates.bl_coord(X, model, R0)
     T = promote_type(typeof(r), typeof(th), typeof(bhspin))
-    gcov = @MMatrix zeros(T, 4, 4)
-    
-    # Initialize metric to zero
-    fill!(gcov, 0.0)
 
-    
-    #Minkowski (Spherical Polar)
-    if params.metric == METRIC_MINKOWSKI
-        gcov[1, 1] = -1.0
-        gcov[2, 2] = 1.0
-        gcov[3, 3] = r * r
-        gcov[4, 4] = r * r * sin(th)^2
-        return gcov
-
-    # E-Minkowski (Exponential Radial, Spherical Polar)
-    elseif params.metric == METRIC_EMINKOWSKI
-        gcov[1, 1] = -1.0
-        gcov[2, 2] = r * r 
-        gcov[3, 3] = r * r
-        gcov[4, 4] = r * r * sin(th)^2
-        return gcov
-
+    if model.metric == METRIC_MINKOWSKI
+        return SMatrix{4,4,T}(
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+            0.0, 0.0, r * r, 0.0,
+            0.0, 0.0, 0.0, r * r * sin(th)^2
+        )
+    elseif model.metric == METRIC_EMINKOWSKI
+        return SMatrix{4,4,T}(
+            -1.0, 0.0, 0.0, 0.0,
+            0.0, r * r, 0.0, 0.0,
+            0.0, 0.0, r * r, 0.0,
+            0.0, 0.0, 0.0, r * r * sin(th)^2
+        )
     end
 
-    #MKS 
-    Gcov_ks = @MMatrix zeros(T, 4, 4)
-    
     cth = cos(th)
     sth = sin(th)
     s2 = sth^2
     rho2 = r^2 + bhspin^2 * cth^2
-    
-    Gcov_ks[1, 1] = -1.0 + 2.0 * r / rho2
-    Gcov_ks[1, 2] = 2.0 * r / rho2
-    Gcov_ks[1, 4] = -2.0 * bhspin * r * s2 / rho2
-    
-    Gcov_ks[2, 1] = Gcov_ks[1, 2]
-    Gcov_ks[2, 2] = 1.0 + 2.0 * r / rho2
-    Gcov_ks[2, 4] = -bhspin * s2 * (1.0 + 2.0 * r / rho2)
-    
-    Gcov_ks[3, 3] = rho2
-    
-    Gcov_ks[4, 1] = Gcov_ks[1, 4]
-    Gcov_ks[4, 2] = Gcov_ks[2, 4]
-    Gcov_ks[4, 4] = s2 * (rho2 + bhspin^2 * s2 * (1.0 + 2.0 * r / rho2))
 
+    term1 = 1.0 + 2.0 * r / rho2
+    term2 = 2.0 * r / rho2
+    term3 = -2.0 * bhspin * r * s2 / rho2
+    term4 = -bhspin * s2 * term1
 
-    dxdX = set_dxdX(X)
-    
-    fill!(gcov, 0.0)
-    for mu in 1:4
-        for nu in 1:4
-            sum_val = 0.0
-            for lam in 1:4
-                for kap in 1:4
-                    sum_val += Gcov_ks[lam, kap] * dxdX[lam, mu] * dxdX[kap, nu]
-                end
-            end
-            gcov[mu, nu] = sum_val
-        end
-    end
-    return gcov
+    Gcov_ks = SMatrix{4,4,T}(
+        -1.0 + term2, term2, 0.0, term3,
+        term2, term1, 0.0, term4,
+        0.0, 0.0, rho2, 0.0,
+        term3, term4, 0.0, s2 * (rho2 + bhspin^2 * s2 * term1)
+    )
+
+    dxdX = Coordinates.set_ks_jacobian(X, model)
+
+    return transpose(dxdX) * Gcov_ks * dxdX
 end
 
+"""
+    gcov_func_fd(X, bhspin, model, R0=0.0)
 
+Compute the covariant metric tensor via [`Coordinates.gcov_ks`](@ref) and
+the Jacobian from [`Coordinates.set_ks_jacobian`](@ref) (used as a finite-
+difference-friendly alternative to [`gcov_func`](@ref)).
 
-function gcov_func_fd(X, bhspin, R0::Float64 = 0.0)
-    """
-    Returns covariant metric tensor in Kerr-Schild coordinates.
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Model parameters.
+- `R0`: Optional radial coordinate shift.
 
-    Parameters:
-    @X: Vector of position coordinates in internal coordinates.
-    """
-    r, th = bl_coord(X)
+# Returns
+- The covariant metric tensor.
+"""
+function gcov_func_fd(X, bhspin, model, R0::Float64=0.0)
+    r, th = Coordinates.bl_coord(X, model, R0)
     T = promote_type(typeof(r), typeof(th), typeof(bhspin))
     gcov = @MMatrix zeros(T, 4, 4)
-    Gcov_ks = @MMatrix zeros(T, 4, 4)
-    gcov_ks(r, th, bhspin, Gcov_ks)
+    Gcov_ks = Coordinates.gcov_ks(r, th, bhspin)
 
-
-
-    dxdX = set_dxdX(X)
-    for μ in 1:NDIM
-        for ν in 1:NDIM
-            for λ in 1:NDIM
-                for κ in 1:NDIM
-                    gcov[μ, ν] +=  Gcov_ks[λ, κ] * dxdX[λ, μ] * dxdX[κ, ν] 
+    dxdX = Coordinates.set_ks_jacobian(X, model)
+    for μ in 1:Constants.NDIM
+        for ν in 1:Constants.NDIM
+            for λ in 1:Constants.NDIM
+                for κ in 1:Constants.NDIM
+                    gcov[μ, ν] += Gcov_ks[λ, κ] * dxdX[λ, μ] * dxdX[κ, ν]
                 end
             end
         end
@@ -201,52 +214,60 @@ function gcov_func_fd(X, bhspin, R0::Float64 = 0.0)
     return gcov
 end
 
+"""
+    gcon_func!(gcov, gcon)
+
+In-place version of [`gcon_func`](@ref), writing the result into `gcon`.
+
+It uses the `inv` function from `LinearAlgebra` to compute the inverse of the
+covariant metric tensor.
+
+# Arguments
+- `gcov`: Covariant metric tensor.
+- `gcon`: Output matrix, overwritten with the contravariant metric tensor.
+"""
 function gcon_func!(gcov, gcon)
-    """
-    Returns contravariant metric tensor in Kerr-Schild coordinates through matrix inversion of the covariant tensor.
-    Parameters:
-    @gcov: Covariant metric tensor in Kerr-Schild coordinates.
-    """
     gcon .= inv(gcov)
-    if any(isnan.(gcon)) || any(isinf.(gcon))
-        @error "Singular gcov encountered in gcon"
-        print_matrix("gcov", gcov)
-        print_matrix("gcon", gcon)
-        error("Singular gcov encountered, cannot compute gcon.")
-    end
 end
 
+"""
+    gcon_func(gcov)
+
+Compute the contravariant metric tensor by inverting the covariant metric
+tensor.
+
+It uses the `inv` function from `LinearAlgebra` to compute the inverse of the
+covariant metric tensor.
+
+# Arguments
+- `gcov`: Covariant metric tensor.
+
+# Returns
+- The contravariant metric tensor.
+"""
 function gcon_func(gcov)
-    """
-    Returns contravariant metric tensor in Kerr-Schild coordinates through matrix inversion of the covariant tensor.
-    Parameters:
-    @gcov: Covariant metric tensor in Kerr-Schild coordinates.
-    """
-    gcon = inv(gcov)
-    if any(isnan.(gcon)) || any(isinf.(gcon))
-        @error "Singular gcov encountered in gcon"
-        print_matrix("gcov", gcov)
-        print_matrix("gcon", gcon)
-        error("Singular gcov encountered, cannot compute gcon.")
-    end
-    return gcon
+    return inv(gcov)
 end
 
-function gcov_bl!(r,th, bhspin, gcov)
-    """
-    Computes the metric tensor in Boyer-Lindquist coordinates.
-    Parameters:
-    @r: Radial coordinate in Boyer-Lindquist coordinates.
-    @th: Angular coordinate in Boyer-Lindquist coordinates.
-    """
+"""
+    gcov_bl!(r, th, bhspin, gcov)
 
+Compute the covariant metric tensor in Boyer-Lindquist coordinates.
+
+# Arguments
+- `r`: Radial coordinate in Boyer-Lindquist coordinates.
+- `th`: Polar coordinate in Boyer-Lindquist coordinates.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `gcov`: Output matrix, overwritten with the covariant metric tensor.
+"""
+function gcov_bl!(r, th, bhspin, gcov)
     sth = sin(th)
-    if(sth < 1e-40)
+    if sth < 1e-40
         sth = 10^(-40)
     end
     cth = cos(th)
     s2 = sth * sth
-    if(r < 1e-40)
+    if r < 1e-40
         r = 10^(-40)
     end
     a2 = bhspin * bhspin
@@ -257,22 +278,22 @@ function gcov_bl!(r,th, bhspin, gcov)
     gcov[1, 1] = -(1.0 - 2.0 / (r * mu))
     gcov[1, 4] = -2.0 * bhspin * s2 / (r * mu)
     gcov[4, 1] = gcov[1, 4]
-    gcov[2, 2] = mu / (DD )
+    gcov[2, 2] = mu / (DD)
     gcov[3, 3] = r2 * mu
     gcov[4, 4] = r2 * sth * sth * (1.0 + a2 / r2 + 2.0 * a2 * s2 / (r2 * r * mu))
 
-    #if any element of the diagonal is zero print variables
-    if(gcov[1,1] == 0 || gcov[2,2] == 0 || gcov[3,3] == 0 || gcov[4,4] == 0)   
+    if gcov[1, 1] == 0 || gcov[2, 2] == 0 || gcov[3, 3] == 0 || gcov[4, 4] == 0
         @error "Singular gcov encountered in gcov_bl"
         println("sth $sth, cth $cth, r $r, a $bhspin, r2 $r2, a2 $a2, mu $mu, DD $DD")
-        print_matrix("gcov", gcov)
+        DebugFunctions.print_matrix("gcov", gcov)
         error("Singular gcov encountered, cannot compute gcov_bl.")
     end
-    #if any (isnan.(gcov)) || any(isinf.(gcov))
     if any(isnan.(gcov)) || any(isinf.(gcov))
         @error "Singular gcov encountered in gcov_bl"
         println("sth $sth, cth $cth, r $r, a $bhspin, r2 $r2, a2 $a2, mu $mu, DD $DD")
-        print_matrix("gcov", gcov)
+        DebugFunctions.print_matrix("gcov", gcov)
         error("Singular gcov encountered, cannot compute gcov_bl.")
     end
+end
+
 end

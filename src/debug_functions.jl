@@ -1,30 +1,43 @@
+"""
+Diagnostic printing helpers used throughout the engine to report vectors
+and matrices when something numerically invalid is encountered.
+
+Yes, I've used this several times to debug this code.
+"""
+module DebugFunctions
+
 using Printf
-export print_vector, print_matrix, check_parameters
+using StaticArrays
 
+export print_vector, print_matrix
 
+"""
+    print_vector(name, vec)
 
-function print_vector(name::String, vec::MVec4)
-    """
-    Returns a string representation of a vector with the given name.
+Print a labeled 4-vector, one component per line.
 
-    Parameters:
-    @name: The name of the vector to be printed.
-    @vec: The vector to be printed.
-    """
+# Arguments
+- `name`: Label to print above the vector.
+- `vec`: The 4-vector to print.
+"""
+function print_vector(name::String, vec::MVector{4,Float64})
     println("Vector: $name")
     for i in eachindex(vec)
         print("$(vec[i]) ")
     end
     println()
 end
-function print_matrix(name::String, mat)
-    """
-    Returns a string representation of a matrix with the given name.
 
-    Parameters:
-    @name: The name of the matrix to be printed.
-    @mat: The matrix to be printed.
-    """
+"""
+    print_matrix(name, mat)
+
+Print a labeled matrix in scientific notation.
+
+# Arguments
+- `name`: Label to print above the matrix.
+- `mat`: The matrix to print.
+"""
+function print_matrix(name::String, mat)
     println("Matrix: $name")
     for i in axes(mat, 1)
         for j in axes(mat, 2)
@@ -34,17 +47,4 @@ function print_matrix(name::String, mat)
     end
 end
 
-function check_parameters()
-    """
-    Checks the consistency of the parameters used in the simulation.
-    """
-
-    if(MODEL == "thin_disk")
-        error("The thin disk model is not implemented yet!")
-    end
-
-    if(nx != ny && Krang == true)
-        error("Currently Nx must be equal to Ny when using Krang!")
-    end
 end
-

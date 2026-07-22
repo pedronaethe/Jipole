@@ -191,16 +191,17 @@ function process_slowlight_images!(
             end
             last_img_target += params_slowlight.ImageCadence
         end
+
         valid_ks = [k for k in 1:nimgs_concurrently if valid_images[k] == 1]
         p = Progress(length(valid_ks) * pixels_x * pixels_y;
             desc = "Rendering $(length(valid_ks)) frame(s) this round...", showspeed = true, barlen = 30)
         progress_lock = ReentrantLock()
-        for k in valid_ks
-            do_output = true
+        do_output = trues(nimgs_concurrently)
 
-            Threads.@threads :greedy for i in 1:pixels_x
-                for j in 1:pixels_y
-                    traj = all_geodesics[i, j]
+        Threads.@threads :greedy for i in 1:pixels_x
+            for j in 1:pixels_y
+                traj = all_geodesics[i, j]
+                for k in valid_ks
                     nstep = MovieArray[i, j, k].nstep
                     dt = target_times[k] + 1e-5
 
@@ -212,7 +213,7 @@ function process_slowlight_images!(
 
                         Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
                         Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
-                       if Xi[1] < params_slowlight.tA
+                        if Xi[1] < params_slowlight.tA
                             shift = params_slowlight.tA - Xi[1]
                             Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
                             Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
@@ -236,15 +237,21 @@ function process_slowlight_images!(
                     end
                     MovieArray[i, j, k].nstep = nstep
                     if nstep != 2
-                        do_output = false
+                        do_output[k] = false
                     end
-                    lock(progress_lock) do
+                end
+
+                lock(progress_lock) do
+                    for _ in valid_ks
                         ProgressMeter.next!(p)
                     end
                 end
             end
+        end
+        finish!(p)
 
-            if do_output
+        for k in valid_ks
+            if do_output[k]
                 Image_out = map(x -> x.Intensity, MovieArray[:, :, k]) .* freq^3
 
                 file_name = Printf.format(Printf.Format(output), target_times[k])
@@ -255,7 +262,6 @@ function process_slowlight_images!(
                 nopenimgs -= 1
             end
         end
-        finish!(p)
 
         if nopenimgs <= 1
             break
@@ -263,5 +269,6 @@ function process_slowlight_images!(
         update_data!(params_slowlight, simulation_data, trat_large, model, all_dumps_path)
     end
 end
+
 
 end

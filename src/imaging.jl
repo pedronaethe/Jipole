@@ -273,7 +273,7 @@ function calculate_pixel_intensity(traj, ro, θo::T, phi, bhspin, i::Int, j::Int
     Xv = SVector{4,Float64}(ForwardDiff.value.(X))
     Kv = SVector{4,Float64}(ForwardDiff.value.(K))
     while Geodesics.stop_backward_integration(Xv, Kv, Rh, Rstop) == 0 && step < nmaxstep
-        dl = Geodesics.stepsize(Xv, Kv, model.cstartx, model.cstopx)
+        dl = Geodesics.stepsize(X, K, model.cstartx, model.cstopx)
         Xnew, Knew, _, _ = Geodesics.push_photon(X, K, -dl, bhspin, model)
         X, K = Xnew, Knew
         Xv = SVector{4,Float64}(ForwardDiff.value.(X))

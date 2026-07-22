@@ -384,6 +384,13 @@ function autodiff_geo_traj_euler_method_grmhd!(traj, dI_dθo_out::Base.RefValue{
         momentum_ode(Xs, Ks, spin, model)
     end
 
+
+    stepsize_flat = xk -> Geodesics.stepsize(
+        SVector{4}(xk[1], xk[2], xk[3], xk[4]),
+        SVector{4}(xk[5], xk[6], xk[7], xk[8]),
+        model.cstartx, model.cstopx
+    )
+
     push!(traj, OfTraj(
         0.0,
         SVector{4,Float64}(X),
@@ -414,14 +421,17 @@ function autodiff_geo_traj_euler_method_grmhd!(traj, dI_dθo_out::Base.RefValue{
             jac .= jac_static
 
             dl = Geodesics.stepsize(X, Kcon, model.cstartx, model.cstopx)
-
             scaled_dl = dl * dl_unit
 
-            @. temp_dX_dθo = traj[step].dX_dθo - dl * traj[step].dK_dθo
+            grad_dl = ForwardDiff.gradient(stepsize_flat, SVector{8}(XK[1], XK[2], XK[3], XK[4], XK[5], XK[6], XK[7], XK[8]))
+            ddl_dθo = dot(view(grad_dl, 1:4), traj[step].dX_dθo) + dot(view(grad_dl, 5:8), traj[step].dK_dθo)
+            f_val = momentum_ode(SVector{4,Float64}(X), SVector{4,Float64}(Kcon), bhspin, model)
+
+            @. temp_dX_dθo = traj[step].dX_dθo - dl * traj[step].dK_dθo - ddl_dθo * Kcon
 
             mul!(temp_jac_dX_dθo, view(jac, 1:4, 1:4), traj[step].dX_dθo)
             mul!(temp_jac_dK_dθo, view(jac, 1:4, 5:8), traj[step].dK_dθo)
-            @. temp_dK_dθo = traj[step].dK_dθo - dl * (temp_jac_dX_dθo + temp_jac_dK_dθo)
+            @. temp_dK_dθo = traj[step].dK_dθo - dl * (temp_jac_dX_dθo + temp_jac_dK_dθo) - ddl_dθo * f_val
 
             Geodesics.push_photon!(X, Kcon, -dl, Xhalf, Kconhalf, lconn, bhspin, model)
 
@@ -500,10 +510,8 @@ function autodiff_geo_traj_euler_method_grmhd!(traj, dI_dθo_out::Base.RefValue{
             error("NaN or Inf encountered in intensity calculation")
         end
 
-        ji = jf
-        ki = kf
-        dji_dRhigh = djf_dRhigh
-        dki_dRhigh = dkf_dRhigh
+        ji = jf; ki = kf
+        dji_dRhigh = djf_dRhigh; dki_dRhigh = dkf_dRhigh
     end
 
     dI_dθo_out[] = dI_dθo * freq^3
@@ -606,23 +614,25 @@ function calculate_gradients(
 
     while (Geodesics.stop_backward_integration(X, K, Rh, Rstop) == 0 && (step < nmaxstep))
         @inbounds begin
-            dl = Geodesics.stepsize(X, K, model.cstartx, model.cstopx)
-            scaled_dl = dl * dl_unit
-
             X_dual = ForwardDiff.Dual{Nothing}.(X, dX)
             K_dual = ForwardDiff.Dual{Nothing}.(K, dK)
 
-            dK_dual = momentum_ode(X_dual, K_dual, bhspin, model)
+            dl_dual = Geodesics.stepsize(X_dual, K_dual, model.cstartx, model.cstopx)
+            dl = ForwardDiff.value(dl_dual)
+            ddl_dθo = ForwardDiff.partials(dl_dual, 1)
+            scaled_dl = dl * dl_unit
 
+            dK_dual = momentum_ode(X_dual, K_dual, bhspin, model)
             d_dK_dl = SVector{4}(
                 ForwardDiff.partials(dK_dual[1], 1),
                 ForwardDiff.partials(dK_dual[2], 1),
                 ForwardDiff.partials(dK_dual[3], 1),
                 ForwardDiff.partials(dK_dual[4], 1)
             )
+            f_val = momentum_ode(X, K, bhspin, model)
 
-            next_dX = dX - dl * dK
-            next_dK = dK - dl * d_dK_dl
+            next_dX = dX - dl * dK - ddl_dθo * K
+            next_dK = dK - dl * d_dK_dl - ddl_dθo * f_val
 
             X, K, Xhalf, Khalf = Geodesics.push_photon(X, K, -dl, bhspin, model)
 

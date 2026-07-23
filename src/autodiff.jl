@@ -20,7 +20,7 @@ using ..Radiation
 using ..DebugFunctions
 using ..ThinDisk
 using ..Imaging
-export autodiff_geo_traj_euler_method!, autodiff_geo_traj_euler_method_grmhd!, raytrace_gradients_gpu!, calculate_gradients, differentiate_pixel_intensity
+export autodiff_geo_traj_euler_method!, autodiff_geo_traj_euler_method_grmhd!, raytrace_gradients_gpu!, calculate_gradients, differentiate_pixel_intensity, differentiate_pixel_intensity_full
 
 """
     momentum_ode(X, Kcon, bhspin, model)
@@ -743,6 +743,52 @@ function differentiate_pixel_intensity(θo::Float64, i::Int, j::Int, bhspin, mod
     d = ForwardDiff.Dual{Nothing}(θo, 1.0)
     out = Imaging.calculate_pixel_intensity(traj, ro, d, phi, bhspin, i, j, nx, ny, fovx, fovy, freq, Rstop, nmaxstep, model, data)
     return ForwardDiff.value(out), ForwardDiff.partials(out, 1)
+end
+
+"""
+    differentiate_pixel_intensity_full(θo, i, j, bhspin, model, data, model_d, data_d,
+        ro, phi, nx, ny, fovx, fovy, freq, Rstop, nmaxstep, traj, traj_replay)
+
+Returns (I, dI_dθo, dI_dRhigh, dI_dM_unit). theta_o's derivative uses the
+existing full-Dual geodesic+RT pass (unchanged). Rhigh/M_unit's derivatives
+reuse that pass's already-integrated path (stripped to plain Float64) and
+replay ONLY the radiative-transfer accumulation against the Dual-valued
+`model_d`/`data_d` pair.
+
+`model_d`/`data_d` (from `Iharm.build_dual_params_and_data`) must be built
+ONCE per image (outside the pixel loop) and passed in here, not rebuilt per
+pixel -- `build_dual_params_and_data` reruns the O(N1*N2*N3) physical-
+quantities computation, which would otherwise happen once per pixel
+(pixels_x*pixels_y times per image) instead of once.
+
+`traj` and `traj_replay` are separate pre-allocated scratch buffers:
+`traj::Vector{GeoTypes.OfTrajDual{Dual{Nothing,Float64,1}}}` (theta_o's own,
+as today) and `traj_replay::Vector{GeoTypes.OfTrajDual{Float64}}` (the
+stripped path, reused across the Rhigh/M_unit replay).
+"""
+function differentiate_pixel_intensity_full(θo::Float64,
+    i::Int, j::Int, bhspin, model, data, model_d, data_d, ro, phi, nx::Int, ny::Int, fovx, fovy, freq,
+    Rstop, nmaxstep::Int, traj, traj_replay)
+
+    d = ForwardDiff.Dual{Nothing}(θo, 1.0)
+    Rh = 1.0 + sqrt(1.0 - bhspin^2)
+    step = Imaging.integrate_geodesic!(traj, ro, d, phi, bhspin, i, j, nx, ny, fovx, fovy, freq, Rstop, nmaxstep, model)
+    I_dual = Imaging.accumulate_radiative_transfer(traj, step, freq, bhspin, model, data, Rh)
+    I_val = ForwardDiff.value(I_dual)
+    dI_dθo = ForwardDiff.partials(I_dual, 1)
+
+    for k in 1:step
+        traj_replay[k] = GeoTypes.OfTrajDual{Float64}(
+            ForwardDiff.value(traj[k].dl),
+            ForwardDiff.value.(traj[k].X),
+            ForwardDiff.value.(traj[k].Kcon))
+    end
+
+    I_dual2 = Imaging.accumulate_radiative_transfer(traj_replay, step, freq, bhspin, model_d, data_d, Rh)
+    dI_dRhigh = ForwardDiff.partials(I_dual2, 1)
+    dI_dM_unit = ForwardDiff.partials(I_dual2, 2)
+
+    return I_val, dI_dθo, dI_dRhigh, dI_dM_unit
 end
 
 end

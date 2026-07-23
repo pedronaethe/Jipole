@@ -37,7 +37,7 @@ Parametric over the array type `A` (`Array{Float64,3}` on the CPU,
 so the same struct and the functions that consume it work unchanged in
 both contexts.
 """
-struct IharmData{A<:AbstractArray{Float64,3}}
+struct IharmData{T, A<:AbstractArray{T,3}}
     t::Float64
     RHO::A
     UU::A
@@ -63,8 +63,18 @@ GPU-safe (`SVector` fields, no heap-allocated members) so it can be used
 directly both by the CPU raytracer and as a CUDA kernel argument.
 
 Built once by [`read_header`](@ref) from an [`IharmParamsBuilder`](@ref).
+
+Parametric over `T` (the type of `M_unit`/`RHO_unit`/`U_unit`/`B_unit`
+only -- every other field stays `Float64` regardless of `T`, since they
+don't depend on `M_unit`). This exists so a `ForwardDiff.Dual`-valued
+`M_unit` (and the `RHO_unit`/`U_unit`/`B_unit` derived from it) can flow
+through, for `dI/dM_unit`; `read_header` always builds an ordinary
+`IharmParams{Float64}` -- only code that explicitly differentiates
+w.r.t. `M_unit` constructs an `IharmParams{<:ForwardDiff.Dual}`. Function
+signatures elsewhere that just say `model::IharmParams` (no explicit
+`{T}`) continue to match either case unchanged.
 """
-struct IharmParams <: AbstractModel
+struct IharmParams{T} <: AbstractModel
     metric::Int
     ELECTRONS::Int
     RADIATION::Int
@@ -80,15 +90,15 @@ struct IharmParams <: AbstractModel
     mu_tot::Float64
     Ne_factor::Float64
 
-    M_unit::Float64
+    M_unit::T
     T_unit::Float64
     L_unit::Float64
     MBH::Float64
     tp_over_te::Float64
 
-    RHO_unit::Float64
-    U_unit::Float64
-    B_unit::Float64
+    RHO_unit::T
+    U_unit::T
+    B_unit::T
 
     a::Float64
     hslope::Float64
@@ -135,7 +145,7 @@ Mutable, `MVector`-based scratch struct used only while
 complete, `read_header` converts it to the immutable, GPU-safe
 [`IharmParams`](@ref) that the rest of the codebase uses.
 """
-mutable struct IharmParamsBuilder <: AbstractModel
+mutable struct IharmParamsBuilder{T} <: AbstractModel
     metric::Int
     ELECTRONS::Int
     RADIATION::Int
@@ -151,17 +161,17 @@ mutable struct IharmParamsBuilder <: AbstractModel
     mu_tot::Float64
     Ne_factor::Float64
 
-    M_unit::Float64
-    T_unit::Float64
-    L_unit::Float64
+    M_unit::T
+    T_unit::T
+    L_unit::T
     MBH::Float64
     tp_over_te::Float64
 
-    RHO_unit::Float64
-    U_unit::Float64
-    B_unit::Float64
+    RHO_unit::T
+    U_unit::T
+    B_unit::T
 
-    a::Float64
+    a::T
     hslope::Float64
     Rin::Float64
     Rout::Float64
@@ -510,13 +520,13 @@ electron/magnetic-field quantities used by the radiative transfer.
 # Returns
 - The loaded [`IharmData`](@ref).
 """
-function load_data(filename::String, trat_large::Float64, model::IharmParams; advance_path!::Union{Nothing,Function}=nothing)
+function load_data(filename::String, trat_large, model::IharmParams; advance_path!::Union{Nothing,Function}=nothing)
     println("Loading data from '$filename' into 'Iharm' module...")
     !isfile(filename) && error("File not found: $filename")
 
     rho = uu = u1 = u2 = u3 = b1 = b2 = b3 = nothing
 
-    data_array = Vector{IharmData{Array{Float64,3}}}(undef, 1)
+    data_array = Vector{IharmData{Float64,Array{Float64,3}}}(undef, 1)
 
     h5open(filename, "r") do file
         t = read(file, "t")
@@ -701,8 +711,7 @@ Ressler/Athena mixed electron-temperature model.
 - `trat_large`: Electron/ion temperature ratio at high magnetization
   (`Rhigh`).
 """
-function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large::Float64)
-    rescale_factor_sqrt = 1.0
+function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large::T2) where {T2}
     rho_factor = model.RHO_unit / (Constants.MP + Constants.ME) * model.Ne_factor
     gam_minus_1 = model.gam - 1.0
     beta_crit_sq = model.beta_crit * model.beta_crit
@@ -725,12 +734,9 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large
             for k in 1:model.N3
                 rho_ijk = RHO_arr[i, j, k]
                 uu_ijk = UU_arr[i, j, k]
-                b_ijk = b_arr[i, j, k]
+                b_ijk = b_arr[i, j, k]  # already correctly B_unit-scaled by the caller
 
                 ne_arr[i, j, k] = rho_ijk * rho_factor
-
-                b_ijk *= rescale_factor_sqrt
-                b_arr[i, j, k] = b_ijk
 
                 bsq_normalized = b_ijk * B_unit_inv
                 bsq = bsq_normalized * bsq_normalized
@@ -761,6 +767,71 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large
             end
         end
     end
+end
+
+
+"""
+    build_dual_params_and_data(model::IharmParams{Float64}, data::IharmData{Float64},
+                                Rhigh_val::Float64, M_unit_val::Float64)
+
+Build a fresh `IharmParams{Dual}`/`IharmData{Dual}` pair for the Rhigh/M_unit
+replay pass: RHO_unit/U_unit/B_unit become Duals derived from a Dual M_unit
+(same formulas as read_header: RHO_unit = M_unit/L_unit^3, U_unit =
+RHO_unit*CL^2, B_unit = CL*sqrt(4pi*RHO_unit) -- these propagate automatically
+once M_unit is Dual), and ne/b/theta_e are recomputed from the RAW (Float64,
+Rhigh/M_unit-independent) primitives via `init_physical_quantities` seeded with
+a Dual Rhigh.
+"""
+function build_dual_params_and_data(model::IharmParams{Float64}, data::IharmData{Float64},
+                                     Rhigh_val::Float64, M_unit_val::Float64)
+    Tag = nothing
+    DualT = ForwardDiff.Dual{Tag,Float64,2}
+    Rhigh_d = DualT(Rhigh_val, ForwardDiff.Partials((1.0, 0.0)))
+    M_unit_d = DualT(M_unit_val, ForwardDiff.Partials((0.0, 1.0)))
+
+    RHO_unit_d = M_unit_d / model.L_unit^3
+    U_unit_d = RHO_unit_d * Constants.CL^2
+    B_unit_d = Constants.CL * sqrt(4π * RHO_unit_d)
+
+    # Rebuild an IharmParams{DualT} sharing every other (Float64) field, but with
+    # M_unit/RHO_unit/U_unit/B_unit promoted to DualT.
+    model_d = IharmParams{DualT}(model.metric, model.ELECTRONS, model.RADIATION,
+        model.gam, model.game, model.gamp, model.Te_unit, model.Thetae_unit,
+        model.mu_i, model.mu_e, model.mu_tot, model.Ne_factor,
+        M_unit_d, model.T_unit, model.L_unit, model.MBH, model.tp_over_te,
+        RHO_unit_d, U_unit_d, B_unit_d, model.a, model.hslope, model.Rin, model.Rout,
+        model.poly_xt, model.poly_alpha, model.mks_smooth, model.poly_norm,
+        model.mks3R0, model.mks3H0, model.mks3MY1, model.mks3MY2, model.mks3MP0,
+        model.N1, model.N2, model.N3, model.dx, model.startx, model.stopx,
+        model.cstartx, model.cstopx, model.rmin_geo, model.rmax_geo,
+        model.th_beg, model.trat_small, model.beta_crit, model.sigma_cut,
+        model.sigma_cut_high, model.slow_light)
+
+    # b is M_unit-independent aside from the overall B_unit scaling baked in
+    # at load time (data.b[i,j,k] = sqrt(bsq_code) * OLD_B_unit) -- recover the
+    # raw, dimensionless sqrt(bsq_code) by dividing the old (Float64) B_unit
+    # back out, then rescale by the new (Dual) B_unit_d. This correctly
+    # produces zero M_unit-sensitivity in the *normalized* bsq used below
+    # (the B_unit_d dependence analytically cancels via the product/quotient
+    # rule, which ForwardDiff computes exactly), matching the fact that
+    # theta_e is M_unit-independent -- only ne/b themselves carry the
+    # M_unit-derivative.
+    #
+    # similar(data.b, DualT) is NOT used here on purpose: it allocates
+    # uninitialized memory, not a copy -- reading that back in
+    # init_physical_quantities would silently propagate garbage.
+    b_d = (data.b ./ model.B_unit) .* B_unit_d
+
+    # IharmData{T,A} requires every array field to share one concrete type A --
+    # promote the raw (M_unit/Rhigh-independent) primitives to DualT too (zero
+    # partials) purely for type uniformity; their *values* are unaffected.
+    data_d = IharmData(data.t, DualT.(data.RHO), DualT.(data.UU), DualT.(data.U1), DualT.(data.U2), DualT.(data.U3),
+        DualT.(data.B1), DualT.(data.B2), DualT.(data.B3),
+        similar(data.ne, DualT), b_d, similar(data.θe, DualT),
+        similar(data.sigma, DualT), similar(data.beta, DualT), similar(data.dθedRhi, DualT))
+
+    init_physical_quantities([data_d], 1, model_d, Rhigh_d)
+    return model_d, [data_d]
 end
 
 """
@@ -834,7 +905,7 @@ density) at position `X`.
 - The interpolated magnetization, or `0` if `X` is outside the grid.
 """
 function get_model_sigma(X, model::IharmParams, data)
-    T = eltype(X)
+    T = promote_type(eltype(X), eltype(data[1].sigma))
     if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
@@ -891,7 +962,7 @@ geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
   the magnetization cutoff.
 """
 function get_model_ne(X, model::IharmParams, data)
-    T = eltype(X)
+    T = promote_type(eltype(X), eltype(data[1].ne)) 
     if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
@@ -922,7 +993,7 @@ Interpolate the dimensionless electron temperature at position `X`.
   grid.
 """
 function get_model_thetae(X, model::IharmParams, data)
-    T = eltype(X)
+    T = promote_type(eltype(X), eltype(data[1].θe)) 
     if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
@@ -945,7 +1016,7 @@ respect to `Rhigh`, at position `X`.
 - `dθe/dRhigh`, or `0` if `X` is outside the grid.
 """
 function get_model_thetae_deriv(X, model::IharmParams, data)
-    T = eltype(X)
+    T = promote_type(eltype(X), eltype(data[1].dθedRhi)) 
     if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
@@ -967,7 +1038,7 @@ Interpolate the magnetic field strength at position `X`.
 - The magnetic field strength, or `0` if `X` is outside the grid.
 """
 function get_model_b(X, model::IharmParams, data)
-    T = eltype(X)
+    T = promote_type(eltype(X), eltype(data[1].b))
     if Grid.x_in_domain(X, model) == 0
         return zero(T)
     end
@@ -996,7 +1067,7 @@ with the rest of the differentiable call path.
 - A tuple `(Ucon, Ucov, Bcon, Bcov)`.
 """
 @inline function get_model_fourv(X, Kcon, bhspin, model::IharmParams, data)
-    elT = eltype(X)
+    elT = promote_type(eltype(X), eltype(data[1].θe))
     gcov = Metrics.gcov_func(X, bhspin, model)
     gcon = Metrics.gcon_func(gcov)
 
@@ -1072,9 +1143,8 @@ position `X`, optionally with their derivatives with respect to `Rhigh`.
 - A tuple `(j, k, dj_dRhigh, dk_dRhigh)`.
 """
 function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)) where {B}
-    z_base = zero(eltype(X))
-
     Ne = get_model_ne(X, model, data)
+    z_base = zero(typeof(Ne))
     if Ne == 0.0
         return (z_base, z_base, z_base, z_base)
     end
@@ -1135,8 +1205,8 @@ avoids GPU-compiling `jar_calc`'s nested-derivative `Val{true}` branch for the
 Dual-X specialization, which is otherwise fatal to compile.
 """
 @inline function jar_calc_ad(X, Kcon, bhspin, model::IharmParams, data)
-    z_base = zero(eltype(X))
     Ne = get_model_ne(X, model, data)
+    z_base = zero(typeof(Ne))
     if Ne == 0.0
         return (z_base, z_base)
     end

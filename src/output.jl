@@ -26,7 +26,7 @@ function generate_output_file(output_file::String, data::Dict{String,Any}; forma
     if format == "ipole"
         generate_output_ipole(output_file, data)
         return
-    else
+    else if format != "generic"
         @error "Unsupported output format: $format. Supported formats are: 'generic', 'ipole'."
         return
     end

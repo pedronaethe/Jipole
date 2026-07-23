@@ -96,29 +96,25 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     rotcam = get(data, "rotcam", 0.0)
 
     nx, ny = size(image)
-    NIMG = 5 # Stokes I,Q,U,V + Faraday depth, matching ipole's NIMG
+    NIMG = 5 # Stokes I,Q,U,V + Faraday depth, matching ipole's NIMG, even though we don't have polarization yet. Maybe soon?
 
     Mdot, MdotEdd, Ladv = Iharm.compute_accretion_diagnostics(params, snapshot)
 
     Ftot_unpol = sum(image) * scale
     nuLnu_unpol = 4π * Ftot_unpol * SourceD^2 * Constants.JY * freq
-    Ftot = 0.0    # no polarized transport yet
+    Ftot = 0.0    
     nuLnu = 0.0
 
-    # dx/dy (image-plane pixel size, in Rg) and fovx_dsource/fovy_dsource
-    # (angular FOV as seen from the source), following ipole's main.c exactly:
-    # DX = fovx_dsource * (Dsource/L_unit/MUAS_PER_RAD); fovx = DX/rcam.
     fov_to_d = SourceD / params.L_unit / Constants.MUAS_PER_RAD
     DXsize = fovx * ro
     DYsize = fovy * ro
-    dx = DXsize # full image-plane size in Rg, NOT per-pixel -- matches ipole's params.dx
+    dx = DXsize 
     dy = DYsize
     fovx_dsource = DXsize / fov_to_d
     fovy_dsource = DYsize / fov_to_d
 
     h5file = h5open(output_file, "w")
 
-    # ---- top level ----
     write(h5file, "Ftot_unpol", Ftot_unpol)
     write(h5file, "Ftot", Ftot)
     write(h5file, "nuLnu", nuLnu)
@@ -130,7 +126,6 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     write(h5file, "tau", tau)
     write(h5file, "pol", zeros(nx, ny, NIMG))
 
-    # ---- header ----
     write(h5file, "header/version", "Jipole-1.0")
     write(h5file, "header/githash", "unknown") # Jipole has no build-time githash yet
     write(h5file, "header/freqcgs", freq)

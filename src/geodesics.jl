@@ -759,7 +759,7 @@ stepsize used in grmonty, for future reference.
 """
 function stepsize(X, Kcon, cstartx, cstopx, eps_ipole::Float64=0.01)
     #TODO: Create a choice for the user to do it.
-    if (true)
+    if (false)
         deh = min(abs(X[2] - cstartx[2]), 0.1)
         dlx2 = eps_ipole * (10 * deh) / (abs(Kcon[2]) + Constants.SMALL * Constants.SMALL)
         cut = 0.02

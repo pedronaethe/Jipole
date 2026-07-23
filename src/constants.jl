@@ -81,6 +81,21 @@ Elementary charge (statC).
 """
 const EE = 4.80320680e-10
 
+"""
+Typical mass unit (g) for MAD (Magnetically Arrested Disk) GRMHD dumps.
+Pass as `read_header(...; M_unit=Constants.M_UNIT_MAD)` -- using the wrong
+preset for a dump silently mis-scales density/temperature and therefore the
+whole radiative transfer calculation.
+"""
+const M_UNIT_MAD = 6.e24
+
+"""
+Typical mass unit (g) for SANE (Standard And Normal Evolution) GRMHD dumps.
+Pass as `read_header(...; M_unit=Constants.M_UNIT_SANE)`. This is
+`read_header`'s default `M_unit`, since it matches `ipole`'s own default.
+"""
+const M_UNIT_SANE = 3.e26
+
 end
 
 

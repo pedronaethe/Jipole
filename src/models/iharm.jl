@@ -18,7 +18,8 @@ using ..Grid
 using ..Radiation
 using ..MaxwellJuettner
 
-export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data, jar_calc_ad
+export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data, jar_calc_ad,
+    compute_accretion_diagnostics
 
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
@@ -254,7 +255,11 @@ the black hole mass `MBH` and `M_unit`.
   region.
 - `slow_light`: Whether slow-light (time-dependent) interpolation is
   enabled.
-- `M_unit`: Mass unit, in g.
+- `M_unit`: Mass unit, in g. Sets the overall density/temperature scale for
+  the dump, and therefore the entire radiative transfer calculation. `Constants.M_UNIT_MAD` (6.e24) and
+  `Constants.M_UNIT_SANE` (3.e26, this keyword's default) cover the two
+  common GRMHD magnetic topologies: MAD and SANE for M87*; Ignored if the dump itself carries a
+  `RADIATION` block with its own `M_unit` (read from the file instead).
 
 # Returns
 - The populated [`IharmParams`](@ref).
@@ -612,6 +617,72 @@ function load_data(filename::String, trat_large::Float64, model::IharmParams; ad
         advance_path!()
     end
     return data_array[1]
+end
+
+"""
+    compute_accretion_diagnostics(model::IharmParams, data::IharmData)
+
+Compute the mass accretion rate (`Mdot`), Eddington-normalized accretion
+rate scale (`MdotEdd`), and advected energy flux (`Ladv`) for a loaded
+snapshot, matching `ipole`'s `load_iharm_data` diagnostics exactly (same
+per-zone 4-velocity reconstruction already used above to build the `b`
+field, restricted to the innermost 21 radial zones and integrated over
+the angular directions).
+
+# Returns
+- `(Mdot, MdotEdd, Ladv)`, all in cgs.
+"""
+function compute_accretion_diagnostics(model::IharmParams, data::IharmData)
+    n_shell = min(21, model.N1)
+    dMact = 0.0
+    Ladv = 0.0
+
+    Ufields = (data.U1, data.U2, data.U3)
+
+    for i in 1:n_shell
+        for j in 1:(model.N2)
+            X = zeros(MVector{4,Float64})
+            Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
+            gcov = zeros(MMatrix{4,4,Float64})
+            gcon = zeros(MMatrix{4,4,Float64})
+            Metrics.gcov_func!(X, model.a, model, gcov)
+            Metrics.gcon_func!(gcov, gcon)
+            g = Grid.gdet_zone(i - 1, j - 1, 0, model)
+
+            for k in 1:(model.N3)
+                UdotU = 0.0
+                for l in 1:(Constants.NDIM-1)
+                    for m in 1:(Constants.NDIM-1)
+                        UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
+                    end
+                end
+
+                ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
+                ucon = MVector{4,Float64}(undef)
+                ucon[1] = -ufac * gcon[1, 1]
+                for μ in 1:(Constants.NDIM-1)
+                    ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
+                end
+
+                ucov = MVector{4,Float64}(undef)
+                Coordinates.flip_index!(ucov, ucon, gcov)
+
+                # ucon[2]/ucov[1] here are Julia's 1-indexed radial-contravariant
+                # and time-covariant components, matching ipole's ucon[1]/ucov[0].
+                dMact += g * data.RHO[i, j, k] * ucon[2]
+                Ladv += g * data.UU[i, j, k] * ucon[2] * ucov[1]
+            end
+        end
+    end
+
+    dMact *= model.dx[4] * model.dx[3] / n_shell
+    Ladv *= model.dx[4] * model.dx[3] / n_shell
+
+    Mdot = -dMact * model.M_unit / model.T_unit
+    MdotEdd = 4π * Constants.GNEWT * (model.MBH * Constants.MSUN) * Constants.MP /
+              Constants.CL / 0.1 / Constants.SIGMA_THOMPSON
+
+    return Mdot, MdotEdd, Ladv
 end
 
 """

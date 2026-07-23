@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "de01a2e52dddad6fd17803001b097f2b1dca4788"
+project_hash = "c8d803f4c8c7e2341208a9457c66e5bff1b45776"
 
 [[deps.ADTypes]]
 git-tree-sha1 = "ec6be48a85c93d995563b84bff8a86bc98df45ce"
@@ -1883,7 +1883,7 @@ uuid = "ae98c720-c025-4a4a-838c-29b094483192"
 version = "0.2.1"
 
 [[deps.Jipole]]
-deps = ["BenchmarkTools", "CUDA", "CairoMakie", "Comrade", "ComradeBase", "DelimitedFiles", "DifferentialEquations", "DisplayAs", "Distributions", "FFTW", "ForwardDiff", "HDF5", "IJulia", "ImageFiltering", "JLD2", "LSODA", "LaTeXStrings", "LibPQ", "LineSearches", "LinearAlgebra", "MCMCChains", "Makie", "MathTeXEngine", "NLSolversBase", "Optim", "Optimization", "OptimizationBBO", "Pigeons", "Plots", "Printf", "ProfileView", "ProgressMeter", "Pyehtim", "PythonCall", "Random", "Revise", "SpecialFunctions", "StableRNGs", "StaticArrays", "StatsBase", "VLBIImagePriors", "VLBISkyModels"]
+deps = ["Adapt", "BenchmarkTools", "Bessels", "CUDA", "CairoMakie", "Comrade", "ComradeBase", "DelimitedFiles", "DifferentialEquations", "DisplayAs", "Distributions", "FFTW", "ForwardDiff", "HDF5", "IJulia", "ImageFiltering", "JLD2", "LSODA", "LaTeXStrings", "LibPQ", "LineSearches", "LinearAlgebra", "MCMCChains", "Makie", "MathTeXEngine", "NLSolversBase", "Optim", "Optimization", "OptimizationBBO", "Pigeons", "Plots", "Printf", "ProfileView", "ProgressMeter", "Pyehtim", "PythonCall", "Random", "Revise", "SpecialFunctions", "StableRNGs", "StaticArrays", "StatsBase", "VLBIImagePriors", "VLBISkyModels"]
 path = "."
 uuid = "2347fae0-cb17-4e37-b3ba-1e469be55413"
 version = "0.1.0"

@@ -20,7 +20,7 @@ using ..Radiation
 using ..DebugFunctions
 using ..ThinDisk
 using ..Imaging
-export autodiff_geo_traj_euler_method!, autodiff_geo_traj_euler_method_grmhd!, raytrace_gradients_gpu!, calculate_gradients, differentiate_pixel_intensity, differentiate_pixel_intensity_full
+export autodiff_geo_traj_euler_method!, autodiff_geo_traj_euler_method_grmhd!, raytrace_gradients_gpu!, calculate_gradients, differentiate_pixel_intensity, differentiate_pixel_intensity_full, raytrace_full_dual_gradients_gpu!, calculate_full_dual_gradients
 
 """
     momentum_ode(X, Kcon, bhspin, model)
@@ -789,6 +789,96 @@ function differentiate_pixel_intensity_full(θo::Float64,
     dI_dM_unit = ForwardDiff.partials(I_dual2, 2)
 
     return I_val, dI_dθo, dI_dRhigh, dI_dM_unit
+end
+
+"""
+    raytrace_full_dual_gradients_gpu!(d_traj, d_traj_replay, d_Image, d_dI_dtheta, d_dI_dRhigh,
+        d_dI_dMunit, i_offset, j_offset, block_size_x, block_size_y, ro, θo, phi, bhspin, nx, ny,
+        nmaxstep, freq, fovx, fovy, Rstop, model, data, model_d, data_d)
+
+GPU kernel launcher for [`calculate_full_dual_gradients`](@ref): computes the image
+intensity together with its derivatives w.r.t. `θo`, `Rhigh`, and `M_unit`, using the
+SAME full-ForwardDiff-through-the-whole-computation method as the CPU
+[`differentiate_pixel_intensity_full`](@ref) -- as opposed to the tangent-linear/analytic
+method of [`calculate_gradients`](@ref). Tiled the same way as
+[`Imaging.raytrace_image_gpu!`](@ref); needs two tile buffers (`d_traj` for the
+θo-Dual geodesic pass, `d_traj_replay` for the value-stripped replay pass).
+"""
+function raytrace_full_dual_gradients_gpu!(
+    d_traj, d_traj_replay, d_Image, d_dI_dtheta, d_dI_dRhigh, d_dI_dMunit,
+    i_offset, j_offset, block_size_x, block_size_y,
+    ro, θo, phi, bhspin, nx, ny, nmaxstep,
+    freq, fovx, fovy, Rstop, model, data, model_d, data_d
+)
+    local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+
+    i = local_i - 1 + i_offset
+    j = local_j - 1 + j_offset
+
+    if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
+        calculate_full_dual_gradients(
+            d_traj, d_traj_replay, d_Image, d_dI_dtheta, d_dI_dRhigh, d_dI_dMunit,
+            ro, θo, phi, bhspin, nx, ny, nmaxstep,
+            i, j, local_i, local_j, freq, fovx, fovy, Rstop, model, data, model_d, data_d
+        )
+    end
+    return nothing
+end
+
+"""
+    calculate_full_dual_gradients(traj, traj_replay, d_Image, d_dI_dtheta, d_dI_dRhigh, d_dI_dMunit,
+        ro, θo, phi, bhspin, nx, ny, nmaxstep, i_global, j_global, i_local, j_local, freq, fovx, fovy,
+        Rstop, model, data, model_d, data_d)
+
+Per-pixel kernel body for [`raytrace_full_dual_gradients_gpu!`](@ref): identical
+computation to the CPU [`differentiate_pixel_intensity_full`](@ref), just operating on
+tile-local views of the 3D scratch buffers instead of a per-pixel `Vector` --
+[`Imaging.integrate_geodesic!`](@ref) and [`Imaging.accumulate_radiative_transfer`](@ref)
+are CPU/GPU-agnostic (see their docstrings), so nothing else needs to change.
+"""
+function calculate_full_dual_gradients(
+    traj, traj_replay, d_Image, d_dI_dtheta, d_dI_dRhigh, d_dI_dMunit,
+    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64,
+    nx::Int64, ny::Int64, nmaxstep::Int64,
+    i_global::Int64, j_global::Int64,
+    i_local::Int64, j_local::Int64,
+    freq::Float64, fovx::Float64, fovy::Float64, Rstop::Float64,
+    model, data, model_d, data_d
+)
+    if (i_global >= nx || j_global >= ny)
+        return nothing
+    end
+
+    Rh = 1.0 + sqrt(1.0 - bhspin^2)
+    d = ForwardDiff.Dual{Nothing}(θo, 1.0)
+
+    traj_view = @view traj[i_local, j_local, :]
+    traj_replay_view = @view traj_replay[i_local, j_local, :]
+
+    step = Imaging.integrate_geodesic!(traj_view, ro, d, phi, bhspin, i_global, j_global,
+        nx, ny, fovx, fovy, freq, Rstop, nmaxstep, model)
+    I_dual = Imaging.accumulate_radiative_transfer(traj_view, step, freq, bhspin, model, data, Rh)
+    I_val = ForwardDiff.value(I_dual)
+    dI_dθo = ForwardDiff.partials(I_dual, 1)
+
+    @inbounds for k in 1:step
+        traj_replay_view[k] = GeoTypes.OfTrajDual{Float64}(
+            ForwardDiff.value(traj_view[k].dl),
+            ForwardDiff.value.(traj_view[k].X),
+            ForwardDiff.value.(traj_view[k].Kcon))
+    end
+
+    I_dual2 = Imaging.accumulate_radiative_transfer(traj_replay_view, step, freq, bhspin, model_d, data_d, Rh)
+    dI_dRhigh = ForwardDiff.partials(I_dual2, 1)
+    dI_dMunit = ForwardDiff.partials(I_dual2, 2)
+
+    @inbounds d_Image[i_global+1, j_global+1] = I_val
+    @inbounds d_dI_dtheta[i_global+1, j_global+1] = dI_dθo
+    @inbounds d_dI_dRhigh[i_global+1, j_global+1] = dI_dRhigh
+    @inbounds d_dI_dMunit[i_global+1, j_global+1] = dI_dMunit
+
+    return nothing
 end
 
 end

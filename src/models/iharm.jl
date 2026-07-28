@@ -32,27 +32,34 @@ A single GRMHD simulation snapshot: fluid primitives on the simulation
 grid, plus the derived electron/magnetic-field quantities used by the
 radiative transfer.
 
-Parametric over the array type `A` (`Array{Float64,3}` on the CPU,
-`CuArray{Float64,3}` on the GPU via [`Utils_GPU.copy_iharm_to_gpu`](@ref))
-so the same struct and the functions that consume it work unchanged in
-both contexts.
+Parametric over TWO independent array types: `Araw` for the raw fluid
+primitives (`RHO`/`UU`/`U1`-`U3`/`B1`-`B3`, loaded directly from the dump
+and always `Float64`-valued. This means `Array{Float64,3}` on the CPU,
+`CuArray{Float64,3}` on the GPU via [`Utils_GPU.copy_iharm_to_gpu`](@ref)),
+and `Ader` for the derived electron/magnetic-field quantities
+(`ne`/`b`/`θe`/`sigma`/`beta`/`dθedRhi`). These are independent so that a
+`ForwardDiff.Dual`-valued M_unit/Rhigh (see
+[`build_dual_params_and_data`](@ref)) only needs to promote the derived
+quantities. The raw primitives, which are M_unit/Rhigh-
+independent, stay `Float64` rather than needlessly tripling their memory
+footprint (`Dual{Float64,2}` is 24 bytes vs. `Float64`'s 8).
 """
-struct IharmData{T, A<:AbstractArray{T,3}}
+struct IharmData{Traw, Araw<:AbstractArray{Traw,3}, Tder, Ader<:AbstractArray{Tder,3}}
     t::Float64
-    RHO::A
-    UU::A
-    U1::A
-    U2::A
-    U3::A
-    B1::A
-    B2::A
-    B3::A
-    ne::A
-    b::A
-    θe::A
-    sigma::A
-    beta::A
-    dθedRhi::A
+    RHO::Araw
+    UU::Araw
+    U1::Araw
+    U2::Araw
+    U3::Araw
+    B1::Araw
+    B2::Araw
+    B3::Araw
+    ne::Ader
+    b::Ader
+    θe::Ader
+    sigma::Ader
+    beta::Ader
+    dθedRhi::Ader
 end
 
 Adapt.@adapt_structure IharmData
@@ -65,7 +72,7 @@ directly both by the CPU raytracer and as a CUDA kernel argument.
 Built once by [`read_header`](@ref) from an [`IharmParamsBuilder`](@ref).
 
 Parametric over `T` (the type of `M_unit`/`RHO_unit`/`U_unit`/`B_unit`
-only -- every other field stays `Float64` regardless of `T`, since they
+only, every other field stays `Float64` regardless of `T`, since they
 don't depend on `M_unit`). This exists so a `ForwardDiff.Dual`-valued
 `M_unit` (and the `RHO_unit`/`U_unit`/`B_unit` derived from it) can flow
 through, for `dI/dM_unit`; `read_header` always builds an ordinary
@@ -526,7 +533,7 @@ function load_data(filename::String, trat_large, model::IharmParams; advance_pat
 
     rho = uu = u1 = u2 = u3 = b1 = b2 = b3 = nothing
 
-    data_array = Vector{IharmData{Float64,Array{Float64,3}}}(undef, 1)
+    data_array = Vector{IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 1)
 
     h5open(filename, "r") do file
         t = read(file, "t")
@@ -793,8 +800,7 @@ function build_dual_params_and_data(model::IharmParams{Float64}, data::IharmData
     U_unit_d = RHO_unit_d * Constants.CL^2
     B_unit_d = Constants.CL * sqrt(4π * RHO_unit_d)
 
-    # Rebuild an IharmParams{DualT} sharing every other (Float64) field, but with
-    # M_unit/RHO_unit/U_unit/B_unit promoted to DualT.
+
     model_d = IharmParams{DualT}(model.metric, model.ELECTRONS, model.RADIATION,
         model.gam, model.game, model.gamp, model.Te_unit, model.Thetae_unit,
         model.mu_i, model.mu_e, model.mu_tot, model.Ne_factor,
@@ -806,27 +812,10 @@ function build_dual_params_and_data(model::IharmParams{Float64}, data::IharmData
         model.cstartx, model.cstopx, model.rmin_geo, model.rmax_geo,
         model.th_beg, model.trat_small, model.beta_crit, model.sigma_cut,
         model.sigma_cut_high, model.slow_light)
-
-    # b is M_unit-independent aside from the overall B_unit scaling baked in
-    # at load time (data.b[i,j,k] = sqrt(bsq_code) * OLD_B_unit) -- recover the
-    # raw, dimensionless sqrt(bsq_code) by dividing the old (Float64) B_unit
-    # back out, then rescale by the new (Dual) B_unit_d. This correctly
-    # produces zero M_unit-sensitivity in the *normalized* bsq used below
-    # (the B_unit_d dependence analytically cancels via the product/quotient
-    # rule, which ForwardDiff computes exactly), matching the fact that
-    # theta_e is M_unit-independent -- only ne/b themselves carry the
-    # M_unit-derivative.
-    #
-    # similar(data.b, DualT) is NOT used here on purpose: it allocates
-    # uninitialized memory, not a copy -- reading that back in
-    # init_physical_quantities would silently propagate garbage.
     b_d = (data.b ./ model.B_unit) .* B_unit_d
 
-    # IharmData{T,A} requires every array field to share one concrete type A --
-    # promote the raw (M_unit/Rhigh-independent) primitives to DualT too (zero
-    # partials) purely for type uniformity; their *values* are unaffected.
-    data_d = IharmData(data.t, DualT.(data.RHO), DualT.(data.UU), DualT.(data.U1), DualT.(data.U2), DualT.(data.U3),
-        DualT.(data.B1), DualT.(data.B2), DualT.(data.B3),
+    data_d = IharmData(data.t, data.RHO, data.UU, data.U1, data.U2, data.U3,
+        data.B1, data.B2, data.B3,
         similar(data.ne, DualT), b_d, similar(data.θe, DualT),
         similar(data.sigma, DualT), similar(data.beta, DualT), similar(data.dθedRhi, DualT))
 

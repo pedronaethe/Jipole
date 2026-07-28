@@ -29,10 +29,10 @@ include("models/analytic.jl")
 include("models/thin_disk.jl")
 include("models/iharm.jl")
 
+include("output.jl")
 include("imaging.jl")
 include("slowlight.jl")
 include("autodiff.jl")
 include("utils_gpu.jl")
-include("output.jl")
 
 end

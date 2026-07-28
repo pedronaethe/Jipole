@@ -13,7 +13,8 @@ using StaticArrays
 using ..Constants
 using ..Radiation
 using ..Iharm
-
+using ..Output
+using Dates
 export OfImg, OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
     process_slowlight_images!
 
@@ -50,7 +51,7 @@ and the time window `[tA, tB]` currently bracketed by `simulation_data`.
 mutable struct OfSlowLight
     dump_max::Int64
     nloaded::Int64
-    ImageCadence::Int64
+    ImageCadence::Float64
     tA::Float64
     tB::Float64
     tf::Float64
@@ -153,11 +154,29 @@ allows, until every requested frame has been produced.
 - `freq`: Frequency, in cgs units.
 - `trat_large`: Electron/ion temperature ratio at high magnetization.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
+- `Xcamera`: 4-vector camera position.
+- `ro`, `theta_o`, `phi`: Camera position in KS spherical coordinates.
+- `fovx`, `fovy`: Field of view, in radians.
+- `SourceD`: Source distance, in cgs units.
+- `scale`: Jy-per-pixel-intensity scale factor.
 """
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
-    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path
+    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale
 )
+    base_dir = joinpath("..", "slow_sims")
+    
+    if !isdir(base_dir)
+        mkpath(base_dir)
+    end
+    
+
+    timestamp = Dates.format(now(), "yyyy-mm-dd-HH:MM:SS")
+    
+    output_dir = joinpath(base_dir, timestamp)
+    mkpath(output_dir)
+    println("Outputs will be saved to: $output_dir")
+
     last_img_target = params_slowlight.tA - tgeof
     nimgs_concurrently = round(Int, 2 + abs(t0) / params_slowlight.ImageCadence)
 
@@ -168,7 +187,7 @@ function process_slowlight_images!(
     println("First Image will be produced at $last_img_target")
     nimg = 1
     nopenimgs = 1
-    output = "Image.%05d.txt"
+    output = "Image.%07.1f.h5"
 
     while true
         while (last_img_target + t0 < params_slowlight.tB)
@@ -255,7 +274,23 @@ function process_slowlight_images!(
                 Image_out = map(x -> x.Intensity, MovieArray[:, :, k]) .* freq^3
 
                 file_name = Printf.format(Printf.Format(output), target_times[k])
-                writedlm(file_name, Image_out)
+                out_data = Dict{String, Any}(
+                    "image"      => Image_out,
+                    "img_time"   => target_times[k],
+                    "params"     => model,                
+                    "data"       => simulation_data[1],   
+                    "ro"         => ro,           
+                    "theta_o"    => theta_o,       
+                    "phi"        => phi,         
+                    "fovx"       => fovx,           
+                    "fovy"       => fovy,           
+                    "freq"       => freq,                 
+                    "SourceD"    => SourceD,        
+                    "scale"      => scale,          
+                    "Xcamera"    => Xcamera,        
+                    "trat_large" => trat_large            
+                )
+                Output.generate_output_file(file_name, out_data; format="ipole")
                 println("Saving image $(file_name)")
 
                 valid_images[k] = 0

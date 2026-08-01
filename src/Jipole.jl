@@ -31,6 +31,7 @@ include("models/iharm.jl")
 
 include("imaging.jl")
 include("slowlight.jl")
+include("brisklight.jl")
 include("autodiff.jl")
 include("utils_gpu.jl")
 

@@ -124,6 +124,7 @@ struct IharmParams <: AbstractModel
     sigma_cut_high::Float64
 
     slow_light::Bool
+    brisk_light::Bool
 end
 
 
@@ -193,6 +194,7 @@ mutable struct IharmParamsBuilder <: AbstractModel
     sigma_cut::Float64
     sigma_cut_high::Float64
     slow_light::Bool
+    brisk_light::Bool
 end
 
 """
@@ -217,7 +219,7 @@ function IharmParamsBuilder()
         MVector{4,Float64}(0.0, 0.0, 0.0, 0.0),
         MVector{4,Float64}(0.0, 0.0, 0.0, 0.0),
         1.0, 100.0,
-        1.74e-2, 1.0, 1.0, 1.0, -1.0, false)
+        1.74e-2, 1.0, 1.0, 1.0, -1.0, false, false)
 end
 
 """
@@ -230,11 +232,11 @@ everywhere else.
 IharmParams(p::IharmParamsBuilder) = IharmParams(p.metric, p.ELECTRONS, p.RADIATION, p.gam, p.game, p.gamp, p.Te_unit, p.Thetae_unit, p.mu_i, p.mu_e, p.mu_tot, p.Ne_factor,
 p.M_unit, p.T_unit, p.L_unit, p.MBH, p.tp_over_te, p.RHO_unit, p.U_unit, p.B_unit, p.a, p.hslope, p.Rin, p.Rout, p.poly_xt, p.poly_alpha, p.mks_smooth, p.poly_norm, p.mks3R0,
 p.mks3H0, p.mks3MY1, p.mks3MY2, p.mks3MP0,p.N1,p.N2,p.N3,SVector(p.dx),SVector(p.startx),SVector(p.stopx),SVector(p.cstartx),SVector(p.cstopx),p.rmin_geo,p.rmax_geo,p.th_beg,
-p.trat_small,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light)
+p.trat_small,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light,p.brisk_light)
 
 
 """
-    read_header(filename, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
+    read_header(filename, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, brisk_light=false, M_unit=3.e26)
 
 Read a GRMHD dump file's header, returning the populated
 [`IharmParams`](@ref).
@@ -242,7 +244,11 @@ Read a GRMHD dump file's header, returning the populated
 The electron-temperature-model parameters (`th_beg`, `trat_small`,
 `beta_crit`, `sigma_cut`, `sigma_cut_high`) are run configuration, not
 recorded in the dump file, so they're supplied here (with `ipole`'s usual
-defaults). `L_unit`/`T_unit`/`RHO_unit`/`U_unit`/`B_unit` are derived from
+defaults). `slow_light` and `brisk_light` are temporal rendering modes:
+- `slow_light=true`: interpolate temporally between multiple GRMHD snapshots.
+- `brisk_light=true`: select one snapshot per lensing band based on modal emission time.
+
+`L_unit`/`T_unit`/`RHO_unit`/`U_unit`/`B_unit` are derived from
 the black hole mass `MBH` and `M_unit`.
 
 # Arguments
@@ -253,13 +259,15 @@ the black hole mass `MBH` and `M_unit`.
 - `sigma_cut`, `sigma_cut_high`: Magnetization cutoffs for the emitting
   region.
 - `slow_light`: Whether slow-light (time-dependent) interpolation is
-  enabled.
+  enabled (interpolates temporally between multiple snapshots).
+- `brisk_light`: Whether brisk-light rendering is enabled (selects one
+  snapshot per lensing band based on modal emission time).
 - `M_unit`: Mass unit, in g.
 
 # Returns
 - The populated [`IharmParams`](@ref).
 """
-function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
+function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, brisk_light=false, M_unit=3.e26)
     println("Initializing grid from: $filename")
 
     params = IharmParamsBuilder()
@@ -269,6 +277,7 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta
     params.sigma_cut = sigma_cut
     params.sigma_cut_high = sigma_cut_high
     params.slow_light = slow_light
+    params.brisk_light = brisk_light
 
     params.L_unit = Constants.GNEWT * MBH * Constants.MSUN / Constants.CL^2
     params.T_unit = params.L_unit / Constants.CL

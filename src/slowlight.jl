@@ -10,47 +10,24 @@ using Printf
 using DelimitedFiles
 using ProgressMeter
 using StaticArrays
+using CUDA
 using ..Constants
 using ..Radiation
 using ..Iharm
 using ..Output
+using ..GeoTypes
+using ..Utils_GPU
 using Dates
-export OfImg, OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
+export OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
     process_slowlight_images!
-
-"""
-Per-pixel, per-frame accumulator used while rendering a slow-light movie.
-"""
-mutable struct OfImg
-    nstep::Int
-    Intensity::Float64
-    tau::Float64
-    tauF::Float64
-    N_coord::MMatrix{4,4,ComplexF64}
-end
-
-"""
-    Base.zero(::Type{OfImg})
-
-Construct a zeroed [`OfImg`](@ref).
-"""
-function Base.zero(::Type{OfImg})
-    OfImg(
-        0,
-        0.0,
-        0.0,
-        0.0,
-        MMatrix{4,4,ComplexF64}(zeros(ComplexF64, 4, 4))
-    )
-end
 
 """
 Slow-light run state: which dump is currently loaded/being advanced to,
 and the time window `[tA, tB]` currently bracketed by `simulation_data`.
 """
 mutable struct OfSlowLight
-    dump_max::Int64
     nloaded::Int64
+    dump_max::Int64
     ImageCadence::Float64
     tA::Float64
     tB::Float64
@@ -133,6 +110,373 @@ function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large
 end
 
 """
+    render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times,
+        pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
+
+Integrate one round of radiative transfer for the currently-active frames,
+across the whole image, on the CPU, threaded over pixels.
+
+# Arguments
+- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
+  in place.
+- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten
+  in place.
+- `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per
+  pixel.
+- `valid_ks`: Indices of the currently-active frames to render this
+  round.
+- `target_times`: Target simulation time for each frame.
+- `pixels_x`, `pixels_y`: Image resolution.
+- `params_slowlight`: Slow-light run state (time window `[tA, tB]`).
+- `freq`: Frequency, in cgs units.
+- `model`: Iharm model parameters.
+- `simulation_data`: 3-element window of loaded GRMHD snapshots.
+"""
+function render_round_cpu!(
+    movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
+    params_slowlight::OfSlowLight, freq, model, simulation_data
+)
+    p = Progress(length(valid_ks) * pixels_x * pixels_y;
+        desc = "Rendering $(length(valid_ks)) frame(s) this round on CPU...", showspeed = true, barlen = 30)
+    progress_lock = ReentrantLock()
+
+    Threads.@threads :greedy for i in 1:pixels_x
+        for j in 1:pixels_y
+            traj = all_geodesics[i, j]
+            for k in valid_ks
+                nstep = movie_nstep[i, j, k]
+                Intensity = movie_intensity[i, j, k]
+                dt = target_times[k] + 1e-5
+
+                while (nstep > 2)
+                    Xi = traj[nstep].X
+                    Xf = traj[nstep-1].X
+                    Kconi = traj[nstep].Kcon
+                    Kconf = traj[nstep-1].Kcon
+
+                    Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
+                    Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
+                    if Xi[1] < params_slowlight.tA
+                        shift = params_slowlight.tA - Xi[1]
+                        Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
+                        Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
+                    end
+                    if Xi[1] >= params_slowlight.tB
+                        if Xf[1] >= params_slowlight.tf
+                            shift = params_slowlight.tf - Xf[1]
+                            Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
+                            Xf = SVector{4,Float64}(params_slowlight.tf, Xf[2], Xf[3], Xf[4])
+                        else
+                            break
+                        end
+                    end
+
+                    ji, ki = Radiation.get_jk(Xi, Kconi, freq, model.a, model, simulation_data)
+                    jf, kf = Radiation.get_jk(Xf, Kconf, freq, model.a, model, simulation_data)
+
+                    Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
+
+                    nstep -= 1
+                end
+                movie_nstep[i, j, k] = nstep
+                movie_intensity[i, j, k] = Intensity
+            end
+
+            lock(progress_lock) do
+                for _ in valid_ks
+                    ProgressMeter.next!(p)
+                end
+            end
+        end
+    end
+    finish!(p)
+    return nothing
+end
+
+"""
+    pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
+
+Pack the per-pixel geodesic trajectories for image rows `j0:j1` into the
+dense host buffer `dest` (unused tail steps zeroed), so they can be
+uploaded to the GPU as one contiguous tile — a ragged `Vector`-of-
+`Vector`s can't be transferred as a single `CuArray`. Repacking a tile-
+sized buffer each round (rather than materializing the whole image at
+once) keeps host memory bounded at production image sizes.
+
+# Arguments
+- `dest`: Output buffer, overwritten with the packed trajectories.
+- `all_geodesics`: Matrix of per-pixel geodesic trajectories.
+- `nsteps`: Matrix of trajectory lengths, one per pixel.
+- `pixels_x`: Image width.
+- `j0`, `j1`: Range of image rows to pack.
+
+# Returns
+- `dest`.
+"""
+function pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
+    zero_vec = SVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
+    dummy = OfTrajS(0.0, zero_vec, zero_vec, zero_vec, zero_vec)
+    fill!(dest, dummy)
+    @inbounds for j in j0:j1, i in 1:pixels_x
+        traj = all_geodesics[i, j]
+        n = nsteps[i, j]
+        jj = j - j0 + 1
+        for s in 1:n
+            dest[i, jj, s] = traj[s]
+        end
+    end
+    return dest
+end
+
+"""
+    gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+
+Pick how many image rows can be packed and rendered on the GPU at once
+without exceeding either the GPU's or the host's currently free memory
+(queried live, since both are shared with other processes).
+
+# Arguments
+- `pixels_x`, `pixels_y`: Image resolution.
+- `max_nstep`: Longest trajectory length across all pixels.
+- `nimgs_concurrently`: Number of frames rendered concurrently.
+- `simulation_data`: 3-element window of loaded GRMHD snapshots, used to
+  estimate their GPU memory footprint.
+
+# Returns
+- `tile_height`: Number of image rows (the `j` dimension) per tile.
+"""
+function gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+    traj_elem_bytes = sizeof(OfTrajS)
+
+    grid_bytes = 3 * Base.summarysize(simulation_data[1])
+    state_bytes = pixels_x * pixels_y * nimgs_concurrently * (sizeof(Float64) + sizeof(Int))
+
+    gpu_usable_bytes = max(CUDA.available_memory() - grid_bytes - state_bytes, 0)
+    host_usable_bytes = Sys.free_memory()
+
+    safety_fraction = 0.6 
+    usable_bytes = floor(Int, min(gpu_usable_bytes, host_usable_bytes) * safety_fraction)
+
+    row_bytes = pixels_x * max_nstep * traj_elem_bytes
+    tile_height = row_bytes <= 0 ? pixels_y : clamp(usable_bytes ÷ row_bytes, 1, pixels_y)
+    return tile_height
+end
+
+"""
+    upload_gpu_snapshot(cpu_snapshot)
+
+Copy one CPU-resident GRMHD snapshot to the GPU.
+
+# Arguments
+- `cpu_snapshot`: GRMHD snapshot with `Array`-backed fields.
+
+# Returns
+- The same snapshot, with `CuArray`-backed fields.
+"""
+upload_gpu_snapshot(cpu_snapshot) = Utils_GPU.copy_iharm_to_gpu(cpu_snapshot)
+
+"""
+    init_gpu_data(simulation_data)
+
+Upload all 3 initial GRMHD snapshots to the GPU. Only used once, at
+GPU-engine startup; every subsequent slide of the time window goes
+through [`refresh_gpu_data!`](@ref) instead, which re-uploads just the
+one snapshot that actually changed.
+
+# Arguments
+- `simulation_data`: 3-element window of loaded GRMHD snapshots.
+
+# Returns
+- 3-element `Vector` of GPU-resident snapshots.
+"""
+function init_gpu_data(simulation_data)
+    return [upload_gpu_snapshot(simulation_data[1]),
+            upload_gpu_snapshot(simulation_data[2]),
+            upload_gpu_snapshot(simulation_data[3])]
+end
+
+"""
+    refresh_gpu_data!(gpu_data, simulation_data)
+
+Slide the GPU-resident snapshot window forward by one dump, mirroring the
+rotation [`update_data!`](@ref) already performed on the CPU side:
+slots 1/2 are just re-pointed at the (already GPU-resident) former slots
+2/3, and only the genuinely new snapshot is re-uploaded.
+
+# Arguments
+- `gpu_data`: 3-element vector of GPU-resident snapshots, overwritten in
+  place.
+- `simulation_data`: 3-element window of loaded (CPU) GRMHD snapshots,
+  already advanced by [`update_data!`](@ref).
+
+# Returns
+- `gpu_data`.
+"""
+function refresh_gpu_data!(gpu_data, simulation_data)
+    gpu_data[1] = gpu_data[2]
+    gpu_data[2] = gpu_data[3]
+    gpu_data[3] = upload_gpu_snapshot(simulation_data[3])
+    return gpu_data
+end
+
+"""
+    slowlight_kernel!(traj, nstep_state, intensity, valid_mask, target_times,
+        tA, tB, tf, freq, bhspin, model, data)
+
+GPU kernel: for each pixel and each active frame, integrate the radiative
+transfer equation backward along the pre-traced trajectory, mirroring
+[`render_round_cpu!`](@ref)'s inner loop.
+
+# Arguments
+- `traj`: Packed per-pixel geodesic trajectories for this tile (see
+  [`pack_trajectory_tile!`](@ref)).
+- `nstep_state`: Remaining trajectory steps per pixel/frame, overwritten
+  in place.
+- `intensity`: Accumulated intensity per pixel/frame, overwritten in
+  place.
+- `valid_mask`: Which frames are currently active (nonzero entries).
+- `target_times`: Target simulation time for each frame.
+- `tA`, `tB`: Time window currently bracketed by `data`.
+- `tf`: Simulation time of the newest available dump.
+- `freq`: Frequency, in cgs units.
+- `bhspin`: Dimensionless black hole spin parameter.
+- `model`: Iharm model parameters.
+- `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (see
+  [`refresh_gpu_data!`](@ref)).
+"""
+function slowlight_kernel!(
+    traj, nstep_state, intensity, valid_mask, target_times,
+    tA::Float64, tB::Float64, tf::Float64,
+    freq::Float64, bhspin::Float64, model, data
+)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+
+    nx, ny, _ = size(traj)
+    nk = length(valid_mask)
+
+    if i <= nx && j <= ny
+        @inbounds for k in 1:nk
+            if valid_mask[k] == 0
+                continue
+            end
+
+            nstep = nstep_state[i, j, k]
+            Intensity = intensity[i, j, k]
+            dt = target_times[k] + 1e-5
+
+            while nstep > 2
+                Xi = traj[i, j, nstep].X
+                Xf = traj[i, j, nstep-1].X
+                Kconi = traj[i, j, nstep].Kcon
+                Kconf = traj[i, j, nstep-1].Kcon
+
+                Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
+                Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
+                if Xi[1] < tA
+                    shift = tA - Xi[1]
+                    Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
+                    Xi = SVector{4,Float64}(tA, Xi[2], Xi[3], Xi[4])
+                end
+                if Xi[1] >= tB
+                    if Xf[1] >= tf
+                        shift = tf - Xf[1]
+                        Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
+                        Xf = SVector{4,Float64}(tf, Xf[2], Xf[3], Xf[4])
+                    else
+                        break
+                    end
+                end
+
+                ji, ki = Radiation.get_jk(Xi, Kconi, freq, bhspin, model, data)
+                jf, kf = Radiation.get_jk(Xf, Kconf, freq, bhspin, model, data)
+
+                Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[i, j, nstep-1].dl)
+
+                nstep -= 1
+            end
+
+            nstep_state[i, j, k] = nstep
+            intensity[i, j, k] = Intensity
+        end
+    end
+    return nothing
+end
+
+"""
+    render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height,
+        valid_ks, nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
+
+GPU counterpart of [`render_round_cpu!`](@ref): integrates one round of
+radiative transfer for the currently-active frames, tiled over image rows
+(see [`gpu_tile_plan`](@ref)) so no single tile's trajectory buffer
+exceeds the GPU's free memory. Per tile: packs and uploads that tile's
+trajectories and current state, launches [`slowlight_kernel!`](@ref), and
+copies the results back to the host.
+
+# Arguments
+- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
+  in place.
+- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten
+  in place.
+- `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per
+  pixel.
+- `nsteps`: Matrix of trajectory lengths, one per pixel.
+- `max_nstep`: Longest trajectory length across all pixels.
+- `tile_height`: Number of image rows per tile (see [`gpu_tile_plan`](@ref)).
+- `valid_ks`: Indices of the currently-active frames to render this
+  round.
+- `nimgs_concurrently`: Number of frames rendered concurrently.
+- `target_times`: Target simulation time for each frame.
+- `pixels_x`, `pixels_y`: Image resolution.
+- `params_slowlight`: Slow-light run state (time window `[tA, tB, tf]`).
+- `freq`: Frequency, in cgs units.
+- `model`: Iharm model parameters.
+- `gpu_data`: 3-element vector of GPU-resident GRMHD snapshots.
+"""
+function render_round_gpu!(
+    movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks, nimgs_concurrently,
+    target_times, pixels_x, pixels_y, params_slowlight::OfSlowLight, freq, model, gpu_data
+)
+    threads_per_block = (16, 16)
+    valid_mask_host = zeros(Int, nimgs_concurrently)
+    for k in valid_ks
+        valid_mask_host[k] = 1
+    end
+    d_valid_mask = CuArray(valid_mask_host)
+    d_target_times = CuArray(target_times)
+    data_tuple = Tuple(gpu_data)
+
+    n_tiles = cld(pixels_y, tile_height)
+    println("Rendering $(length(valid_ks)) frame(s) this round on GPU ($n_tiles tile(s) of height $tile_height)...")
+
+    traj_tile_host = Array{OfTrajS}(undef, pixels_x, tile_height, max_nstep)
+    for j0 in 1:tile_height:pixels_y
+        j1 = min(j0 + tile_height - 1, pixels_y)
+        tile_ny = j1 - j0 + 1
+
+        traj_view = tile_ny == tile_height ? traj_tile_host : Array{OfTrajS}(undef, pixels_x, tile_ny, max_nstep)
+        pack_trajectory_tile!(traj_view, all_geodesics, nsteps, pixels_x, j0, j1)
+        d_traj = CuArray(traj_view)
+
+        d_nstep = CuArray(@view movie_nstep[:, j0:j1, :])
+        d_intensity = CuArray(@view movie_intensity[:, j0:j1, :])
+
+        blocks_per_grid = (cld(pixels_x, threads_per_block[1]), cld(tile_ny, threads_per_block[2]))
+        @cuda threads = threads_per_block blocks = blocks_per_grid slowlight_kernel!(
+            d_traj, d_nstep, d_intensity, d_valid_mask, d_target_times,
+            params_slowlight.tA, params_slowlight.tB, params_slowlight.tf,
+            freq, model.a, model, data_tuple
+        )
+        CUDA.synchronize()
+
+        copyto!(@view(movie_nstep[:, j0:j1, :]), Array(d_nstep))
+        copyto!(@view(movie_intensity[:, j0:j1, :]), Array(d_intensity))
+    end
+    return nothing
+end
+
+"""
     process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path)
 
 Render a slow-light movie: repeatedly integrate the (already-traced)
@@ -159,11 +503,17 @@ allows, until every requested frame has been produced.
 - `fovx`, `fovy`: Field of view, in radians.
 - `SourceD`: Source distance, in cgs units.
 - `scale`: Jy-per-pixel-intensity scale factor.
+- `engine`: `:CPU` (default) integrates radiative transfer threaded over
+  pixels on the CPU, exactly as before. `:GPU` runs the same physics on
+  the GPU instead ([`render_round_gpu!`](@ref)/[`slowlight_kernel!`](@ref)).
 """
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
-    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale
+    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
+    engine::Symbol = :CPU
 )
+    engine in (:CPU, :GPU) || throw(ArgumentError("engine must be :CPU or :GPU, got $(repr(engine))"))
+
     base_dir = joinpath("..", "slow_sims")
     
     if !isdir(base_dir)
@@ -180,7 +530,8 @@ function process_slowlight_images!(
     last_img_target = params_slowlight.tA - tgeof
     nimgs_concurrently = round(Int, 2 + abs(t0) / params_slowlight.ImageCadence)
 
-    MovieArray = [zero(OfImg) for _ in 1:pixels_x, _ in 1:pixels_y, _ in 1:nimgs_concurrently]
+    movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
+    movie_intensity = zeros(Float64, pixels_x, pixels_y, nimgs_concurrently)
     target_times = zeros(Float64, nimgs_concurrently)
     valid_images = zeros(Float64, nimgs_concurrently)
 
@@ -188,6 +539,17 @@ function process_slowlight_images!(
     nimg = 1
     nopenimgs = 1
     output = "Image.%07.1f.h5"
+
+    max_nstep = 0
+    tile_height = pixels_y
+    gpu_data = nothing
+    if engine === :GPU
+        println("Preparing GPU workspace...")
+        max_nstep = maximum(nsteps)
+        tile_height = gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+        gpu_data = init_gpu_data(simulation_data)
+        println("GPU tiling: $(cld(pixels_y, tile_height)) tile(s) of height $tile_height (image is $(pixels_x)x$(pixels_y), up to $max_nstep steps/pixel)")
+    end
 
     while true
         while (last_img_target + t0 < params_slowlight.tB)
@@ -197,10 +559,8 @@ function process_slowlight_images!(
                 nopenimgs += 1
                 for i in 1:pixels_x
                     for j in 1:pixels_y
-                        MovieArray[i, j, nimg].nstep = nsteps[i, j]
-                        MovieArray[i, j, nimg].Intensity = 0.0
-                        MovieArray[i, j, nimg].tau = 0.0
-                        MovieArray[i, j, nimg].tauF = 0.0
+                        movie_nstep[i, j, nimg] = nsteps[i, j]
+                        movie_intensity[i, j, nimg] = 0.0
                     end
                 end
                 nimg += 1
@@ -212,68 +572,30 @@ function process_slowlight_images!(
         end
 
         valid_ks = [k for k in 1:nimgs_concurrently if valid_images[k] == 1]
-        p = Progress(length(valid_ks) * pixels_x * pixels_y;
-            desc = "Rendering $(length(valid_ks)) frame(s) this round...", showspeed = true, barlen = 30)
-        progress_lock = ReentrantLock()
+
+        elapsed = @elapsed if engine === :CPU
+            render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
+                params_slowlight, freq, model, simulation_data)
+        else
+            render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks,
+                nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
+        end
+        println("Round rendered in $(round(elapsed, digits=3))s on $engine")
+
+        # do_output is derived from movie_nstep's final state, so it's identical
+        # regardless of which engine produced that state.
         do_output = trues(nimgs_concurrently)
-
-        Threads.@threads :greedy for i in 1:pixels_x
-            for j in 1:pixels_y
-                traj = all_geodesics[i, j]
-                for k in valid_ks
-                    nstep = MovieArray[i, j, k].nstep
-                    dt = target_times[k] + 1e-5
-
-                    while (nstep > 2)
-                        Xi = traj[nstep].X
-                        Xf = traj[nstep-1].X
-                        Kconi = traj[nstep].Kcon
-                        Kconf = traj[nstep-1].Kcon
-
-                        Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
-                        Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
-                        if Xi[1] < params_slowlight.tA
-                            shift = params_slowlight.tA - Xi[1]
-                            Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
-                            Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
-                        end
-                        if Xi[1] >= params_slowlight.tB
-                            if Xf[1] >= params_slowlight.tf
-                                shift = params_slowlight.tf - Xf[1]
-                                Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
-                                Xf = SVector{4,Float64}(params_slowlight.tf, Xf[2], Xf[3], Xf[4])
-                            else
-                                break
-                            end
-                        end
-
-                        ji, ki = Radiation.get_jk(Xi, Kconi, freq, model.a, model, simulation_data)
-                        jf, kf = Radiation.get_jk(Xf, Kconf, freq, model.a, model, simulation_data)
-
-                        MovieArray[i, j, k].Intensity = Radiation.approximate_solve(MovieArray[i, j, k].Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
-
-                        nstep -= 1
-                    end
-                    MovieArray[i, j, k].nstep = nstep
-                    if nstep != 2
-                        do_output[k] = false
-                    end
-                end
-
-                lock(progress_lock) do
-                    for _ in valid_ks
-                        ProgressMeter.next!(p)
-                    end
-                end
+        for k in valid_ks
+            if !all(==(2), @view movie_nstep[:, :, k])
+                do_output[k] = false
             end
         end
-        finish!(p)
 
         for k in valid_ks
             if do_output[k]
-                Image_out = map(x -> x.Intensity, MovieArray[:, :, k]) .* freq^3
+                Image_out = movie_intensity[:, :, k] .* freq^3
 
-                file_name = Printf.format(Printf.Format(output), target_times[k])
+                file_name = joinpath(output_dir, Printf.format(Printf.Format(output), target_times[k]))
                 out_data = Dict{String, Any}(
                     "image"      => Image_out,
                     "img_time"   => target_times[k],
@@ -302,6 +624,9 @@ function process_slowlight_images!(
             break
         end
         update_data!(params_slowlight, simulation_data, trat_large, model, all_dumps_path)
+        if engine === :GPU
+            refresh_gpu_data!(gpu_data, simulation_data)
+        end
     end
 end
 

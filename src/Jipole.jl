@@ -31,8 +31,8 @@ include("models/iharm.jl")
 
 include("output.jl")
 include("imaging.jl")
+include("utils_gpu.jl")
 include("slowlight.jl")
 include("autodiff.jl")
-include("utils_gpu.jl")
 
 end

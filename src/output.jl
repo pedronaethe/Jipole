@@ -89,6 +89,7 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     scale = data["scale"]
     Xcamera = data["Xcamera"]
     trat_large = data["trat_large"]
+    t = data["img_time"]
 
     tau = get(data, "tau", zeros(size(image)))
     xoff = get(data, "xoff", 0.0)
@@ -151,6 +152,7 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     write(h5file, "header/camera/xoff", xoff)
     write(h5file, "header/camera/yoff", yoff)
     write(h5file, "header/camera/x", collect(Xcamera))
+    write(h5file, "header/camera/t0", t)
 
     write(h5file, "header/units/L_unit", params.L_unit)
     write(h5file, "header/units/M_unit", params.M_unit)

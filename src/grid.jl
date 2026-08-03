@@ -157,12 +157,13 @@ set) linearly in time between the `dataA` and `dataB` snapshots.
 """
 function interp_scalar_time(X, dataA, dataB, tfac, slow_light::Bool, model)
     vA = interp_scalar(X, dataA, model)
-    if slow_light
+    if slow_light || model.brisk_light  
         vB = interp_scalar(X, dataB, model)
         return (tfac) * vA + (1.0 - tfac) * vB
     end
     return vA
 end
+
 
 """
     gdet_zone(i, j, k, model)

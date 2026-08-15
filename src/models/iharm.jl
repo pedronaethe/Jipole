@@ -701,6 +701,18 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large
     end
 end
 
+
+"""
+    time_interp_enabled(model)
+
+Whether time interpolation between GRMHD snapshots is required.
+
+Both slow light and brisk light interpolate in time: slow light on the full
+screen-dependent emission-time map, brisk light on the band-wise clipped map.
+Only fast light (both flags false) uses a single snapshot.
+"""
+@inline time_interp_enabled(model::IharmParams) = model.slow_light || model.brisk_light
+
 """
     set_tinterp_ns(X, model, data)
 
@@ -720,7 +732,7 @@ compiling it) — so the `Tuple`-specific methods below select on the
 tuple's length instead, which is resolved at compile time.
 """
 function set_tinterp_ns(X, model::IharmParams, data)
-    if model.slow_light
+    if time_interp_enabled(model)
         nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
         dataA, dataB = data[nA], data[nB]
         tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
@@ -777,7 +789,7 @@ function get_model_sigma(X, model::IharmParams, data)
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.sigma, dataB.sigma, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(X, dataA.sigma, dataB.sigma, tfac, time_interp_enabled(model), model)
 end
 
 """
@@ -842,7 +854,7 @@ function get_model_ne(X, model::IharmParams, data)
         sigma_smoothfac = get_sigma_smoothfac(sigma, model)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.ne, dataB.ne, tfac, model.slow_light, model) * sigma_smoothfac
+    return Grid.interp_scalar_time(X, dataA.ne, dataB.ne, tfac, time_interp_enabled(model), model) * sigma_smoothfac
 end
 
 """
@@ -865,7 +877,7 @@ function get_model_thetae(X, model::IharmParams, data)
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.θe, dataB.θe, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(X, dataA.θe, dataB.θe, tfac, time_interp_enabled(model), model)
 end
 
 """
@@ -888,7 +900,7 @@ function get_model_thetae_deriv(X, model::IharmParams, data)
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(X, dataA.dθedRhi, dataB.dθedRhi, tfac, time_interp_enabled(model), model)
 end
 
 """
@@ -910,7 +922,7 @@ function get_model_b(X, model::IharmParams, data)
         return zero(T)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.b, dataB.b, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(X, dataA.b, dataB.b, tfac, time_interp_enabled(model), model)
 end
 
 """
@@ -954,9 +966,9 @@ with the rest of the differentiable call path.
     end
 
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    Vcon2 = Grid.interp_scalar_time(X, dataA.U1, dataB.U1, tfac, model.slow_light, model)
-    Vcon3 = Grid.interp_scalar_time(X, dataA.U2, dataB.U2, tfac, model.slow_light, model)
-    Vcon4 = Grid.interp_scalar_time(X, dataA.U3, dataB.U3, tfac, model.slow_light, model)
+    Vcon2 = Grid.interp_scalar_time(X, dataA.U1, dataB.U1, tfac, time_interp_enabled(model), model)
+    Vcon3 = Grid.interp_scalar_time(X, dataA.U2, dataB.U2, tfac, time_interp_enabled(model), model)
+    Vcon4 = Grid.interp_scalar_time(X, dataA.U3, dataB.U3, tfac, time_interp_enabled(model), model)
     Vcon = SVector{4,elT}(0.0, Vcon2, Vcon3, Vcon4)
 
     VdotV = zero(elT)
@@ -976,9 +988,9 @@ with the rest of the differentiable call path.
 
     Ucov = Coordinates.flip_index(Ucon, gcov)
 
-    Bcon1_interp = Grid.interp_scalar_time(X, dataA.B1, dataB.B1, tfac, model.slow_light, model)
-    Bcon2_interp = Grid.interp_scalar_time(X, dataA.B2, dataB.B2, tfac, model.slow_light, model)
-    Bcon3_interp = Grid.interp_scalar_time(X, dataA.B3, dataB.B3, tfac, model.slow_light, model)
+    Bcon1_interp = Grid.interp_scalar_time(X, dataA.B1, dataB.B1, tfac, time_interp_enabled(model), model)
+    Bcon2_interp = Grid.interp_scalar_time(X, dataA.B2, dataB.B2, tfac, time_interp_enabled(model), model)
+    Bcon3_interp = Grid.interp_scalar_time(X, dataA.B3, dataB.B3, tfac, time_interp_enabled(model), model)
 
     Bcon1 = (Ucov[2] * Bcon1_interp + Ucov[3] * Bcon2_interp + Ucov[4] * Bcon3_interp)
     Bcon2 = (Bcon1_interp + Ucon[2] * Bcon1) / Ucon[1]

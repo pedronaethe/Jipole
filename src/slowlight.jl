@@ -113,8 +113,10 @@ end
     render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times,
         pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
 
-Integrate one round of radiative transfer for the currently-active frames,
-across the whole image, on the CPU, threaded over pixels.
+Render one round on the CPU: for every pixel and every currently-open
+frame in `valid_ks`, continue integrating intensity along that pixel's
+trajectory, threaded over pixels. Called from
+[`process_slowlight_images!`](@ref) when `engine = :CPU`.
 
 # Arguments
 - `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
@@ -196,12 +198,17 @@ end
 """
     pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
 
-Pack the per-pixel geodesic trajectories for image rows `j0:j1` into the
-dense host buffer `dest` (unused tail steps zeroed), so they can be
-uploaded to the GPU as one contiguous tile — a ragged `Vector`-of-
-`Vector`s can't be transferred as a single `CuArray`. Repacking a tile-
-sized buffer each round (rather than materializing the whole image at
-once) keeps host memory bounded at production image sizes.
+Each pixel's traced light ray has its own number of steps, so
+`all_geodesics` stores them as a list of differently-sized lists. The GPU
+instead needs one same-sized rectangular block. This function builds that
+block for one strip of the image (rows `j0` to `j1`): it copies each
+pixel's steps into `dest`, padding any leftover space with zeros for
+pixels whose ray was shorter than the longest one in the strip.
+
+Only one strip at a time, not the whole image, to keep memory use down --
+padding every pixel in the whole image to the single longest ray anywhere
+could need tens of GB. Called from [`render_round_gpu!`](@ref), once per
+strip per round.
 
 # Arguments
 - `dest`: Output buffer, overwritten with the packed trajectories.
@@ -231,9 +238,12 @@ end
 """
     gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
 
-Pick how many image rows can be packed and rendered on the GPU at once
-without exceeding either the GPU's or the host's currently free memory
-(queried live, since both are shared with other processes).
+Decide how many image rows fit in one GPU tile, by checking how much
+memory is actually free right now -- on both the GPU (`CUDA.available_memory()`)
+and the host (`Sys.free_memory()`, since [`pack_trajectory_tile!`](@ref)
+builds each tile on the host first) -- and picking the size that fits
+the tighter of the two. Called once from [`process_slowlight_images!`](@ref)
+when `engine = :GPU`, before the rounds loop starts.
 
 # Arguments
 - `pixels_x`, `pixels_y`: Image resolution.
@@ -243,7 +253,7 @@ without exceeding either the GPU's or the host's currently free memory
   estimate their GPU memory footprint.
 
 # Returns
-- `tile_height`: Number of image rows (the `j` dimension) per tile.
+- `tile_height`: number of image rows (the `j` dimension) per tile.
 """
 function gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
     traj_elem_bytes = sizeof(OfTrajS)
@@ -265,7 +275,8 @@ end
 """
     upload_gpu_snapshot(cpu_snapshot)
 
-Copy one CPU-resident GRMHD snapshot to the GPU.
+Copy one CPU-resident GRMHD snapshot to the GPU. Small helper used by
+[`init_gpu_data`](@ref) and [`refresh_gpu_data!`](@ref).
 
 # Arguments
 - `cpu_snapshot`: GRMHD snapshot with `Array`-backed fields.
@@ -278,10 +289,9 @@ upload_gpu_snapshot(cpu_snapshot) = Utils_GPU.copy_iharm_to_gpu(cpu_snapshot)
 """
     init_gpu_data(simulation_data)
 
-Upload all 3 initial GRMHD snapshots to the GPU. Only used once, at
-GPU-engine startup; every subsequent slide of the time window goes
-through [`refresh_gpu_data!`](@ref) instead, which re-uploads just the
-one snapshot that actually changed.
+Upload all 3 starting GRMHD snapshots to the GPU. Called once from
+[`process_slowlight_images!`](@ref) when a `:GPU` run starts; after that,
+[`refresh_gpu_data!`](@ref) takes over for each new round.
 
 # Arguments
 - `simulation_data`: 3-element window of loaded GRMHD snapshots.
@@ -298,10 +308,12 @@ end
 """
     refresh_gpu_data!(gpu_data, simulation_data)
 
-Slide the GPU-resident snapshot window forward by one dump, mirroring the
-rotation [`update_data!`](@ref) already performed on the CPU side:
-slots 1/2 are just re-pointed at the (already GPU-resident) former slots
-2/3, and only the genuinely new snapshot is re-uploaded.
+Keep the GPU's copy of the GRMHD snapshots in sync after
+[`update_data!`](@ref) slides the CPU-side window forward by one dump:
+slots 1 and 2 just get re-pointed at the snapshots already on the GPU,
+and only the genuinely new slot 3 is re-uploaded. Called from
+[`process_slowlight_images!`](@ref) after each `update_data!` call, when
+`engine = :GPU`.
 
 # Arguments
 - `gpu_data`: 3-element vector of GPU-resident snapshots, overwritten in
@@ -323,9 +335,11 @@ end
     slowlight_kernel!(traj, nstep_state, intensity, valid_mask, target_times,
         tA, tB, tf, freq, bhspin, model, data)
 
-GPU kernel: for each pixel and each active frame, integrate the radiative
-transfer equation backward along the pre-traced trajectory, mirroring
-[`render_round_cpu!`](@ref)'s inner loop.
+The GPU kernel itself: one thread per pixel `(i, j)`, looping over every
+active frame `k` (skipping any where `valid_mask[k] == 0`) and continuing
+that pixel's intensity integration along its trajectory. Same math as
+[`render_round_cpu!`](@ref)'s inner loop, just run on the GPU. Launched
+via `@cuda` from [`render_round_gpu!`](@ref).
 
 # Arguments
 - `traj`: Packed per-pixel geodesic trajectories for this tile (see
@@ -407,12 +421,14 @@ end
     render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height,
         valid_ks, nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
 
-GPU counterpart of [`render_round_cpu!`](@ref): integrates one round of
-radiative transfer for the currently-active frames, tiled over image rows
-(see [`gpu_tile_plan`](@ref)) so no single tile's trajectory buffer
-exceeds the GPU's free memory. Per tile: packs and uploads that tile's
-trajectories and current state, launches [`slowlight_kernel!`](@ref), and
-copies the results back to the host.
+Render one round on the GPU -- the `:GPU` counterpart of
+[`render_round_cpu!`](@ref). Goes tile by tile (rows sized by
+[`gpu_tile_plan`](@ref)): pack that tile's trajectories
+([`pack_trajectory_tile!`](@ref)) and upload it plus the current
+`movie_nstep`/`movie_intensity` state, run [`slowlight_kernel!`](@ref),
+then copy the results back to `movie_nstep`/`movie_intensity` so they're
+plain host arrays again afterwards, same as the CPU path. Called from
+[`process_slowlight_images!`](@ref) when `engine = :GPU`.
 
 # Arguments
 - `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten

@@ -1,0 +1,57 @@
+[physical]
+MBH = 6.2e9
+# When true, dump_filepath below must be a directory: the whole
+# t_init..t_final range is used as the slow-light dump sequence (see
+# [slowlight]) instead of one image per dump.
+slow_light = false
+
+#it can be MAD/SANE or any float value
+m_unit = MAD
+
+[dump]
+# dump_filepath can point to a single dump file, or to a directory of dumps.
+dump_filepath = "/home/pedro/kharma_dumps/"
+t_init = 0
+t_final = 10
+
+# Only read when [physical].slow_light = true.
+[slowlight]
+image_cadence = 10.0
+#either cpu or gpu
+engine = "cpu"
+
+[plasma]
+trat_large = 20.0
+trat_small = 1.0
+beta_crit = 1.0
+th_beg = 1.74e-2
+sigma_cut = 1.0
+sigma_cut_high = -1.0
+
+[camera]
+ro = 1000.0
+theta_o = 163.0
+phi = 0.0
+
+[image]
+pixels_x = 128
+pixels_y = 128
+fov_size = 160.0
+xoff = 0.0
+yoff = 0.0
+
+[observing]
+freq = 230e9
+source_distance_pc = 16.9e6
+
+[raytracing]
+maxnstep = 25000
+
+#either cpu or gpu
+mode = "gpu"
+
+[output]
+#if the directory does not exist, it will create it.
+#with slowlight on, the results are saved in a slow_sims folder.
+filename = "results/jipole_output.h5"
+format = "ipole"

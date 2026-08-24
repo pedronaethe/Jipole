@@ -23,6 +23,12 @@ scripts/*
 # Generated figures
 *.png
 
+
+#scripts
+!scripts/generate_image.jl
+!scripts/pars/
+!scripts/pars/example_par.toml
+
 # Jupyter noise
 **/.ipynb_checkpoints/
 

@@ -77,7 +77,7 @@ end
 
 
 """
-    raytrace_image_gpu!(d_traj, d_Image, i_offset, j_offset, block_size_x, block_size_y,
+    raytrace_image_gpu!(d_traj, d_Image, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
         ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rout, Rstop, data, params)
 
 GPU kernel launcher for [`calculate_image!`](@ref): raytraces and
@@ -93,6 +93,11 @@ The division in tiles is necessary depending on the size of the image due to GPU
 - `d_traj`: Pre-allocated `CuArray{OfTrajGRMHD}` scratch buffer, sized
   `(block_size_x, block_size_y, nmaxstep)`.
 - `d_Image`: Output image, overwritten in-place.
+- `d_truncated`: Pre-allocated array of booleans, set `true` for any pixel whose geodesic
+  integration hit `nmaxstep` before `stop_backward_integration` actually
+  fired (i.e. `d_traj` was too small for that pixel). Callers should check
+  this after the launch and retry with a larger `nmaxstep`/`d_traj` if any
+  entry came back `true`.
 - `i_offset`, `j_offset`: Pixel offset of this tile within the full image.
 - `block_size_x`, `block_size_y`: Tile size (must match `d_traj`'s first
   two dimensions and the launch's thread/block configuration).
@@ -108,7 +113,7 @@ The division in tiles is necessary depending on the size of the image due to GPU
 - `params`: Model parameters.
 """
 function raytrace_image_gpu!(
-    d_traj, d_Image,
+    d_traj, d_Image, d_truncated,
     i_offset, j_offset, block_size_x, block_size_y, # New offset parameters
     ro, θo, phi, bhspin, nx, ny, nmaxstep,
     freq, fovx, fovy, Rout, Rstop, data, params
@@ -120,9 +125,9 @@ function raytrace_image_gpu!(
     j = local_j - 1 + j_offset
 
     if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
-        
+
         calculate_image!(
-            d_traj, d_Image, ro, θo, phi, bhspin, nx, ny, nmaxstep,
+            d_traj, d_Image, d_truncated, ro, θo, phi, bhspin, nx, ny, nmaxstep,
             i, j, local_i, local_j, freq, fovx, fovy, Rout, Rstop, params, data
         )
     end
@@ -131,7 +136,7 @@ end
 
 
 """
-    calculate_image!(traj, d_Image, ro, θo, phi, bhspin, nx, ny, nmaxstep, i_global,
+    calculate_image!(traj, d_Image, d_truncated, ro, θo, phi, bhspin, nx, ny, nmaxstep, i_global,
         j_global, i_local, j_local, freq, fovx, fovy, Rout, Rstop, params, data=nothing)
 
 GPU per-pixel kernel body for [`raytrace_image_gpu!`](@ref): traces the
@@ -144,6 +149,9 @@ far end back to the camera), writing the result into `d_Image`.
 - `traj`: Pre-allocated `CuDeviceArray{OfTrajGRMHD}` scratch buffer for
   this tile, indexed by the pixel's local (within-tile) coordinates.
 - `d_Image`: Output image, overwritten in-place at `(i_global, j_global)`.
+- `d_truncated`: Pre-allocated boolean array for this tile, set
+  `true` at `(i_local, j_local)` if `nmaxstep` was hit before the geodesic
+  actually reached its stopping condition.
 - `ro`, `θo`, `phi`: Camera radial distance, inclination, and azimuth.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `nx`, `ny`: Full image resolution.
@@ -159,7 +167,7 @@ far end back to the camera), writing the result into `d_Image`.
 - `data`: Model-specific auxiliary data (e.g. `Iharm`'s GRMHD snapshots).
 """
 function calculate_image!(
-    traj, d_Image,
+    traj, d_Image, d_truncated,
     ro::Float64, θo::Float64, phi::Float64, bhspin::Float64,
     nx::Int64, ny::Int64, nmaxstep::Int64,
     i_global::Int64, j_global::Int64,
@@ -203,6 +211,8 @@ function calculate_image!(
             )
         end
     end
+
+    @inbounds d_truncated[i_local, j_local] = (step >= nmaxstep) && (Geodesics.stop_backward_integration(X, K, Rh, Rstop) == 0)
 
     # #Radiative Transfer Integration:
 

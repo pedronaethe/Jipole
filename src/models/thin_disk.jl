@@ -396,13 +396,13 @@ integral: `Image[I, J]` is set to the surface intensity of the last
 disk-midplane crossing found along the trajectory (`data` is unused by
 this model).
 """
-function Radiation.integrate_emission!(traj::Vector{OfTrajS}, nsteps::Int, Image::Matrix{Float64}, I::Int, J::Int, freq::Float64, bhspin::Float64, model::ThinDiskParams, data=nothing)
-    Xi = MVector{4,Float64}(undef)
-    Kconi = MVector{4,Float64}(undef)
-    Xf = MVector{4,Float64}(undef)
-    Rh::Float64 = 1 + sqrt(1.0 - bhspin * bhspin)
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing) where {T}
+    Xi = MVector{4,T}(undef)
+    Kconi = MVector{4,T}(undef)
+    Xf = MVector{4,T}(undef)
+    Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
-    Intensity = 0.0
+    Intensity = zero(T)
     for nstep = nsteps:-1:2
         for k in 1:Constants.NDIM
             Xi[k] = traj[nstep].X[k]

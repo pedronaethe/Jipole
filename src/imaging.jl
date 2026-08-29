@@ -8,13 +8,14 @@ using ForwardDiff
 using CUDA
 using Printf
 using StaticArrays
+using ProgressMeter
 using ..Constants
 using ..GeoTypes
 using ..Camera
 using ..Geodesics
 using ..Radiation
 
-export output_stokes_parameters, calculate_scale_factor, calculate_pixel_intensity
+export output_stokes_parameters, calculate_scale_factor
 
 """
     output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
@@ -118,6 +119,7 @@ function raytrace_image_gpu!(
     ro, θo, phi, bhspin, nx, ny, nmaxstep,
     freq, fovx, fovy, Rout, Rstop, data, params
 )
+    #TODO (PNM): This function is necessarily GPU specific, maybe it shouldn't be and we can find a way to abstract it out.
     local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
@@ -249,75 +251,73 @@ function calculate_image!(
 end
 
 
-function integrate_geodesic!(traj, ro, θo::T, phi, bhspin, i, j, nx, ny, fovx, fovy,
-                              freq, Rstop, nmaxstep, model) where {T}
-    Xcam = SVector{4,T}(Camera.camera_position(ro, θo, phi, bhspin, model))
-    Kcon0 = Geodesics.init_kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model)
-    Kcon = Kcon0 .* T(freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
-    dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
-    Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
 
-    X = Xcam
-    K = Kcon
-    @inbounds traj[1] = GeoTypes.OfTrajDual{T}(zero(T), X, K)
+"""
+    raytrace_image(model, simulation_data, Xcamera, freq, pixels_x, pixels_y,
+                   fovx, fovy, maxnstep, Rh, xoff, yoff)
 
-    step = 1
-    Xv = SVector{4,Float64}(ForwardDiff.value.(X))
-    Kv = SVector{4,Float64}(ForwardDiff.value.(K))
-    while Geodesics.stop_backward_integration(Xv, Kv, Rh, Rstop) == 0 && step < nmaxstep
-        dl = Geodesics.stepsize(X, K, model.cstartx, model.cstopx)
-        Xnew, Knew, _, _ = Geodesics.push_photon(X, K, -dl, bhspin, model)
-        X, K = Xnew, Knew
-        Xv = SVector{4,Float64}(ForwardDiff.value.(X))
-        Kv = SVector{4,Float64}(ForwardDiff.value.(K))
-        step += 1
-        @inbounds traj[step] = GeoTypes.OfTrajDual{T}(dl * dl_unit, X, K)
-    end
-    return step;
-end
+Trace rays to form an image of the source.
 
+# Arguments
+ - `model`: The radiative transfer model parameters.
+ - `simulation_data`: The GRMHD simulation data.
+ - `Xcamera`: Camera position in native coordinates.
+ - `freq`: Observation frequency.
+ - `pixels_x`: Number of pixels in the x-direction.
+ - `pixels_y`: Number of pixels in the y-direction.
+ - `fovx`: Field of view in the x-direction.
+ - `fovy`: Field of view in the y-direction.
+ - `maxnstep`: Maximum number of steps for geodesic integration.
+ - `Rh`: Schwarzschild radius of the black hole.
+ - `xoff`: X-offset for the image.
+ - `yoff": Y-offset for the image.
 
-function accumulate_radiative_transfer(traj, step, freq, bhspin, model, data, Rh)
-    Xi = traj[step].X; Ki = traj[step].Kcon
-    ji, ki, _, _ = Radiation.get_jk(Xi, Ki, freq, bhspin, model, data)
-    T2 = typeof(ji)
-    Intensity = zero(T2)
-    for nstep in step:-1:2
-        Xf = traj[nstep-1].X
-        if !Radiation.radiating_region(Xf, model, Rh)
-            continue
+ # Returns
+ - Returns: The formed image as a 2D array of Float64 values.
+
+"""
+#TODO (PNM): Put the camera parameters inside a camera structure, it will be more neat and organized.
+function raytrace_image(model, simulation_data, Xcamera::AbstractVector{T}, freq, pixels_x, pixels_y,
+                         fovx, fovy, maxnstep, Rh, xoff, yoff) where {T}
+    freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
+
+    Image = Matrix{T}(undef, pixels_x, pixels_y)
+
+    println("Allocating workspaces for $pixels_x row-tasks...")
+    task_trajs = [Vector{GeoTypes.OfTrajGeneric{T}}(undef, maxnstep) for _ in 1:pixels_x]
+
+    p = Progress(pixels_x * pixels_y; desc = "Raytracing Image...", showspeed = true, barlen = 30)
+    ProgressMeter.ijulia_behavior(:clear)
+    progress_lock = ReentrantLock()
+    println("Tracing Geodesics...")
+    Threads.@threads :greedy for i in 0:(pixels_x - 1)
+        my_traj = task_trajs[i + 1]
+
+        for j in 0:(pixels_y - 1)
+            nstep, _ = Geodesics.get_pixel(
+                my_traj, i, j, Xcamera,
+                fovx, fovy, freq_unitless,
+                pixels_x, pixels_y, model.a,
+                Rh, model.rmax_geo, model, xoff, yoff
+            )
+
+            Radiation.integrate_emission!(
+                my_traj, nstep, Image,
+                i + 1, j + 1, freq, model.a, model, simulation_data
+            )
+
+            lock(progress_lock) do
+                if (i * pixels_y + j) % 2000 == 0
+                    ProgressMeter.next!(p; showvalues = [(:pixel, "($i, $j)"), (:total_done, "$(i*pixels_y + j)/$(pixels_x * pixels_y)")])
+                else
+                    ProgressMeter.next!(p)
+                end
+            end
         end
-        Kf = traj[nstep-1].Kcon
-        jf, kf, _, _ = Radiation.get_jk(Xf, Kf, freq, bhspin, model, data)
-        Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep].dl)
-        ji, ki = jf, kf
     end
-    return Intensity * T2(freq^3)
+    Image *= freq^3
+    finish!(p)
+
+    return Image
 end
-
-"""
-    calculate_pixel_intensity(traj, ro, θo, phi, bhspin, i, j, nx, ny, fovx, fovy,
-        freq, Rstop, nmaxstep, model, data=nothing)
-
-Compute pixel `(i, j)`'s intensity by carrying `θo` as-is through the
-entire computation (geodesic integration and radiative transfer) — unlike
-[`Autodiff.calculate_gradients`](@ref)'s which is the GPU version of our method 
-of integrating the sensitivities ODE, this differentiates through the whole process 
-directly, so it works for `θo::Float64` (an ordinary intensity) just as well as
-`θo::ForwardDiff.Dual` (differentiable). CPU/GPU-agnostic: `traj` must be
-a pre-allocated, indexable buffer of `OfTrajDual{typeof(θo)}` sized to
-`nmaxstep` (a plain `Vector` on the CPU, or a `CuDeviceArray` slice from a
-GPU kernel) — nothing here is CUDA-specific.
-
-Note: the adaptive step size itself is computed from the *value* of
-`X`/`Kcon` (not their sensitivity) — it's a numerical step-size heuristic,
-not physics you actually want a θo-derivative of.
-"""
-function calculate_pixel_intensity(traj, ro, θo::T, phi, bhspin, i, j, nx, ny, fovx,
-                                    fovy, freq, Rstop, nmaxstep, model, data=nothing) where {T}
-    Rh = 1.0 + sqrt(1.0 - bhspin^2)
-    step = integrate_geodesic!(traj, ro, θo, phi, bhspin, i, j, nx, ny, fovx, fovy, freq, Rstop, nmaxstep, model)
-    return accumulate_radiative_transfer(traj, step, freq, bhspin, model, data, Rh)
-end
-
 end

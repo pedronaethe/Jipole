@@ -880,12 +880,13 @@ time via the tuple's length, unlike the `Vector` method's runtime
 end
 
 """
-    get_model_sigma(X, model, data)
+    get_model_sigma(zone, X, model, data)
 
 Interpolate the magnetization `sigma` (ratio of magnetic to matter energy
 density) at position `X`.
 
 # Arguments
+- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 - `X`: Position four-vector in internal coordinates.
 - `model`: Iharm model parameters.
 - `data`: GRMHD snapshot(s).
@@ -893,13 +894,11 @@ density) at position `X`.
 # Returns
 - The interpolated magnetization, or `0` if `X` is outside the grid.
 """
-function get_model_sigma(X, model::IharmParams, data)
-    T = promote_type(eltype(X), eltype(data[1].sigma))
-    if Grid.x_in_domain(X, model) == 0
-        return zero(T)
-    end
+@inline function get_model_sigma(zone::Grid.ZoneLoc, X, model::IharmParams, data)
+    T = promote_type(typeof(zone.del2), eltype(data[1].sigma))
+    !zone.in_domain && return zero(T)
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.sigma, dataB.sigma, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(zone, dataA.sigma, dataB.sigma, tfac, model.slow_light)
 end
 
 """
@@ -935,13 +934,14 @@ function get_sigma_smoothfac(sigma, model::IharmParams)
 end
 
 """
-    get_model_ne(X, model, data)
+    get_model_ne(zone, X, model, data)
 
 Interpolate the electron number density at position `X`, applying the
 geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
 [`get_sigma_smoothfac`](@ref)) if `USE_GEODESIC_SIGMACUT` is enabled.
 
 # Arguments
+- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 - `X`: Position four-vector in internal coordinates.
 - `model`: Iharm model parameters.
 - `data`: GRMHD snapshot(s).
@@ -950,53 +950,49 @@ geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
 - The electron number density, or `0` if `X` is outside the grid or above
   the magnetization cutoff.
 """
-function get_model_ne(X, model::IharmParams, data)
-    T = promote_type(eltype(X), eltype(data[1].ne)) 
-    if Grid.x_in_domain(X, model) == 0
-        return zero(T)
-    end
+@inline function get_model_ne(zone::Grid.ZoneLoc, X, model::IharmParams, data)
+    T = promote_type(typeof(zone.del2), eltype(data[1].ne))
+    !zone.in_domain && return zero(T)
     sigma_smoothfac = one(T)
     if USE_GEODESIC_SIGMACUT
-        sigma = get_model_sigma(X, model, data)
-        if sigma > model.sigma_cut
-            return zero(T)
-        end
+        sigma = get_model_sigma(zone, X, model, data)
+        sigma > model.sigma_cut && return zero(T)
         sigma_smoothfac = get_sigma_smoothfac(sigma, model)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.ne, dataB.ne, tfac, model.slow_light, model) * sigma_smoothfac
+    return Grid.interp_scalar_time(zone, dataA.ne, dataB.ne, tfac, model.slow_light) * sigma_smoothfac
 end
 
 """
-    get_model_thetae(X, model, data)
+    get_model_thetae(zone, X, model, data)
 
-Interpolate the dimensionless electron temperature at position `X`.
+Interpolate the dimensionless electron temperature at position `X`, using the zone location `zone`.
 
 # Arguments
+- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 - `X`: Position four-vector in internal coordinates.
 - `model`: Iharm model parameters.
 - `data`: GRMHD snapshot(s).
 
 # Returns
 - The dimensionless electron temperature, or `0` if `X` is outside the
-  grid.
+  grid or if the zone is not in the domain.
 """
-function get_model_thetae(X, model::IharmParams, data)
-    T = promote_type(eltype(X), eltype(data[1].θe)) 
-    if Grid.x_in_domain(X, model) == 0
-        return zero(T)
-    end
+@inline function get_model_thetae(zone::Grid.ZoneLoc, X, model::IharmParams, data)
+    T = promote_type(typeof(zone.del2), eltype(data[1].θe))
+    !zone.in_domain && return zero(T)
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.θe, dataB.θe, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(zone, dataA.θe, dataB.θe, tfac, model.slow_light)
 end
 
 """
-    get_model_thetae_deriv(X, model, data)
+    get_model_thetae_deriv(zone, X, model, data)
 
 Interpolate the derivative of the dimensionless electron temperature with
 respect to `Rhigh`, at position `X`.
 
 # Arguments
+- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 - `X`: Position four-vector in internal coordinates.
 - `model`: Iharm model parameters.
 - `data`: GRMHD snapshot(s).
@@ -1004,21 +1000,21 @@ respect to `Rhigh`, at position `X`.
 # Returns
 - `dθe/dRhigh`, or `0` if `X` is outside the grid.
 """
-function get_model_thetae_deriv(X, model::IharmParams, data)
-    T = promote_type(eltype(X), eltype(data[1].dθedRhi)) 
-    if Grid.x_in_domain(X, model) == 0
-        return zero(T)
-    end
+@inline function get_model_thetae_deriv(zone::Grid.ZoneLoc, X, model::IharmParams, data)
+    #TODO (PNM): This whole function has to go, comeback to this.
+    T = promote_type(typeof(zone.del2), eltype(data[1].dθedRhi))
+    !zone.in_domain && return zero(T)
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(zone, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light)
 end
 
 """
-    get_model_b(X, model, data)
+    get_model_b(zone, X, model, data)
 
 Interpolate the magnetic field strength at position `X`.
 
 # Arguments
+- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 - `X`: Position four-vector in internal coordinates.
 - `model`: Iharm model parameters.
 - `data`: GRMHD snapshot(s).
@@ -1026,17 +1022,15 @@ Interpolate the magnetic field strength at position `X`.
 # Returns
 - The magnetic field strength, or `0` if `X` is outside the grid.
 """
-function get_model_b(X, model::IharmParams, data)
-    T = promote_type(eltype(X), eltype(data[1].b))
-    if Grid.x_in_domain(X, model) == 0
-        return zero(T)
-    end
+@inline function get_model_b(zone::Grid.ZoneLoc, X, model::IharmParams, data)
+    T = promote_type(typeof(zone.del2), eltype(data[1].b))
+    !zone.in_domain && return zero(T)
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(X, dataA.b, dataB.b, tfac, model.slow_light, model)
+    return Grid.interp_scalar_time(zone, dataA.b, dataB.b, tfac, model.slow_light)
 end
 
 """
-    get_model_fourv(X, Kcon, bhspin, model, data)
+    get_model_fourv(zone, X, Kcon, bhspin, model, data)
 
 Compute the fluid 4-velocity and magnetic field 4-vector at `X`,
 interpolated from the GRMHD snapshot(s) in `data`.
@@ -1045,6 +1039,7 @@ interpolated from the GRMHD snapshot(s) in `data`.
 with the rest of the differentiable call path.
 
 # Arguments
+- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 - `X`: Position four-vector in internal coordinates.
 - `Kcon`: Contravariant photon 4-momentum (unused; kept for interface
   symmetry with the other models' four-velocity functions).
@@ -1055,32 +1050,26 @@ with the rest of the differentiable call path.
 # Returns
 - A tuple `(Ucon, Ucov, Bcon, Bcov)`.
 """
-@inline function get_model_fourv(X, Kcon, bhspin, model::IharmParams, data)
+@inline function get_model_fourv(zone::Grid.ZoneLoc, X, Kcon, bhspin, model::IharmParams, data)
     elT = promote_type(eltype(X), eltype(data[1].θe))
     gcov = Metrics.gcov_func(X, bhspin, model)
     gcon = Metrics.gcon_func(gcov)
 
-    if Grid.x_in_domain(X, model) == 0
+    if !zone.in_domain
         Ucov1 = -one(elT) / sqrt(-gcon[1, 1])
-
-        Ucon1 = Ucov1 * gcon[1, 1]
-        Ucon2 = Ucov1 * gcon[2, 1]
-        Ucon3 = Ucov1 * gcon[3, 1]
-        Ucon4 = Ucov1 * gcon[4, 1]
-
+        Ucon1 = Ucov1 * gcon[1, 1]; Ucon2 = Ucov1 * gcon[2, 1]
+        Ucon3 = Ucov1 * gcon[3, 1]; Ucon4 = Ucov1 * gcon[4, 1]
         Ucon = SVector{4,elT}(Ucon1, Ucon2, Ucon3, Ucon4)
         Ucov = SVector{4,elT}(Ucov1, zero(elT), zero(elT), zero(elT))
         zero_vec = SVector{4,elT}(0.0, 0.0, 0.0, 0.0)
-
         return Ucon, Ucov, zero_vec, zero_vec
     end
 
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    Vcon2 = Grid.interp_scalar_time(X, dataA.U1, dataB.U1, tfac, model.slow_light, model)
-    Vcon3 = Grid.interp_scalar_time(X, dataA.U2, dataB.U2, tfac, model.slow_light, model)
-    Vcon4 = Grid.interp_scalar_time(X, dataA.U3, dataB.U3, tfac, model.slow_light, model)
+    Vcon2 = Grid.interp_scalar_time(zone, dataA.U1, dataB.U1, tfac, model.slow_light)
+    Vcon3 = Grid.interp_scalar_time(zone, dataA.U2, dataB.U2, tfac, model.slow_light)
+    Vcon4 = Grid.interp_scalar_time(zone, dataA.U3, dataB.U3, tfac, model.slow_light)
     Vcon = SVector{4,elT}(0.0, Vcon2, Vcon3, Vcon4)
-
     VdotV = zero(elT)
     for μ in 2:Constants.NDIM
         for ν in 2:Constants.NDIM
@@ -1098,10 +1087,9 @@ with the rest of the differentiable call path.
 
     Ucov = Coordinates.flip_index(Ucon, gcov)
 
-    Bcon1_interp = Grid.interp_scalar_time(X, dataA.B1, dataB.B1, tfac, model.slow_light, model)
-    Bcon2_interp = Grid.interp_scalar_time(X, dataA.B2, dataB.B2, tfac, model.slow_light, model)
-    Bcon3_interp = Grid.interp_scalar_time(X, dataA.B3, dataB.B3, tfac, model.slow_light, model)
-
+    Bcon1_interp = Grid.interp_scalar_time(zone, dataA.B1, dataB.B1, tfac, model.slow_light)
+    Bcon2_interp = Grid.interp_scalar_time(zone, dataA.B2, dataB.B2, tfac, model.slow_light)
+    Bcon3_interp = Grid.interp_scalar_time(zone, dataA.B3, dataB.B3, tfac, model.slow_light)
     Bcon1 = (Ucov[2] * Bcon1_interp + Ucov[3] * Bcon2_interp + Ucov[4] * Bcon3_interp)
     Bcon2 = (Bcon1_interp + Ucon[2] * Bcon1) / Ucon[1]
     Bcon3 = (Bcon2_interp + Ucon[3] * Bcon1) / Ucon[1]
@@ -1132,7 +1120,8 @@ position `X`, optionally with their derivatives with respect to `Rhigh`.
 - A tuple `(j, k, dj_dRhigh, dk_dRhigh)`.
 """
 function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)) where {B}
-    Ne = get_model_ne(X, model, data)
+    zone = Grid.locate(X, model)
+    Ne = get_model_ne(zone, X, model, data)
     z_base = zero(typeof(Ne))
     if Ne == 0.0
         return (z_base, z_base, z_base, z_base)
@@ -1140,27 +1129,25 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
 
     elT = promote_type(eltype(X), typeof(bhspin))
 
-    Ucon, Ucov, Bcon, Bcov = get_model_fourv(X, Kcon, bhspin, model, data)
+    Ucon, Ucov, Bcon, Bcov = get_model_fourv(zone, X, Kcon, bhspin, model, data)
     nu = Radiation.get_fluid_nu(Kcon, Ucov)
     nusq = nu * nu
     θ = Radiation.get_bk_angle(Kcon, Ucov, Bcon, Bcov)
-    b = get_model_b(X, model, data)
+    b = get_model_b(zone, X, model, data)
 
-    θe = get_model_thetae(X, model, data)
+    θe = get_model_thetae(zone, X, model, data)
     if θ <= zero(elT) || θ >= elT(π)
         return (z_base, z_base, z_base, z_base)
     end
 
-    #j = MaxwellJuettner.maxwell_juettner_i(b, θ, θe, nu, Ne) / nusq
     j = MaxwellJuettner.maxwell_juettner_leung_i(Ne, nu, θe, b, θ) / nusq
 
     Bnuinv = Radiation.bnu_inv(nu, θe)
     z_jk = zero(typeof(j))
-
     k = (Bnuinv > 0) ? j / Bnuinv : z_jk
 
     if B
-        dθe_dRhigh = get_model_thetae_deriv(X, model, data)
+        dθe_dRhigh = get_model_thetae_deriv(zone, X, model, data)
         v_b = ForwardDiff.value(b); v_θ = ForwardDiff.value(θ); v_nu = ForwardDiff.value(nu)
         v_Ne = ForwardDiff.value(Ne); v_nusq = ForwardDiff.value(nusq); v_θe = ForwardDiff.value(θe)
         v_Bnuinv = ForwardDiff.value(Bnuinv); v_j = ForwardDiff.value(j)
@@ -1194,18 +1181,20 @@ avoids GPU-compiling `jar_calc`'s nested-derivative `Val{true}` branch for the
 Dual-X specialization, which is otherwise fatal to compile.
 """
 @inline function jar_calc_ad(X, Kcon, bhspin, model::IharmParams, data)
-    Ne = get_model_ne(X, model, data)
+    #TODO (PNM): We need to erradicate this function.
+    zone = Grid.locate(X, model)
+    Ne = get_model_ne(zone, X, model, data)
     z_base = zero(typeof(Ne))
     if Ne == 0.0
         return (z_base, z_base)
     end
     elT = promote_type(eltype(X), typeof(bhspin))
-    Ucon, Ucov, Bcon, Bcov = get_model_fourv(X, Kcon, bhspin, model, data)
+    Ucon, Ucov, Bcon, Bcov = get_model_fourv(zone, X, Kcon, bhspin, model, data)
     nu = Radiation.get_fluid_nu(Kcon, Ucov)
     nusq = nu * nu
     θ = Radiation.get_bk_angle(Kcon, Ucov, Bcon, Bcov)
-    b = get_model_b(X, model, data)
-    θe = get_model_thetae(X, model, data)
+    b = get_model_b(zone, X, model, data)
+    θe = get_model_thetae(zone, X, model, data)
     if θ <= zero(elT) || θ >= elT(π)
         return (z_base, z_base)
     end

@@ -129,14 +129,14 @@ The function initializes the four-position and four-momentum of the photon, then
 # Returns
 - A tuple `(nstep, midplane_crossings)`.
 """
-function get_pixel(traj::Vector{OfTrajS}, i::Int, j::Int, Xcam::MVector{4,Float64}, fovx::Float64, fovy::Float64, freq::Float64, nx::Int64, ny::Int64, bhspin::Float64, Rh::Float64, Rstop::Float64, model, xoff=0, yoff=0)
-    X_mut = MVector{4,Float64}(undef)
-    Kcon_mut = MVector{4,Float64}(undef)
+function get_pixel(traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j,  Xcam::AbstractVector{T}, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0) where {T}
+    X_mut = MVector{4,T}(undef)
+    Kcon_mut = MVector{4,T}(undef)
 
     init_xk!(X_mut, Kcon_mut, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff, yoff)
 
-    X = SVector{4,Float64}(X_mut)
-    Kcon = SVector{4,Float64}(Kcon_mut) * freq
+    X = SVector{4,T}(X_mut)
+    Kcon = SVector{4,T}(Kcon_mut) * freq
 
     nstep, midplane_crossings = trace_geodesic(X, Kcon, traj, i, j, bhspin, Rh, Rstop, model)
 
@@ -147,41 +147,6 @@ function get_pixel(traj::Vector{OfTrajS}, i::Int, j::Int, Xcam::MVector{4,Float6
     return nstep, midplane_crossings
 end
 
-"""
-    calculate_geodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
-
-Loops through every pixel of the camera, calculating the geodesic trajectory for each pixel and storing it in a matrix of vectors.
-
-# Arguments
-- `Xcam`: Camera position in internal coordinates.
-- `fovx`, `fovy`: Field of view, in radians.
-- `freq_cgs`: Frequency, in cgs units.
-- `maxnstep`: Maximum number of integration steps for each geodesic.
-- `nx`, `ny`: Image resolution.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `Rstop`: Backward-integration stopping radius.
-- `model`: Model parameters.
-
-# Returns
-- A matrix of geodesic trajectories, one per pixel.
-"""
-function calculate_geodesics(Xcam, fovx, fovy, freq_cgs, maxnstep, nx, ny, bhspin, Rstop, model)
-    Rh = 1 + sqrt(1.0 - bhspin * bhspin)
-    trajs = Matrix{Vector{OfTrajS}}(undef, nx, ny)
-    freq_unitless = freq_cgs * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
-
-    Threads.@threads for i in 0:(nx-1)
-        for j in 0:(ny-1)
-            trajs[i+1, j+1] = Vector{OfTrajS}()
-            sizehint!(trajs[i+1, j+1], maxnstep)
-
-            nstep, _ = get_pixel(trajs[i+1, j+1], i, j, Xcam, fovx, fovy, freq_unitless, nx, ny, bhspin, Rh, Rstop, model)
-
-            resize!(trajs[i+1, j+1], nstep)
-        end
-    end
-    return trajs
-end
 
 """
     models_and_mks_connection_analytic(X, bhspin, model)
@@ -821,11 +786,11 @@ Trace the photon geodesic backward from the camera, starting at position
 # Returns
 - A tuple `(nstep, midplane_crossings)`.
 """
-function trace_geodesic(Xi::SVector{4,Float64}, Kconi::SVector{4,Float64}, traj::Vector{OfTrajS}, i::Int, j::Int, bhspin::Float64, Rh::Float64, Rstop::Float64, model)
+function trace_geodesic(Xi::SVector{4,T}, Kconi::SVector{4,T}, traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j, bhspin, Rh, Rstop, model) where {T}
     X = Xi
     Kcon = Kconi
 
-    traj[1] = OfTrajS(0.0, Xi, Kconi, Xi, Kconi)
+    traj[1] = GeoTypes.OfTrajGeneric{T}(zero(T), Xi, Kconi, Xi, Kconi)
 
     midplane_crossings = 0
     _, th = Coordinates.bl_coord(Xi, model)
@@ -842,14 +807,14 @@ function trace_geodesic(Xi::SVector{4,Float64}, Kconi::SVector{4,Float64}, traj:
 
             dummy = @SVector zeros(4)
             for k in (nstep+1):length(traj)
-                traj[k] = OfTrajS(0.0, dummy, dummy, dummy, dummy)
+                traj[k] = GeoTypes.OfTrajGeneric{T}(zero(T), dummy, dummy, dummy, dummy)
             end
         end
 
         dl = stepsize(X, Kcon, model.cstartx, model.cstopx)
         unit_dl = dl * model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
 
-        traj[nstep] = OfTrajS(unit_dl, traj[nstep].X, traj[nstep].Kcon, traj[nstep].Xhalf, traj[nstep].Kconhalf)
+        traj[nstep] = GeoTypes.OfTrajGeneric{T}(unit_dl, traj[nstep].X, traj[nstep].Kcon, traj[nstep].Xhalf, traj[nstep].Kconhalf)
 
         _, th = Coordinates.bl_coord(X, model)
         if (position_in_midplane == 1) && (th <= π / 2)
@@ -864,7 +829,7 @@ function trace_geodesic(Xi::SVector{4,Float64}, Kconi::SVector{4,Float64}, traj:
 
         nstep += 1
 
-        traj[nstep] = OfTrajS(0.0, new_X, new_Kcon, Xhalf, Kconhalf)
+       traj[nstep] = GeoTypes.OfTrajGeneric{T}(zero(T), new_X, new_Kcon, Xhalf, Kconhalf)
 
         X = new_X
         Kcon = new_Kcon

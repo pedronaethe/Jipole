@@ -33,6 +33,4 @@ include("output.jl")
 include("imaging.jl")
 include("utils_gpu.jl")
 include("slowlight.jl")
-include("autodiff.jl")
-
 end

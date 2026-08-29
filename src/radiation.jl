@@ -126,30 +126,20 @@ crossing emission model.
 - `model`: Model parameters.
 - `data`: Model-specific auxiliary data.
 """
-function integrate_emission!(traj::Vector{OfTrajS}, nsteps::Int, Image::Matrix{Float64}, I::Int, J::Int, freq::Float64, bhspin::Float64, model::AbstractModel, data=nothing)
-    Xi = MVector{4,Float64}(undef)
-    Kconi = MVector{4,Float64}(undef)
-    Xf = MVector{4,Float64}(undef)
-    Kconf = MVector{4,Float64}(undef)
-    Rh::Float64 = 1 + sqrt(1.0 - bhspin * bhspin)
-    for k in 1:Constants.NDIM
-        Xi[k] = traj[nsteps].X[k]
-        Kconi[k] = traj[nsteps].Kcon[k]
-    end
+function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing) where {T}
+    Rh = 1 + sqrt(1.0 - bhspin * bhspin)
+
+    Xi = traj[nsteps].X
+    Kconi = traj[nsteps].Kcon
     ji, ki = get_jk(Xi, Kconi, freq, bhspin, model, data)
 
-    Intensity = 0.0
+    Intensity = zero(T)
     for nstep = nsteps:-1:2
-        for k in 1:Constants.NDIM
-            Xi[k] = traj[nstep].X[k]
-            Xf[k] = traj[nstep-1].X[k]
-            Kconi[k] = traj[nstep].Kcon[k]
-            Kconf[k] = traj[nstep-1].Kcon[k]
-        end
-
+        Xf = traj[nstep-1].X
         if !radiating_region(Xf, model, Rh)
             continue
         end
+        Kconf = traj[nstep-1].Kcon
 
         jf, kf = get_jk(Xf, Kconf, freq, bhspin, model, data)
         Intensity = approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
@@ -159,7 +149,6 @@ function integrate_emission!(traj::Vector{OfTrajS}, nsteps::Int, Image::Matrix{F
             println("Intensity = $Intensity")
             DebugFunctions.print_vector("Kconf =", Kconf)
             DebugFunctions.print_vector("Kconi =", Kconi)
-
             error("NaN or Inf encountered in intensity calculation")
         end
         ji = jf

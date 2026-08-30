@@ -12,13 +12,11 @@ scripts/*
 !License.txt
 /example_notebooks/*
 
-#except for the following notebooks: Autodiff_GRMHD.ipynb Autodiff.ipynb ComputeGeodesics.ipynb GenerateImageGRMHD.ipynb Generateimages.ipynb
-!example_notebooks/Autodiff_GRMHD.ipynb
-!example_notebooks/Autodiff.ipynb
-!example_notebooks/ComputeGeodesics.ipynb
-!example_notebooks/GenerateImageGRMHD.ipynb
-!example_notebooks/GenerateImages.ipynb
-!example_notebooks/SlowLightGRMHD.ipynb
+#except for the following notebooks: 
+!example_notebooks/calculate_gradients.ipynb
+!example_notebooks/generate_image_GRMHD.ipynb
+!example_notebooks/generate_images_analytics.ipynb
+!example_notebooks/slowlight_GRMHD.ipynb
 !scripts/run_slowlight.jl
 # Generated figures
 *.png

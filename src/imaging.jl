@@ -279,7 +279,7 @@ Trace rays to form an image of the source.
 #TODO (PNM): Put the camera parameters inside a camera structure, it will be more neat and organized.
 function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y,
                          fovx, fovy, maxnstep, Rh, xoff, yoff)
-    T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a), typeof(model.Rhigh), typeof(model.Rhigh))
+    T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a))
 
     Xcamera = SVector{4,T}(Camera.camera_position(ro, th, phi, model.a, model))
     freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)

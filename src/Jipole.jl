@@ -25,12 +25,12 @@ include("maxwell_juettner.jl")
 include("grid.jl")
 include("radiation.jl")
 include("geodesics.jl")
+include("imaging.jl")
 include("models/analytic.jl")
 include("models/thin_disk.jl")
 include("models/iharm.jl")
 
 include("output.jl")
-include("imaging.jl")
 include("utils_gpu.jl")
 include("slowlight.jl")
 end

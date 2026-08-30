@@ -15,7 +15,7 @@ using ..Camera
 using ..Geodesics
 using ..Radiation
 
-export output_stokes_parameters, calculate_scale_factor
+export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image, calculate_gradients
 
 """
     output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
@@ -277,8 +277,11 @@ Trace rays to form an image of the source.
 
 """
 #TODO (PNM): Put the camera parameters inside a camera structure, it will be more neat and organized.
-function raytrace_image(model, simulation_data, Xcamera::AbstractVector{T}, freq, pixels_x, pixels_y,
-                         fovx, fovy, maxnstep, Rh, xoff, yoff) where {T}
+function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y,
+                         fovx, fovy, maxnstep, Rh, xoff, yoff)
+    T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a), typeof(model.Rhigh), typeof(model.Rhigh))
+
+    Xcamera = SVector{4,T}(Camera.camera_position(ro, th, phi, model.a, model))
     freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
 
     Image = Matrix{T}(undef, pixels_x, pixels_y)
@@ -320,4 +323,6 @@ function raytrace_image(model, simulation_data, Xcamera::AbstractVector{T}, freq
 
     return Image
 end
+
+
 end

@@ -79,7 +79,7 @@ function get_specific_dump_time(dump_idx::Int64, all_dumps_path::String)
 end
 
 """
-    update_data!(params_slowlight, simulation_data, trat_large, model, all_dumps_path)
+    update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)
 
 Slide the 3-snapshot window `simulation_data` forward by one dump,
 loading the next dump into the (reused) oldest slot.
@@ -88,11 +88,11 @@ loading the next dump into the (reused) oldest slot.
 - `params_slowlight`: Slow-light run state, updated with the new time
   window `[tA, tB]`.
 - `simulation_data`: 3-element window of loaded GRMHD snapshots.
-- `trat_large`: Electron/ion temperature ratio at high magnetization.
+- `Rhigh`: Electron/ion temperature ratio at high magnetization.
 - `model`: Iharm model parameters.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
 """
-function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large::Float64, model::Iharm.IharmParams, all_dumps_path::String)
+function update_data!(params_slowlight::OfSlowLight, simulation_data, Rhigh::Float64, model::Iharm.IharmParams, all_dumps_path::String)
     oldest_data = simulation_data[1]
 
     simulation_data[1] = simulation_data[2]
@@ -100,7 +100,7 @@ function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large
 
     simulation_data[3] = oldest_data
 
-    simulation_data[3] = Iharm.load_data(params_slowlight.current_dumps_path, trat_large, model;
+    simulation_data[3] = Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model;
         advance_path! = () -> (params_slowlight.current_dumps_path = update_dump_path(params_slowlight, all_dumps_path)))
 
     params_slowlight.tA = simulation_data[1].t
@@ -493,7 +493,7 @@ function render_round_gpu!(
 end
 
 """
-    process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path)
+    process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path)
 
 Render a slow-light movie: repeatedly integrate the (already-traced)
 geodesics against the sliding GRMHD snapshot window, writing out one
@@ -512,7 +512,7 @@ allows, until every requested frame has been produced.
 - `tgeoi`: Newest simulation time needed by the active geodesics.
 - `pixels_x`, `pixels_y`: Image resolution.
 - `freq`: Frequency, in cgs units.
-- `trat_large`: Electron/ion temperature ratio at high magnetization.
+- `Rhigh`: Electron/ion temperature ratio at high magnetization.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
 - `Xcamera`: 4-vector camera position.
 - `ro`, `theta_o`, `phi`: Camera position in KS spherical coordinates.
@@ -525,7 +525,7 @@ allows, until every requested frame has been produced.
 """
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
-    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
+    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
     engine::Symbol = :CPU
 )
     engine in (:CPU, :GPU) || throw(ArgumentError("engine must be :CPU or :GPU, got $(repr(engine))"))
@@ -626,7 +626,7 @@ function process_slowlight_images!(
                     "SourceD"    => SourceD,        
                     "scale"      => scale,          
                     "Xcamera"    => Xcamera,        
-                    "trat_large" => trat_large            
+                    "Rhigh" => Rhigh            
                 )
                 Output.generate_output_file(file_name, out_data; format="ipole")
                 println("Saving image $(file_name)")
@@ -639,7 +639,7 @@ function process_slowlight_images!(
         if nopenimgs <= 1
             break
         end
-        update_data!(params_slowlight, simulation_data, trat_large, model, all_dumps_path)
+        update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)
         if engine === :GPU
             refresh_gpu_data!(gpu_data, simulation_data)
         end

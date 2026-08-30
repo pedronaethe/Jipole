@@ -46,8 +46,8 @@ else
 end
 
 # Plasma parameters
-const trat_large = Jipole.Utils.get_config(config, "plasma", "trat_large", 20.0)
-const trat_small = Jipole.Utils.get_config(config, "plasma", "trat_small", 1.0)
+const Rhigh = Jipole.Utils.get_config(config, "plasma", "Rhigh", 20.0)
+const Rlow = Jipole.Utils.get_config(config, "plasma", "Rlow", 1.0)
 const beta_crit = Jipole.Utils.get_config(config, "plasma", "beta_crit", 1.0)
 const th_beg = Jipole.Utils.get_config(config, "plasma", "th_beg", 1.74e-2)
 const sigma_cut = Jipole.Utils.get_config(config, "plasma", "sigma_cut", 1.0)
@@ -137,11 +137,11 @@ if !slow_light
         println("Processing dump: $current_dump_filepath")
 
         # Read the header and load the data for this dump file.
-        model = Jipole.Iharm.read_header(current_dump_filepath, MBH; th_beg=th_beg, trat_small=trat_small, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
+        model = Jipole.Iharm.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, trat_beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
 
         #This will read the primitives and the variables derived from them.
         simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 1)
-        simulation_data[1] = Jipole.Iharm.load_data(current_dump_filepath, trat_large, model)
+        simulation_data[1] = Jipole.Iharm.load_data(current_dump_filepath, Rhigh, model)
 
         Rh = 1 + sqrt(1.0 - model.a^2)
         DXsize = SourceD / model.L_unit / Jipole.Constants.MUAS_PER_RAD * fov_size
@@ -274,7 +274,7 @@ if !slow_light
             "SourceD" => SourceD,
             "scale" => scale_factor,
             "Xcamera" => Xcamera,
-            "trat_large" => trat_large,
+            "Rhigh" => Rhigh,
         )
 
 
@@ -308,14 +308,14 @@ else
     params_slowlight = Jipole.Slowlight.OfSlowLight(dump_start, dump_max, image_cadence, 0.0, 0.0, 0.0, "")
     params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path)
 
-    model = Jipole.Iharm.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, trat_small=trat_small, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit, slow_light=true)
+    model = Jipole.Iharm.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, Rlow=Rlow, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit, slow_light=true)
 
     advance_dump_path! = () -> (params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path))
 
     simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 3)
-    simulation_data[1] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, trat_large, model; advance_path! = advance_dump_path!)
-    simulation_data[2] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, trat_large, model; advance_path! = advance_dump_path!)
-    simulation_data[3] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, trat_large, model; advance_path! = advance_dump_path!)
+    simulation_data[1] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data[2] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data[3] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
 
     params_slowlight.tA = simulation_data[1].t
     params_slowlight.tB = simulation_data[2].t
@@ -414,7 +414,7 @@ else
     println("Starting slow-light image processing loop...")
     Jipole.Slowlight.process_slowlight_images!(
         params_slowlight, simulation_data, all_geodesics, nsteps,
-        model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path,
+        model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path,
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
         engine=slowlight_engine
     )

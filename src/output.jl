@@ -67,7 +67,7 @@ fields (`pol`, `Ftot`, `nuLnu`) are written as zero, matching what
 - `"scale"`: the Jy-per-pixel-intensity scale factor (`calculate_scale_factor`)
 - `"Xcamera"`: the 4-vector camera position
 
-- `"trat_large"`: electron/ion temperature ratio at high magnetization
+- `"Rhigh"`: electron/ion temperature ratio at high magnetization
   (`Rhigh`) -- not stored in `IharmParams` itself (it's only a transient
   argument to `load_data`), so it must be passed here explicitly
 
@@ -88,7 +88,7 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     SourceD = data["SourceD"]
     scale = data["scale"]
     Xcamera = data["Xcamera"]
-    trat_large = data["trat_large"]
+    Rhigh = data["Rhigh"]
     t = data["img_time"]
 
     tau = get(data, "tau", zeros(size(image)))
@@ -159,8 +159,8 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     write(h5file, "header/units/T_unit", params.T_unit)
     write(h5file, "header/units/Thetae_unit", params.Thetae_unit)
 
-    write(h5file, "header/electrons/rlow", params.trat_small)
-    write(h5file, "header/electrons/rhigh", trat_large)
+    write(h5file, "header/electrons/rlow", params.Rlow)
+    write(h5file, "header/electrons/rhigh", Rhigh)
     write(h5file, "header/electrons/beta_crit", params.beta_crit)
     write(h5file, "header/electrons/type", Int32(params.ELECTRONS))
 

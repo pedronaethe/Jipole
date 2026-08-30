@@ -21,8 +21,8 @@ image_cadence = 10.0
 engine = "cpu"
 
 [plasma]
-trat_large = 20.0
-trat_small = 1.0
+Rhigh = 20.0
+Rlow = 1.0
 beta_crit = 1.0
 th_beg = 1.74e-2
 sigma_cut = 1.0

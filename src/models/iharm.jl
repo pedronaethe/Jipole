@@ -17,9 +17,10 @@ using ..Camera
 using ..Grid
 using ..Radiation
 using ..MaxwellJuettner
+using ..Imaging
 
 export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data, jar_calc_ad,
-    compute_accretion_diagnostics
+    compute_accretion_diagnostics, load_grmhd_context, calculate_gradients
 
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
@@ -98,16 +99,16 @@ struct IharmParams{T} <: AbstractModel
     Ne_factor::Float64
 
     M_unit::T
-    T_unit::Float64
-    L_unit::Float64
-    MBH::Float64
-    tp_over_te::Float64
+    T_unit::T
+    L_unit::T
+    MBH::T
+    tp_over_te::T
 
     RHO_unit::T
     U_unit::T
     B_unit::T
 
-    a::Float64
+    a::T
     hslope::Float64
     Rin::Float64
     Rout::Float64
@@ -135,11 +136,12 @@ struct IharmParams{T} <: AbstractModel
     rmin_geo::Float64
     rmax_geo::Float64
 
-    th_beg::Float64
-    trat_small::Float64
-    beta_crit::Float64
-    sigma_cut::Float64
-    sigma_cut_high::Float64
+    th_beg::T
+    Rlow::T
+    Rhigh::T
+    beta_crit::T
+    sigma_cut::T
+    sigma_cut_high::T
 
     slow_light::Bool
 end
@@ -171,8 +173,8 @@ mutable struct IharmParamsBuilder{T} <: AbstractModel
     M_unit::T
     T_unit::T
     L_unit::T
-    MBH::Float64
-    tp_over_te::Float64
+    MBH::T
+    tp_over_te::T
 
     RHO_unit::T
     U_unit::T
@@ -205,11 +207,12 @@ mutable struct IharmParamsBuilder{T} <: AbstractModel
     rmin_geo::Float64
     rmax_geo::Float64
 
-    th_beg::Float64
-    trat_small::Float64
-    beta_crit::Float64
-    sigma_cut::Float64
-    sigma_cut_high::Float64
+    th_beg::T
+    Rlow::T
+    Rhigh::T
+    beta_crit::T
+    sigma_cut::T
+    sigma_cut_high::T
     slow_light::Bool
 end
 
@@ -235,7 +238,7 @@ function IharmParamsBuilder()
         MVector{4,Float64}(0.0, 0.0, 0.0, 0.0),
         MVector{4,Float64}(0.0, 0.0, 0.0, 0.0),
         1.0, 100.0,
-        1.74e-2, 1.0, 1.0, 1.0, -1.0, false)
+        1.74e-2, 1.0, 20.0, 1.0, 1.0, -1.0, false)
 end
 
 """
@@ -248,16 +251,16 @@ everywhere else.
 IharmParams(p::IharmParamsBuilder) = IharmParams(p.metric, p.ELECTRONS, p.RADIATION, p.gam, p.game, p.gamp, p.Te_unit, p.Thetae_unit, p.mu_i, p.mu_e, p.mu_tot, p.Ne_factor,
 p.M_unit, p.T_unit, p.L_unit, p.MBH, p.tp_over_te, p.RHO_unit, p.U_unit, p.B_unit, p.a, p.hslope, p.Rin, p.Rout, p.poly_xt, p.poly_alpha, p.mks_smooth, p.poly_norm, p.mks3R0,
 p.mks3H0, p.mks3MY1, p.mks3MY2, p.mks3MP0,p.N1,p.N2,p.N3,SVector(p.dx),SVector(p.startx),SVector(p.stopx),SVector(p.cstartx),SVector(p.cstopx),p.rmin_geo,p.rmax_geo,p.th_beg,
-p.trat_small,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light)
+p.Rlow,p.Rhigh,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light)
 
 
 """
-    read_header(filename, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
+    read_header(filename, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
 
 Read a GRMHD dump file's header, returning the populated
 [`IharmParams`](@ref).
 
-The electron-temperature-model parameters (`th_beg`, `trat_small`,
+The electron-temperature-model parameters (`th_beg`, `Rlow`,
 `beta_crit`, `sigma_cut`, `sigma_cut_high`) are run configuration, not
 recorded in the dump file, so they're supplied here (with `ipole`'s usual
 defaults). `L_unit`/`T_unit`/`RHO_unit`/`U_unit`/`B_unit` are derived from
@@ -267,7 +270,7 @@ the black hole mass `MBH` and `M_unit`.
 - `filename`: Path to the GRMHD dump file (HDF5).
 - `MBH`: Black hole mass, in solar masses.
 - `th_beg`: Polar angle cutoff for the radiating region, near the poles.
-- `trat_small`, `beta_crit`: Mixed electron-temperature-model parameters.
+- `Rlow`, `Rhigh`, `beta_crit`: Mixed electron-temperature-model parameters.
 - `sigma_cut`, `sigma_cut_high`: Magnetization cutoffs for the emitting
   region.
 - `slow_light`: Whether slow-light (time-dependent) interpolation is
@@ -281,12 +284,13 @@ the black hole mass `MBH` and `M_unit`.
 # Returns
 - The populated [`IharmParams`](@ref).
 """
-function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
+function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
     println("Initializing grid from: $filename")
 
     params = IharmParamsBuilder()
     params.th_beg = th_beg
-    params.trat_small = trat_small
+    params.Rlow = Rlow
+    params.Rhigh = Rhigh
     params.beta_crit = beta_crit
     params.sigma_cut = sigma_cut
     params.sigma_cut_high = sigma_cut_high
@@ -368,7 +372,7 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, trat_small=1.0, beta
             params.Thetae_unit = Constants.MP / Constants.ME
         elseif params.ELECTRONS == ELECTRONS_TFLUID
             @printf(stderr, "Using Ressler/Athena electrons with mixed tp_over_te and\n")
-            @printf(stderr, "trat_small = %g, trat_large = %g, and beta_crit = %g\n", params.trat_small, NaN, params.beta_crit)
+            @printf(stderr, "Rlow = %g, Rhigh = %g, and beta_crit = %g\n", params.Rlow, params.Rhigh, params.beta_crit)
         elseif USE_FIXED_TPTE && !USE_MIXED_TPTE
             params.ELECTRONS = 0
             params.Thetae_unit = 2.0 / 3.0 * Constants.MP / Constants.ME / (2.0 + params.tp_over_te)
@@ -511,14 +515,14 @@ function _read_single_primitive(file_handle, prim_name::String)
 end
 
 """
-    load_data(filename, trat_large, model; advance_path!=nothing)
+    load_data(filename, Rhigh, model; advance_path!=nothing)
 
 Load a GRMHD dump file's fluid primitives and compute the derived
 electron/magnetic-field quantities used by the radiative transfer.
 
 # Arguments
 - `filename`: Path to the GRMHD dump file (HDF5).
-- `trat_large`: Electron/ion temperature ratio at high magnetization
+- `Rhigh`: Electron/ion temperature ratio at high magnetization
   (`Rhigh`).
 - `model`: Iharm model parameters.
 - `advance_path!`: Optional zero-argument callback invoked after a
@@ -527,7 +531,7 @@ electron/magnetic-field quantities used by the radiative transfer.
 # Returns
 - The loaded [`IharmData`](@ref).
 """
-function load_data(filename::String, trat_large, model::IharmParams; advance_path!::Union{Nothing,Function}=nothing)
+function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::Union{Nothing,Function}=nothing)
     println("Loading data from '$filename' into 'Iharm' module...")
     !isfile(filename) && error("File not found: $filename")
 
@@ -621,7 +625,7 @@ function load_data(filename::String, trat_large, model::IharmParams; advance_pat
             end
         end
     end
-    init_physical_quantities(data_array, 1, model, trat_large)
+    init_physical_quantities(data_array, 1, model, Rhigh)
 
     fields = [rho, uu, u1, u2, u3, b1, b2, b3]
     if any(x -> x === nothing, fields)
@@ -703,7 +707,7 @@ function compute_accretion_diagnostics(model::IharmParams, data::IharmData)
 end
 
 """
-    init_physical_quantities(data, n, model, trat_large)
+    init_physical_quantities(data, n, model, Rhigh)
 
 Compute the derived electron-density, magnetic-field-strength,
 electron-temperature, magnetization (`sigma`), and plasma-beta arrays
@@ -715,10 +719,10 @@ Ressler/Athena mixed electron-temperature model.
 - `data`: Vector of loaded [`IharmData`](@ref) snapshots.
 - `n`: Index of the snapshot to process.
 - `model`: Iharm model parameters.
-- `trat_large`: Electron/ion temperature ratio at high magnetization
+- `Rhigh`: Electron/ion temperature ratio at high magnetization
   (`Rhigh`).
 """
-function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large::T2) where {T2}
+function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2) where {T2}
     rho_factor = model.RHO_unit / (Constants.MP + Constants.ME) * model.Ne_factor
     gam_minus_1 = model.gam - 1.0
     beta_crit_sq = model.beta_crit * model.beta_crit
@@ -753,7 +757,7 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large
 
                 betasq = beta_m * beta_m / beta_crit_sq
                 betasq_plus_1_inv = 1.0 / (1.0 + betasq)
-                trat = trat_large * betasq * betasq_plus_1_inv + model.trat_small * betasq_plus_1_inv
+                trat = Rhigh * betasq * betasq_plus_1_inv + model.Rlow * betasq_plus_1_inv
                 θe_unit = θe_factor / (game_minus_1 * trat + gamp_minus_1)
                 θe_val = θe_unit * uu_ijk / rho_ijk
 
@@ -774,53 +778,6 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, trat_large
             end
         end
     end
-end
-
-
-"""
-    build_dual_params_and_data(model::IharmParams{Float64}, data::IharmData{Float64},
-                                Rhigh_val::Float64, M_unit_val::Float64)
-
-Build a fresh `IharmParams{Dual}`/`IharmData{Dual}` pair for the Rhigh/M_unit
-replay pass: RHO_unit/U_unit/B_unit become Duals derived from a Dual M_unit
-(same formulas as read_header: RHO_unit = M_unit/L_unit^3, U_unit =
-RHO_unit*CL^2, B_unit = CL*sqrt(4pi*RHO_unit) -- these propagate automatically
-once M_unit is Dual), and ne/b/theta_e are recomputed from the RAW (Float64,
-Rhigh/M_unit-independent) primitives via `init_physical_quantities` seeded with
-a Dual Rhigh.
-"""
-function build_dual_params_and_data(model::IharmParams{Float64}, data::IharmData{Float64},
-                                     Rhigh_val::Float64, M_unit_val::Float64)
-    Tag = nothing
-    DualT = ForwardDiff.Dual{Tag,Float64,2}
-    Rhigh_d = DualT(Rhigh_val, ForwardDiff.Partials((1.0, 0.0)))
-    M_unit_d = DualT(M_unit_val, ForwardDiff.Partials((0.0, 1.0)))
-
-    RHO_unit_d = M_unit_d / model.L_unit^3
-    U_unit_d = RHO_unit_d * Constants.CL^2
-    B_unit_d = Constants.CL * sqrt(4π * RHO_unit_d)
-
-
-    model_d = IharmParams{DualT}(model.metric, model.ELECTRONS, model.RADIATION,
-        model.gam, model.game, model.gamp, model.Te_unit, model.Thetae_unit,
-        model.mu_i, model.mu_e, model.mu_tot, model.Ne_factor,
-        M_unit_d, model.T_unit, model.L_unit, model.MBH, model.tp_over_te,
-        RHO_unit_d, U_unit_d, B_unit_d, model.a, model.hslope, model.Rin, model.Rout,
-        model.poly_xt, model.poly_alpha, model.mks_smooth, model.poly_norm,
-        model.mks3R0, model.mks3H0, model.mks3MY1, model.mks3MY2, model.mks3MP0,
-        model.N1, model.N2, model.N3, model.dx, model.startx, model.stopx,
-        model.cstartx, model.cstopx, model.rmin_geo, model.rmax_geo,
-        model.th_beg, model.trat_small, model.beta_crit, model.sigma_cut,
-        model.sigma_cut_high, model.slow_light)
-    b_d = (data.b ./ model.B_unit) .* B_unit_d
-
-    data_d = IharmData(data.t, data.RHO, data.UU, data.U1, data.U2, data.U3,
-        data.B1, data.B2, data.B3,
-        similar(data.ne, DualT), b_d, similar(data.θe, DualT),
-        similar(data.sigma, DualT), similar(data.beta, DualT), similar(data.dθedRhi, DualT))
-
-    init_physical_quantities([data_d], 1, model_d, Rhigh_d)
-    return model_d, [data_d]
 end
 
 """
@@ -1221,7 +1178,7 @@ end
 Check whether `X` lies within the GRMHD grid's radiating region (within
 the grid's radial bounds and away from the polar axis).
 """
-function Radiation.radiating_region(X, model::IharmParams, Rh::Float64)
+function Radiation.radiating_region(X, model::IharmParams, Rh)
     r, th = Coordinates.bl_coord(X, model)
     return (r > (model.rmin_geo) && r < model.rmax_geo && th > model.th_beg && th < (π - model.th_beg))
 end
@@ -1314,5 +1271,107 @@ function Camera.camera_position(cam_dist, cam_theta_angle, cam_phi_angle, bhspin
         (cam_phi_angle / 180) * π
     ]
 end
+
+
+function load_grmhd_context(dump_filepath::String)
+    params0 = Iharm.read_header(dump_filepath, 1.0)
+    data0 = Iharm.load_data(dump_filepath, 1.0, params0) 
+    b_normalized = data0.b ./ params0.B_unit
+    return (; N1=params0.N1, N2=params0.N2, N3=params0.N3,
+              dx=params0.dx, startx=params0.startx, stopx=params0.stopx,
+              cstartx=params0.cstartx, cstopx=params0.cstopx,
+              metric=params0.metric, a=params0.a, hslope=params0.hslope,
+              Rin=params0.Rin, Rout=params0.Rout, rmin_geo=params0.rmin_geo, rmax_geo=params0.rmax_geo,
+              poly_xt=params0.poly_xt, poly_alpha=params0.poly_alpha, mks_smooth=params0.mks_smooth,
+              poly_norm=params0.poly_norm, mks3R0=params0.mks3R0, mks3H0=params0.mks3H0,
+              mks3MY1=params0.mks3MY1, mks3MY2=params0.mks3MY2, mks3MP0=params0.mks3MP0,
+              gam=params0.gam, game=params0.game, gamp=params0.gamp,
+              mu_i=params0.mu_i, mu_e=params0.mu_e, mu_tot=params0.mu_tot, Ne_factor=params0.Ne_factor,
+              ELECTRONS=params0.ELECTRONS, RADIATION=params0.RADIATION, tp_over_te=params0.tp_over_te,
+              slow_light=params0.slow_light, t=data0.t,
+              RHO=data0.RHO, UU=data0.UU, U1=data0.U1, U2=data0.U2, U3=data0.U3,
+              B1=data0.B1, B2=data0.B2, B3=data0.B3, b_normalized=b_normalized)
+end
+
+
+
+const GRADIENT_PARAM_NAMES = (:MBH, :Rhigh, :Rlow, :beta_crit, :th_beg, :sigma_cut, :sigma_cut_high,
+                               :M_unit, :ro, :th, :phi, :sourceD)
+
+"""
+    calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep;
+        MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit,
+        ro, th, phi, sourceD, wrt=())
+
+    This function allows you to efficiently calculate the gradients of the image with respect to the specified parameters.
+
+    #Arguments
+    - `ctx`: A context from `load_grmhd_context`.
+    - - `freq`: The frequency of the observation.
+    - - `pixels_x`: The number of pixels in the x-direction.
+    - - `pixels_y`: The number of pixels in the y-direction.
+    - - `fovx_uas`: The field of view in the x-direction in microarcseconds.
+    - - `maxnstep`: The maximum number of steps for the ray tracing.
+    - - `xoff`: The offset in the x-direction.
+    - - `yoff`: The offset in the y-direction.
+    
+    #Returns
+    - Returns the image and, if `wrt` is not empty, a named tuple of gradients with respect to the specified parameters.
+"""
+function calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep, xoff, yoff;
+        MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit,
+        ro, th, phi, sourceD, wrt::NTuple{N,Symbol}=()) where N
+
+    seed(val, sym) = sym in wrt ?
+        ForwardDiff.Dual{Nothing,Float64,N}(val, ntuple(i -> Float64(ctx_slot(wrt, sym) == i), N)) : val
+    ctx_slot(wrt, sym) = findfirst(==(sym), wrt)
+    dualize(val, sym) = sym in wrt ? ForwardDiff.Dual{Nothing,Float64,N}(val, ForwardDiff.Partials(ntuple(i -> i == findfirst(==(sym), wrt) ? 1.0 : 0.0, N))) : val
+
+    MBH_d, Rhigh_d, Rlow_d = dualize(MBH, :MBH), dualize(Rhigh, :Rhigh), dualize(Rlow, :Rlow)
+    beta_crit_d, th_beg_d = dualize(beta_crit, :beta_crit), dualize(th_beg, :th_beg)
+    sigma_cut_d, sigma_cut_high_d = dualize(sigma_cut, :sigma_cut), dualize(sigma_cut_high, :sigma_cut_high)
+    M_unit_d = dualize(M_unit, :M_unit)
+    ro_d, th_d, phi_d, sourceD_d = dualize(ro, :ro), dualize(th, :th), dualize(phi, :phi), dualize(sourceD, :sourceD)
+
+    T = promote_type(typeof(MBH_d), typeof(Rhigh_d), typeof(Rlow_d), typeof(beta_crit_d), typeof(th_beg_d),
+                      typeof(sigma_cut_d), typeof(sigma_cut_high_d), typeof(M_unit_d),
+                      typeof(ro_d), typeof(th_d), typeof(phi_d), typeof(sourceD_d))
+
+    L_unit_d = Constants.GNEWT * MBH_d * Constants.MSUN / Constants.CL^2
+    T_unit_d = L_unit_d / Constants.CL
+    RHO_unit_d = M_unit_d / L_unit_d^3
+    U_unit_d = RHO_unit_d * Constants.CL^2
+    B_unit_d = Constants.CL * sqrt(4π * RHO_unit_d)
+
+    model_d = IharmParams{T}(ctx.metric, ctx.ELECTRONS, ctx.RADIATION,
+        ctx.gam, ctx.game, ctx.gamp, (0.0), (0.0),
+        ctx.mu_i, ctx.mu_e, ctx.mu_tot, ctx.Ne_factor,
+        M_unit_d, T_unit_d, L_unit_d, MBH_d, ctx.tp_over_te,
+        RHO_unit_d, U_unit_d, B_unit_d, ctx.a, ctx.hslope, ctx.Rin, ctx.Rout,
+        ctx.poly_xt, ctx.poly_alpha, ctx.mks_smooth, ctx.poly_norm,
+        ctx.mks3R0, ctx.mks3H0, ctx.mks3MY1, ctx.mks3MY2, ctx.mks3MP0,
+        ctx.N1, ctx.N2, ctx.N3, ctx.dx, ctx.startx, ctx.stopx, ctx.cstartx, ctx.cstopx,
+        ctx.rmin_geo, ctx.rmax_geo, th_beg_d, Rlow_d, Rhigh_d, beta_crit_d, sigma_cut_d,
+        sigma_cut_high_d, ctx.slow_light)
+
+    b_d = ctx.b_normalized .* T(B_unit_d)
+    data_d = IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3, ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d, similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T))
+    init_physical_quantities([data_d], 1, model_d, Rhigh_d)
+
+    Dxsize = sourceD_d / L_unit_d / Constants.MUAS_PER_RAD * fovx_uas
+    fovx_d = Dxsize / ro_d
+    fovy_d = Dxsize / ro_d
+    Rh = 1.0 + sqrt(1.0 - ctx.a^2)
+
+    Image_dual = Imaging.raytrace_image(model_d, [data_d], ro_d, th_d, phi_d, freq, pixels_x, pixels_y,
+                                 fovx_d, fovy_d, maxnstep, Rh, xoff, yoff)
+
+    N == 0 && return ForwardDiff.value.(Image_dual)
+    Image = ForwardDiff.value.(Image_dual)
+    grads = NamedTuple{wrt}(Tuple(ForwardDiff.partials.(Image_dual, i) for i in 1:N))
+    return Image, grads
+end
+
+
 
 end

@@ -616,7 +616,7 @@ function update_band_window!(band_state::BandWindowState{D},
                              n_window::Int = 3,
                              verbose::Bool = false) where {D}
 
-    margin = length(dump_times) > 1 ? (dump_times[2] - dump_times[1]) : 0.0
+    margin = length(dump_times) > 1 ? 2.0 * (dump_times[2] - dump_times[1]) : 0.0
 
     if band_state.t_window_start + margin <= t_target <= band_state.t_window_end - margin &&
        length(band_state.snapshots) == n_window

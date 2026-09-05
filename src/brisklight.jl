@@ -342,8 +342,6 @@ function collect_band_step_times(midplane_crossings::Matrix{Int},
                 above_prev   = above_curr
             end
 
-            Radiation.radiating_region(Xf, model, Rh) || continue
-
             b = _bin_index(current_band, seed, n_bands, approach_bin, shadow_bin)
             push!(band_ts[b], Xf[1])
         end
@@ -394,8 +392,6 @@ function band_time_extrema(midplane_crossings::Matrix{Int},
                 current_band = max(current_band - 1, 0)
                 above_prev   = above_curr
             end
-
-            Radiation.radiating_region(Xf, model, Rh) || continue
 
             b = _bin_index(current_band, seed, n_bands, approach_bin, shadow_bin)
             t = Xf[1]
@@ -620,7 +616,9 @@ function update_band_window!(band_state::BandWindowState{D},
                              n_window::Int = 3,
                              verbose::Bool = false) where {D}
 
-    if band_state.t_window_start <= t_target <= band_state.t_window_end &&
+    margin = length(dump_times) > 1 ? (dump_times[2] - dump_times[1]) : 0.0
+
+    if band_state.t_window_start + margin <= t_target <= band_state.t_window_end - margin &&
        length(band_state.snapshots) == n_window
         return 0
     end
@@ -852,8 +850,6 @@ function integrate_brisklight_emission!(traj,
             pending_reeval   = true
         end
 
-        step_radiating[nstep] || continue
-
         # Re-evaluate the leading endpoint against the new bin, so that a single
         # transfer step never mixes two epochs.
         if pending_reeval
@@ -1045,9 +1041,6 @@ function process_brisklight_images!(
     dT  = length(dTs) > 0 ? dTs[1] : NaN
     if length(dTs) > 0 && !all(x -> isapprox(x, dT; rtol = 1e-6), dTs)
         @warn "dump_times are not uniformly spaced; W/dT diagnostics lose their meaning."
-    end
-    if n_window > 3
-        @warn "n_window = $n_window requires the generalised set_tinterp_ns (bracket search over N snapshots). Without it, get_jk will only ever see the first three."
     end
 
     #### band statistics

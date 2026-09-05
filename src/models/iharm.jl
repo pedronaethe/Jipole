@@ -716,24 +716,17 @@ Only fast light (both flags false) uses a single snapshot.
 """
     set_tinterp_ns(X, model, data)
 
-Select the two GRMHD snapshots used for time interpolation, along with
-the per-position time-interpolation factor. Returns `(dataA, dataB,
-tinterp)` — the snapshots themselves, rather than their indices into
-`data`.
-
-On the CPU, `data` is a `Vector` and this dispatches to the generic
-method below, branching on `model.slow_light` at runtime exactly as
-before. On the GPU, `data` is a `Tuple` of one (non-slow-light) or three
-(slow-light) snapshots; indexing a `Tuple` with a runtime-computed index
-isn't GPU-compilable (even inside a branch that's never actually taken,
-since `model.slow_light` is a runtime field, not a compile-time
-constant, so the compiler can't prove that branch dead and skip
-compiling it) — so the `Tuple`-specific methods below select on the
-tuple's length instead, which is resolved at compile time.
+Select the GRMHD snapshots used for temporal interpolation at position `X`, and compute the interpolation factor `tinterp` between them. 
+Now it performs a bracket search over the whole vector of simulation data, instead of assuming 3 snapshots.
 """
 function set_tinterp_ns(X, model::IharmParams, data)
     if time_interp_enabled(model)
-        nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
+        n = length(data)
+        nB = 2
+        while nB < n && data[nB].t <= X[1]
+            nB += 1
+        end
+        nA = nB - 1
         dataA, dataB = data[nA], data[nB]
         tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
         return dataA, dataB, tinterp

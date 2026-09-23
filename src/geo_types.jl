@@ -7,6 +7,7 @@ module GeoTypes
 using StaticArrays
 
 export OfTrajGeneric
+
 """
 Immutable structure of a single geodesic step, generic over element type `T`
 so it can carry `ForwardDiff.Dual` (used when differentiating the full
@@ -21,5 +22,15 @@ struct OfTrajGeneric{T}
     Xhalf::SVector{4,T}
     Kconhalf::SVector{4,T}
 end
+
+"""
+Geodesic step for GPU. 
+"""
+struct GPUTrajStep{T}
+      dl::T
+      X::SVector{4,T}
+      Kcon::SVector{4,T}
+  end
+
 
 end

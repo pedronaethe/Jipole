@@ -36,8 +36,8 @@ theta_o = 163.0
 phi = 0.0
 
 [image]
-pixels_x = 128
-pixels_y = 128
+pixels_x = 320
+pixels_y = 320
 fov_size = 160.0
 xoff = 0.0
 yoff = 0.0
@@ -47,10 +47,10 @@ freq = 230e9
 source_distance_pc = 16.9e6
 
 [raytracing]
-maxnstep = 25000
+maxnstep = 8000
 
 #either cpu or gpu
-mode = "gpu"
+mode = "cpu"
 
 [output]
 #if the directory does not exist, it will create it.

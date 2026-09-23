@@ -96,28 +96,11 @@ if !slow_light
 
     
     Image = zeros(Float64, pixels_x, pixels_y)
-
-    # Mode CPU and GPU diverge here because the CPU path will allocate buffer for each thread
-    # while the GPU path will allocate a single buffer in small tiles.
-    # Sometimes the GPU won't have enough memory to hold it all in, so we have to do it in parts.
-    if mode == "cpu"
-        dummy_svec = @SVector zeros(4)
-        dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
-
-        task_trajs = [Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep) for _ in 1:pixels_x]
-
-        for i in 1:pixels_x
-            for k in 1:maxnstep
-                task_trajs[i][k] = dummy_traj
-            end
-        end
-
-        progress_lock = ReentrantLock()
-    elseif mode == "gpu"
+    if mode == "gpu"
         # nmaxstep for the first GPU attempt. render_image_gpu! doubles it for any tile with a
         # truncated geodesic, and the value it ends on carries over to the next dump.
-        gpu_maxnstep = 16000
-    else
+        gpu_maxnstep = 4000
+    elseif mode != "cpu"
         error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
     end
 
@@ -148,36 +131,14 @@ if !slow_light
 
         #Again, we have to separate CPU and GPU here, as they have different memory management strategies and different execution paths.
         if mode == "cpu"
-            fill!(Image, 0.0)
-
-            println("Tracing geodesics for $pixels_x row-tasks...")
-
-            p = Progress(pixels_x * pixels_y; desc="Raytracing Image...", showspeed=true, barlen=30)
-
-            Threads.@threads :greedy for i in 0:(pixels_x - 1)
-                my_traj = task_trajs[i + 1]
-
-                for j in 0:(pixels_y - 1)
-                    nstep, _ = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
-
-                    Jipole.Radiation.integrate_emission!(my_traj, nstep, Image, i + 1, j + 1, freq, model.a, model, simulation_data)
-
-                    lock(progress_lock) do
-                        ProgressMeter.next!(p; showvalues=[(:pixel, "($i, $j)"), (:total_done, "$(i * pixels_y + j)/$(pixels_x * pixels_y)")])
-                    end
-                end
-            end
-
-            Image .*= freq^3
-
-            finish!(p)
+            copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
         else
             println("Copying simulation data grid to the GPU...")
             gpu_sim_data = (Jipole.Utils_GPU.copy_iharm_to_gpu(simulation_data[1]),)
 
             println("Processing image in tiles...")
             global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=64)
+                nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=256)
             println("Raytracing complete!")
         end
 
@@ -285,7 +246,7 @@ else
 
     println("Tracing geodesics (dump-independent; traced once for the whole slow-light run)...")
 
-    dummy_svec = @SVector zeros(4)
+    dummy_svec = zero(SVector{4,Float64})
     dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
 
     row_trajs = [Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep) for _ in 1:pixels_x]

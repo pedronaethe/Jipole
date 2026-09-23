@@ -488,31 +488,6 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
     return IharmParams(params)
 end
 
-"""
-    _read_single_primitive(file_handle, prim_name)
-
-Read one named primitive variable's 3D array from an open GRMHD dump
-file's `"prims"` dataset, permuting it from the dump's `(prim, k, j, i)`
-storage order to `(i, j, k)`.
-
-# Arguments
-- `file_handle`: Open HDF5 file handle.
-- `prim_name`: Primitive variable name (case-insensitive; must appear in
-  `VALID_PRIMS`).
-
-# Returns
-- The primitive's 3D array, or `nothing` if `prim_name` isn't a known
-  primitive.
-"""
-function _read_single_primitive(file_handle, prim_name::String)
-    if "prims" in keys(file_handle)
-        prims = read(file_handle["prims"])
-        prim_idx = findfirst(isequal(uppercase(prim_name)), VALID_PRIMS)
-        return prim_idx === nothing ? nothing : permutedims(prims[prim_idx, :, :, :], (3, 2, 1))
-    else
-        error("Dataset 'prims' not found in the HDF5 file.")
-    end
-end
 
 """
     load_data(filename, Rhigh, model; advance_path!=nothing)
@@ -541,88 +516,76 @@ function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::U
 
     h5open(filename, "r") do file
         t = read(file, "t")
-        Threads.@threads for prim_name in VALID_PRIMS
-            data_3d = _read_single_primitive(file, prim_name)
-            if data_3d !== nothing
-                data_3d = Float64.(data_3d)
-
-                if prim_name == "RHO"
-                    rho = data_3d
-                    if size(rho, 1) != model.N1 || size(rho, 2) != model.N2 || size(rho, 3) != model.N3
-                        println("N1 = $(size(rho,1)), N2 = $(size(rho,2)), N3 = $(size(rho,3))")
-                        error("Data dimensions do not match expected grid size N1,N2,N3")
-                    end
-                elseif prim_name == "UU"
-                    uu = data_3d
-                elseif prim_name == "U1"
-                    u1 = data_3d
-                elseif prim_name == "U2"
-                    u2 = data_3d
-                elseif prim_name == "U3"
-                    u3 = data_3d
-                elseif prim_name == "B1"
-                    b1 = data_3d
-                elseif prim_name == "B2"
-                    b2 = data_3d
-                elseif prim_name == "B3"
-                    b3 = data_3d
-                end
-            end
+        haskey(file, "prims") || error("Dataset 'prims' not found in the HDF5 file.")
+        prims = read(file["prims"])
+        size(prims)[2:4] == (model.N3, model.N2, model.N1) ||
+            error("Data dimensions $(reverse(size(prims)[2:4])) do not match expected grid size ($(model.N1), $(model.N2), $(model.N3))")
+        fields = [Array{Float64}(undef, model.N1, model.N2, model.N3) for _ in VALID_PRIMS]
+        Threads.@threads for i in eachindex(VALID_PRIMS)
+            permutedims!(fields[i], view(prims, i, :, :, :), (3, 2, 1))
         end
+        rho, uu, u1, u2, u3, b1, b2, b3 = fields
         data_array[1] = IharmData(t, rho, uu, u1, u2, u3, b1, b2, b3, zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)))
     end
 
-    Threads.@threads for i in 1:(model.N1)
-        for j in 1:(model.N2)
+    gcovs = Matrix{SMatrix{4,4,Float64,16}}(undef, model.N1, model.N2)
+    gcons = similar(gcovs)
+    Threads.@threads for j in 1:(model.N2)
+        for i in 1:(model.N1)
             X = zeros(MVector{4,Float64})
             Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
             gcov = zeros(MMatrix{4,4,Float64})
             gcon = zeros(MMatrix{4,4,Float64})
             Metrics.gcov_func!(X, model.a, model, gcov)
             Metrics.gcon_func!(gcov, gcon)
-            g = Grid.gdet_zone(i - 1, j - 1, 0, model)
+            gcovs[i, j] = SMatrix(gcov)
+            gcons[i, j] = SMatrix(gcon)
+        end
+    end
 
-            for k in 1:(model.N3)
-                Grid.ijk_to_x(i - 1, j - 1, k, X, model)
+    Threads.@threads for jk in CartesianIndices((model.N2, model.N3))
+        j, k = Tuple(jk)
+        for i in 1:(model.N1)
+            gcov = gcovs[i, j]
+            gcon = gcons[i, j]
 
-                Ufields = (data_array[1].U1, data_array[1].U2, data_array[1].U3)
-                UdotU = 0.0
-                for l in 1:(Constants.NDIM-1)
-                    for m in 1:(Constants.NDIM-1)
-                        UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
-                    end
+            Ufields = (data_array[1].U1, data_array[1].U2, data_array[1].U3)
+            UdotU = 0.0
+            for l in 1:(Constants.NDIM-1)
+                for m in 1:(Constants.NDIM-1)
+                    UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
                 end
-
-                ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
-                ucon = MVector{4,Float64}(undef)
-                ucon[1] = -ufac * gcon[1, 1]
-
-                for μ in 1:(Constants.NDIM-1)
-                    ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
-                end
-
-                ucov = MVector{4,Float64}(undef)
-                Coordinates.flip_index!(ucov, ucon, gcov)
-                udotB = 0.0
-                Bfields = (data_array[1].B1, data_array[1].B2, data_array[1].B3)
-                for l in 1:(Constants.NDIM-1)
-                    udotB += ucov[l+1] * Bfields[l][i, j, k]
-                end
-
-                bcon = MVector{4,Float64}(undef)
-                bcon[1] = udotB
-                for μ in 1:(Constants.NDIM-1)
-                    bcon[μ+1] = (Bfields[μ][i, j, k] + ucon[μ+1] * udotB) / ucon[1]
-                end
-                bcov = MVector{4,Float64}(undef)
-                Coordinates.flip_index!(bcov, bcon, gcov)
-
-                bsq = 0.0
-                for l in 1:Constants.NDIM
-                    bsq += bcov[l] * bcon[l]
-                end
-                data_array[1].b[i, j, k] = sqrt(bsq) * model.B_unit
             end
+
+            ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
+            ucon = MVector{4,Float64}(undef)
+            ucon[1] = -ufac * gcon[1, 1]
+
+            for μ in 1:(Constants.NDIM-1)
+                ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
+            end
+
+            ucov = MVector{4,Float64}(undef)
+            Coordinates.flip_index!(ucov, ucon, gcov)
+            udotB = 0.0
+            Bfields = (data_array[1].B1, data_array[1].B2, data_array[1].B3)
+            for l in 1:(Constants.NDIM-1)
+                udotB += ucov[l+1] * Bfields[l][i, j, k]
+            end
+
+            bcon = MVector{4,Float64}(undef)
+            bcon[1] = udotB
+            for μ in 1:(Constants.NDIM-1)
+                bcon[μ+1] = (Bfields[μ][i, j, k] + ucon[μ+1] * udotB) / ucon[1]
+            end
+            bcov = MVector{4,Float64}(undef)
+            Coordinates.flip_index!(bcov, bcon, gcov)
+
+            bsq = 0.0
+            for l in 1:Constants.NDIM
+                bsq += bcov[l] * bcon[l]
+            end
+            data_array[1].b[i, j, k] = sqrt(bsq) * model.B_unit
         end
     end
     init_physical_quantities(data_array, 1, model, Rhigh)
@@ -740,42 +703,41 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2)
     UU_arr = data[n].UU
     dθedRhi = data[n].dθedRhi
 
-    @inbounds Threads.@threads for i in 1:model.N1
-        for j in 1:model.N2
-            for k in 1:model.N3
-                rho_ijk = RHO_arr[i, j, k]
-                uu_ijk = UU_arr[i, j, k]
-                b_ijk = b_arr[i, j, k]  # already correctly B_unit-scaled by the caller
+    @inbounds Threads.@threads for jk in CartesianIndices((model.N2, model.N3))
+        j, k = Tuple(jk)
+        for i in 1:model.N1
+            rho_ijk = RHO_arr[i, j, k]
+            uu_ijk = UU_arr[i, j, k]
+            b_ijk = b_arr[i, j, k]  # already correctly B_unit-scaled by the caller
 
-                ne_arr[i, j, k] = rho_ijk * rho_factor
+            ne_arr[i, j, k] = rho_ijk * rho_factor
 
-                bsq_normalized = b_ijk * B_unit_inv
-                bsq = bsq_normalized * bsq_normalized
+            bsq_normalized = b_ijk * B_unit_inv
+            bsq = bsq_normalized * bsq_normalized
 
-                sigma_m = bsq / rho_ijk
-                beta_m = uu_ijk * gam_minus_1 / (0.5 * bsq)
+            sigma_m = bsq / rho_ijk
+            beta_m = uu_ijk * gam_minus_1 / (0.5 * bsq)
 
-                betasq = beta_m * beta_m / beta_crit_sq
-                betasq_plus_1_inv = 1.0 / (1.0 + betasq)
-                trat = Rhigh * betasq * betasq_plus_1_inv + model.Rlow * betasq_plus_1_inv
-                θe_unit = θe_factor / (game_minus_1 * trat + gamp_minus_1)
-                θe_val = θe_unit * uu_ijk / rho_ijk
+            betasq = beta_m * beta_m / beta_crit_sq
+            betasq_plus_1_inv = 1.0 / (1.0 + betasq)
+            trat = Rhigh * betasq * betasq_plus_1_inv + model.Rlow * betasq_plus_1_inv
+            θe_unit = θe_factor / (game_minus_1 * trat + gamp_minus_1)
+            θe_val = θe_unit * uu_ijk / rho_ijk
 
-                dtratdRhi = betasq * betasq_plus_1_inv
-                dθe_unit_dRhi = -θe_factor * game_minus_1 / ((game_minus_1 * trat + gamp_minus_1)^2) * dtratdRhi
-                dθe_dRhi = dθe_unit_dRhi * uu_ijk / rho_ijk
+            dtratdRhi = betasq * betasq_plus_1_inv
+            dθe_unit_dRhi = -θe_factor * game_minus_1 / ((game_minus_1 * trat + gamp_minus_1)^2) * dtratdRhi
+            dθe_dRhi = dθe_unit_dRhi * uu_ijk / rho_ijk
 
-                if θe_val > 1.0e-3
-                    θe_arr[i, j, k] = θe_val
-                    dθedRhi[i, j, k] = dθe_dRhi
-                else
-                    θe_arr[i, j, k] = 1.0e-3
-                    dθedRhi[i, j, k] = 0.0
-                end
-
-                sigma_arr[i, j, k] = sigma_m > Constants.SMALL ? sigma_m : Constants.SMALL
-                beta_arr[i, j, k] = beta_m > Constants.SMALL ? beta_m : Constants.SMALL
+            if θe_val > 1.0e-3
+                θe_arr[i, j, k] = θe_val
+                dθedRhi[i, j, k] = dθe_dRhi
+            else
+                θe_arr[i, j, k] = 1.0e-3
+                dθedRhi[i, j, k] = 0.0
             end
+
+            sigma_arr[i, j, k] = sigma_m > Constants.SMALL ? sigma_m : Constants.SMALL
+            beta_arr[i, j, k] = beta_m > Constants.SMALL ? beta_m : Constants.SMALL
         end
     end
 end

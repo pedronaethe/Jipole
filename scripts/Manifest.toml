@@ -948,7 +948,7 @@ version = "1.6.1"
     ArrowTypes = "31f734f8-188a-4ce0-8406-c8a06bd891cd"
 
 [[deps.Jipole]]
-deps = ["Adapt", "Bessels", "CairoMakie", "Dates", "DelimitedFiles", "ForwardDiff", "HDF5", "IJulia", "LinearAlgebra", "MCMCChains", "Printf", "ProgressMeter", "Revise", "StaticArrays", "StatsBase", "StructArrays"]
+deps = ["Adapt", "Bessels", "CairoMakie", "Dates", "DelimitedFiles", "ForwardDiff", "HDF5", "IJulia", "LinearAlgebra", "MCMCChains", "PrecompileTools", "Printf", "ProgressMeter", "Revise", "StaticArrays", "StatsBase", "StructArrays", "TOML"]
 path = ".."
 uuid = "2347fae0-cb17-4e37-b3ba-1e469be55413"
 version = "0.1.0"

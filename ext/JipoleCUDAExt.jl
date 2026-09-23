@@ -8,7 +8,7 @@ using CUDA
 using StaticArrays
 using Jipole
 using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Slowlight, Utils_GPU
-using Jipole.GeoTypes: OfTrajGeneric
+using Jipole.GeoTypes: OfTrajGeneric, GPUTrajStep
 using Jipole.Slowlight: OfSlowLight, pack_trajectory_tile!
 
 function Utils_GPU.copy_iharm_to_gpu(cpu_data)
@@ -46,7 +46,7 @@ the image a single launch can cover.
 The division in tiles is necessary depending on the size of the image due to GPU memory constraints.
 
 # Arguments
-- `d_traj`: Pre-allocated `CuArray{OfTrajGeneric}` scratch buffer, sized
+- `d_traj`: Pre-allocated `CuArray{GPUTrajStep{T}}` scratch buffer, sized
   `(block_size_x, block_size_y, nmaxstep)`.
 - `d_Image`: Output image, overwritten in-place.
 - `d_truncated`: Pre-allocated array of booleans, set `true` for any pixel whose geodesic
@@ -103,7 +103,7 @@ radiative transfer equation forward along the stored trajectory (from the
 far end back to the camera), writing the result into `d_Image`.
 
 # Arguments
-- `traj`: Pre-allocated `CuDeviceArray{OfTrajGeneric{Float64}}` scratch buffer for
+- `traj`: Pre-allocated `CuDeviceArray{GPUTrajStep{T}}` scratch buffer for
   this tile, indexed by the pixel's local (within-tile) coordinates.
 - `d_Image`: Output image, overwritten in-place at `(i_global, j_global)`.
 - `d_truncated`: Pre-allocated boolean array for this tile, set
@@ -146,13 +146,12 @@ function calculate_image!(
 
     X = Xcam
     K = Kcon
-    Xhalf = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
-    Khalf = SVector{4, Float64}(0.0, 0.0, 0.0, 0.0)
     #lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
 
     step::Int64 = 1
-    @inbounds traj[i_local, j_local, step] = OfTrajGeneric{Float64}(
-        0.0, X, K, Xhalf, Khalf
+    T = eltype(X)
+    @inbounds traj[i_local, j_local, step] = GPUTrajStep{T}(
+        0.0, X, K
     )
     while (Geodesics.stop_backward_integration(X, K, Rh, Rstop) == 0 && (step < nmaxstep))
         @inbounds begin
@@ -160,8 +159,8 @@ function calculate_image!(
             scaled_dl = dl * dl_unit
             X, K, Xhalf, Khalf = Geodesics.push_photon(X, K, -dl, bhspin, params)
             step += 1
-            traj[i_local, j_local, step] = OfTrajGeneric{Float64}(
-                scaled_dl, X, K, Xhalf, Khalf
+            @inbounds traj[i_local, j_local, step] = GPUTrajStep{T}(
+                scaled_dl, X, K
             )
         end
     end
@@ -406,10 +405,13 @@ end
 
 function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
     nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
+    
     threads_per_block = (16, 16)
     blocks_per_grid = (cld(block_size, threads_per_block[1]), cld(block_size, threads_per_block[2]))
 
-    d_traj = CuArray{OfTrajGeneric{Float64}}(undef, block_size, block_size, nmaxstep)
+     T = promote_type(typeof(ro), typeof(θo), typeof(phi), typeof(model.a))
+
+    d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
     d_truncated = CUDA.zeros(Bool, block_size, block_size)
     d_Image = CUDA.zeros(Float64, nx, ny)
 
@@ -437,7 +439,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
                     nmaxstep = min(nmaxstep * 2, nmaxstep_ceiling)
                     println("Tile (i_offset=$i_offset, j_offset=$j_offset) truncated a geodesic; retrying with nmaxstep = $nmaxstep")
                     CUDA.unsafe_free!(d_traj)
-                    d_traj = CuArray{OfTrajGeneric{Float64}}(undef, block_size, block_size, nmaxstep)
+                    d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
                 end
             end
         end

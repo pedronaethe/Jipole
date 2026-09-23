@@ -160,7 +160,7 @@ function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pix
             end
         end
     end
-    Image *= freq^3
+    Image .*= freq^3
     finish!(p)
 
     return Image

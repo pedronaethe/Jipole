@@ -27,6 +27,9 @@ scripts/*
 !scripts/pars/
 !scripts/pars/example_par.toml
 
+!scripts/Project.toml
+!scripts/Manifest.toml
+
 # Jupyter noise
 **/.ipynb_checkpoints/
 

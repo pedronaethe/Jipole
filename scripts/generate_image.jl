@@ -2,7 +2,6 @@ using Jipole
 using StaticArrays
 using ProgressMeter
 using TOML
-using CUDA
 if length(ARGS) != 1
     error("Usage: julia --project=. --threads=12 generate_image.jl path/to/config.toml")
 end
@@ -73,6 +72,12 @@ const source_distance_pc = Jipole.Utils.get_config(config, "observing", "source_
 const maxnstep = Jipole.Utils.get_config(config, "raytracing", "maxnstep", 25000)
 const mode = Jipole.Utils.get_config(config, "raytracing", "mode", "cpu")
 
+# CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
+# also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
+const use_gpu = slow_light ? Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" : mode == "gpu"
+if use_gpu
+    using CUDA
+end
 # Output parameters
 const output_filename = Jipole.Utils.get_config(config, "output", "filename", "jipole_output.h5")
 const output_format = Jipole.Utils.get_config(config, "output", "format", "ipole")
@@ -97,9 +102,9 @@ if !slow_light
     # Sometimes the GPU won't have enough memory to hold it all in, so we have to do it in parts.
     if mode == "cpu"
         dummy_svec = @SVector zeros(4)
-        dummy_traj = Jipole.GeoTypes.OfTrajS(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
+        dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
 
-        task_trajs = [Vector{Jipole.GeoTypes.OfTrajS}(undef, maxnstep) for _ in 1:pixels_x]
+        task_trajs = [Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep) for _ in 1:pixels_x]
 
         for i in 1:pixels_x
             for k in 1:maxnstep
@@ -109,23 +114,9 @@ if !slow_light
 
         progress_lock = ReentrantLock()
     elseif mode == "gpu"
-        using CUDA
-
-        # Same hard ceiling the CPU path allows itself, however, dynamically allocating in GPU is not allowed,
-        # So if there's a problem, it will finish sooner and have a boolean parameter to re run that trajectory again with a bigger trajectory.
-        gpu_absolute_max_step = 50000
-
-        # First try will use gpu_maxnstep
+        # nmaxstep for the first GPU attempt. render_image_gpu! doubles it for any tile with a
+        # truncated geodesic, and the value it ends on carries over to the next dump.
         gpu_maxnstep = 16000
-
-        #Block size will tell you how many pixels to process at once in our tile.
-        block_size = 64
-        d_traj = CuArray{Jipole.GeoTypes.OfTrajGRMHD}(undef, block_size, block_size, gpu_maxnstep)
-        d_truncated = CUDA.zeros(Bool, block_size, block_size)
-        threads_per_block = (16, 16)
-        blocks_per_grid = (cld(block_size, threads_per_block[1]), cld(block_size, threads_per_block[2]))
-
-        d_Image = CUDA.zeros(Float64, pixels_x, pixels_y)
     else
         error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
     end
@@ -133,11 +124,12 @@ if !slow_light
 
     #Loop through every file in the directory chosen.
     for current_dump_filepath in dump_files
+        local model, simulation_data, Rh, DXsize, DYsize, fovx, fovy, Xcamera, p, scale_factor
         println("")
         println("Processing dump: $current_dump_filepath")
 
         # Read the header and load the data for this dump file.
-        model = Jipole.Iharm.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, trat_beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
+        model = Jipole.Iharm.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit = beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
 
         #This will read the primitives and the variables derived from them.
         simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 1)
@@ -180,46 +172,12 @@ if !slow_light
 
             finish!(p)
         else
-            CUDA.fill!(d_Image, 0.0)
-
             println("Copying simulation data grid to the GPU...")
-
             gpu_sim_data = (Jipole.Utils_GPU.copy_iharm_to_gpu(simulation_data[1]),)
-            gpu_params = model
 
             println("Processing image in tiles...")
-
-            CUDA.@time begin
-                for i_offset in 0:block_size:(pixels_x - 1)
-                    for j_offset in 0:block_size:(pixels_y - 1)
-                        # This while true loop is basically us saying that we want to expand the GPU maxnstep until we either get a non-truncated result or we hit the absolute max step limit.
-                        while true
-                            CUDA.fill!(d_truncated, false)
-                            @cuda threads=threads_per_block blocks=blocks_per_grid Jipole.Imaging.raytrace_image_gpu!(
-                                d_traj, d_Image, d_truncated,
-                                i_offset, j_offset, block_size, block_size,
-                                ro, th, phi, model.a, pixels_x, pixels_y, gpu_maxnstep,
-                                freq, fovx, fovy, model.Rout, model.rmax_geo, gpu_sim_data, gpu_params
-                            )
-                            CUDA.synchronize()
-
-                            any(d_truncated) || break
-
-                            if gpu_maxnstep >= gpu_absolute_max_step
-                                @warn "Tile (i_offset=$i_offset, j_offset=$j_offset) still truncated at the absolute step ceiling ($gpu_absolute_max_step); keeping its result as-is."
-                                break
-                            end
-
-                            global gpu_maxnstep = min(gpu_maxnstep * 2, gpu_absolute_max_step)
-                            println("Tile (i_offset=$i_offset, j_offset=$j_offset) truncated a geodesic; retrying with gpu_maxnstep = $gpu_maxnstep")
-                            global d_traj = CuArray{Jipole.GeoTypes.OfTrajGRMHD}(undef, block_size, block_size, gpu_maxnstep)
-                        end
-                    end
-                end
-                CUDA.synchronize()
-            end
-
-            copyto!(Image, d_Image)
+            global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
+                nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=64)
             println("Raytracing complete!")
         end
 
@@ -299,16 +257,12 @@ else
     const dump_start = Jipole.Utils.extract_dump_index(basename(dump_files[1]))
     const dump_max = Jipole.Utils.extract_dump_index(basename(dump_files[end]))
     const image_cadence = Jipole.Utils.get_config(config, "slowlight", "image_cadence", 10.0)
-    const slowlight_engine = Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" ? :GPU : :CPU
-
-    if slowlight_engine === :GPU
-        using CUDA
-    end
+    const slowlight_engine = use_gpu ? :GPU : :CPU
 
     params_slowlight = Jipole.Slowlight.OfSlowLight(dump_start, dump_max, image_cadence, 0.0, 0.0, 0.0, "")
     params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path)
 
-    model = Jipole.Iharm.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, Rlow=Rlow, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit, slow_light=true)
+    model = Jipole.Iharm.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit, slow_light=true)
 
     advance_dump_path! = () -> (params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path))
 
@@ -332,16 +286,16 @@ else
     println("Tracing geodesics (dump-independent; traced once for the whole slow-light run)...")
 
     dummy_svec = @SVector zeros(4)
-    dummy_traj = Jipole.GeoTypes.OfTrajS(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
+    dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
 
-    row_trajs = [Vector{Jipole.GeoTypes.OfTrajS}(undef, maxnstep) for _ in 1:pixels_x]
+    row_trajs = [Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep) for _ in 1:pixels_x]
     for i in 1:pixels_x
         for k in 1:maxnstep
             row_trajs[i][k] = dummy_traj
         end
     end
 
-    all_geodesics = Matrix{Vector{Jipole.GeoTypes.OfTrajS}}(undef, pixels_x, pixels_y)
+    all_geodesics = Matrix{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(undef, pixels_x, pixels_y)
     nsteps = zeros(Int, pixels_x, pixels_y)
 
     row_t0 = zeros(Float64, pixels_x)

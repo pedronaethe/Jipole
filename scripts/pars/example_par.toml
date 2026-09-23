@@ -6,11 +6,13 @@ MBH = 6.2e9
 slow_light = false
 
 #it can be MAD/SANE or any float value
-m_unit = MAD
+m_unit = "SANE"
 
 [dump]
 # dump_filepath can point to a single dump file, or to a directory of dumps.
-dump_filepath = "/home/pedro/kharma_dumps/"
+dump_filepath = "/home/mottapn/sample_dump_SANE_a+0.94_MKS_0900.h5"
+
+#These parameters are only read when dump_filepath reads a directory with multiple dumps inside.
 t_init = 0
 t_final = 10
 

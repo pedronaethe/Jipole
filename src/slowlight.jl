@@ -10,7 +10,6 @@ using Printf
 using DelimitedFiles
 using ProgressMeter
 using StaticArrays
-using CUDA
 using ..Constants
 using ..Radiation
 using ..Iharm
@@ -20,6 +19,13 @@ using ..Utils_GPU
 using Dates
 export OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
     process_slowlight_images!
+
+
+"""
+    GPU functions defined in JipoleCUDAExt.jl
+"""
+function gpu_tile_plan end
+function render_round_gpu! end
 
 """
 Slow-light run state: which dump is currently loaded/being advanced to,
@@ -222,7 +228,7 @@ strip per round.
 """
 function pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
     zero_vec = SVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
-    dummy = OfTrajS(0.0, zero_vec, zero_vec, zero_vec, zero_vec)
+    dummy = OfTrajGeneric{Float64}(0.0, zero_vec, zero_vec, zero_vec, zero_vec)
     fill!(dest, dummy)
     @inbounds for j in j0:j1, i in 1:pixels_x
         traj = all_geodesics[i, j]
@@ -233,43 +239,6 @@ function pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
         end
     end
     return dest
-end
-
-"""
-    gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
-
-Decide how many image rows fit in one GPU tile, by checking how much
-memory is actually free right now -- on both the GPU (`CUDA.available_memory()`)
-and the host (`Sys.free_memory()`, since [`pack_trajectory_tile!`](@ref)
-builds each tile on the host first) -- and picking the size that fits
-the tighter of the two. Called once from [`process_slowlight_images!`](@ref)
-when `engine = :GPU`, before the rounds loop starts.
-
-# Arguments
-- `pixels_x`, `pixels_y`: Image resolution.
-- `max_nstep`: Longest trajectory length across all pixels.
-- `nimgs_concurrently`: Number of frames rendered concurrently.
-- `simulation_data`: 3-element window of loaded GRMHD snapshots, used to
-  estimate their GPU memory footprint.
-
-# Returns
-- `tile_height`: number of image rows (the `j` dimension) per tile.
-"""
-function gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
-    traj_elem_bytes = sizeof(OfTrajS)
-
-    grid_bytes = 3 * Base.summarysize(simulation_data[1])
-    state_bytes = pixels_x * pixels_y * nimgs_concurrently * (sizeof(Float64) + sizeof(Int))
-
-    gpu_usable_bytes = max(CUDA.available_memory() - grid_bytes - state_bytes, 0)
-    host_usable_bytes = Sys.free_memory()
-
-    safety_fraction = 0.6 
-    usable_bytes = floor(Int, min(gpu_usable_bytes, host_usable_bytes) * safety_fraction)
-
-    row_bytes = pixels_x * max_nstep * traj_elem_bytes
-    tile_height = row_bytes <= 0 ? pixels_y : clamp(usable_bytes ÷ row_bytes, 1, pixels_y)
-    return tile_height
 end
 
 """
@@ -332,167 +301,6 @@ function refresh_gpu_data!(gpu_data, simulation_data)
 end
 
 """
-    slowlight_kernel!(traj, nstep_state, intensity, valid_mask, target_times,
-        tA, tB, tf, freq, bhspin, model, data)
-
-The GPU kernel itself: one thread per pixel `(i, j)`, looping over every
-active frame `k` (skipping any where `valid_mask[k] == 0`) and continuing
-that pixel's intensity integration along its trajectory. Same math as
-[`render_round_cpu!`](@ref)'s inner loop, just run on the GPU. Launched
-via `@cuda` from [`render_round_gpu!`](@ref).
-
-# Arguments
-- `traj`: Packed per-pixel geodesic trajectories for this tile (see
-  [`pack_trajectory_tile!`](@ref)).
-- `nstep_state`: Remaining trajectory steps per pixel/frame, overwritten
-  in place.
-- `intensity`: Accumulated intensity per pixel/frame, overwritten in
-  place.
-- `valid_mask`: Which frames are currently active (nonzero entries).
-- `target_times`: Target simulation time for each frame.
-- `tA`, `tB`: Time window currently bracketed by `data`.
-- `tf`: Simulation time of the newest available dump.
-- `freq`: Frequency, in cgs units.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Iharm model parameters.
-- `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (see
-  [`refresh_gpu_data!`](@ref)).
-"""
-function slowlight_kernel!(
-    traj, nstep_state, intensity, valid_mask, target_times,
-    tA::Float64, tB::Float64, tf::Float64,
-    freq::Float64, bhspin::Float64, model, data
-)
-    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
-    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
-
-    nx, ny, _ = size(traj)
-    nk = length(valid_mask)
-
-    if i <= nx && j <= ny
-        @inbounds for k in 1:nk
-            if valid_mask[k] == 0
-                continue
-            end
-
-            nstep = nstep_state[i, j, k]
-            Intensity = intensity[i, j, k]
-            dt = target_times[k] + 1e-5
-
-            while nstep > 2
-                Xi = traj[i, j, nstep].X
-                Xf = traj[i, j, nstep-1].X
-                Kconi = traj[i, j, nstep].Kcon
-                Kconf = traj[i, j, nstep-1].Kcon
-
-                Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
-                Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
-                if Xi[1] < tA
-                    shift = tA - Xi[1]
-                    Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
-                    Xi = SVector{4,Float64}(tA, Xi[2], Xi[3], Xi[4])
-                end
-                if Xi[1] >= tB
-                    if Xf[1] >= tf
-                        shift = tf - Xf[1]
-                        Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
-                        Xf = SVector{4,Float64}(tf, Xf[2], Xf[3], Xf[4])
-                    else
-                        break
-                    end
-                end
-
-                ji, ki = Radiation.get_jk(Xi, Kconi, freq, bhspin, model, data)
-                jf, kf = Radiation.get_jk(Xf, Kconf, freq, bhspin, model, data)
-
-                Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[i, j, nstep-1].dl)
-
-                nstep -= 1
-            end
-
-            nstep_state[i, j, k] = nstep
-            intensity[i, j, k] = Intensity
-        end
-    end
-    return nothing
-end
-
-"""
-    render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height,
-        valid_ks, nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
-
-Render one round on the GPU -- the `:GPU` counterpart of
-[`render_round_cpu!`](@ref). Goes tile by tile (rows sized by
-[`gpu_tile_plan`](@ref)): pack that tile's trajectories
-([`pack_trajectory_tile!`](@ref)) and upload it plus the current
-`movie_nstep`/`movie_intensity` state, run [`slowlight_kernel!`](@ref),
-then copy the results back to `movie_nstep`/`movie_intensity` so they're
-plain host arrays again afterwards, same as the CPU path. Called from
-[`process_slowlight_images!`](@ref) when `engine = :GPU`.
-
-# Arguments
-- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
-  in place.
-- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten
-  in place.
-- `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per
-  pixel.
-- `nsteps`: Matrix of trajectory lengths, one per pixel.
-- `max_nstep`: Longest trajectory length across all pixels.
-- `tile_height`: Number of image rows per tile (see [`gpu_tile_plan`](@ref)).
-- `valid_ks`: Indices of the currently-active frames to render this
-  round.
-- `nimgs_concurrently`: Number of frames rendered concurrently.
-- `target_times`: Target simulation time for each frame.
-- `pixels_x`, `pixels_y`: Image resolution.
-- `params_slowlight`: Slow-light run state (time window `[tA, tB, tf]`).
-- `freq`: Frequency, in cgs units.
-- `model`: Iharm model parameters.
-- `gpu_data`: 3-element vector of GPU-resident GRMHD snapshots.
-"""
-function render_round_gpu!(
-    movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks, nimgs_concurrently,
-    target_times, pixels_x, pixels_y, params_slowlight::OfSlowLight, freq, model, gpu_data
-)
-    threads_per_block = (16, 16)
-    valid_mask_host = zeros(Int, nimgs_concurrently)
-    for k in valid_ks
-        valid_mask_host[k] = 1
-    end
-    d_valid_mask = CuArray(valid_mask_host)
-    d_target_times = CuArray(target_times)
-    data_tuple = Tuple(gpu_data)
-
-    n_tiles = cld(pixels_y, tile_height)
-    println("Rendering $(length(valid_ks)) frame(s) this round on GPU ($n_tiles tile(s) of height $tile_height)...")
-
-    traj_tile_host = Array{OfTrajS}(undef, pixels_x, tile_height, max_nstep)
-    for j0 in 1:tile_height:pixels_y
-        j1 = min(j0 + tile_height - 1, pixels_y)
-        tile_ny = j1 - j0 + 1
-
-        traj_view = tile_ny == tile_height ? traj_tile_host : Array{OfTrajS}(undef, pixels_x, tile_ny, max_nstep)
-        pack_trajectory_tile!(traj_view, all_geodesics, nsteps, pixels_x, j0, j1)
-        d_traj = CuArray(traj_view)
-
-        d_nstep = CuArray(@view movie_nstep[:, j0:j1, :])
-        d_intensity = CuArray(@view movie_intensity[:, j0:j1, :])
-
-        blocks_per_grid = (cld(pixels_x, threads_per_block[1]), cld(tile_ny, threads_per_block[2]))
-        @cuda threads = threads_per_block blocks = blocks_per_grid slowlight_kernel!(
-            d_traj, d_nstep, d_intensity, d_valid_mask, d_target_times,
-            params_slowlight.tA, params_slowlight.tB, params_slowlight.tf,
-            freq, model.a, model, data_tuple
-        )
-        CUDA.synchronize()
-
-        copyto!(@view(movie_nstep[:, j0:j1, :]), Array(d_nstep))
-        copyto!(@view(movie_intensity[:, j0:j1, :]), Array(d_intensity))
-    end
-    return nothing
-end
-
-"""
     process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path)
 
 Render a slow-light movie: repeatedly integrate the (already-traced)
@@ -528,8 +336,9 @@ function process_slowlight_images!(
     model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
     engine::Symbol = :CPU
 )
-    engine in (:CPU, :GPU) || throw(ArgumentError("engine must be :CPU or :GPU, got $(repr(engine))"))
-
+    if engine === :GPU && isnothing(Base.get_extension(parentmodule(@__MODULE__), :JipoleCUDAExt))
+        error("engine = :GPU needs CUDA.jl loaded: run `using CUDA` first")
+    end
     base_dir = joinpath("..", "slow_sims")
     
     if !isdir(base_dir)

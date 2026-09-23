@@ -1,0 +1,14 @@
+name: CI
+
+on:
+  push:
+    branches: [ master, main ]
+    pull_request:
+    workflow_dispatch:
+
+env:
+  IPOLE_REPO: https://github.com/AFD-Illinois/ipole.git
+  IPOLE_REF: master           
+  DUMP_URL: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/XZECPF #This is the MKS dump file (I should probably find the FMKS as well)
+  NPIX: 128
+  RCAM: 

@@ -112,11 +112,11 @@ if !slow_light
         println("Processing dump: $current_dump_filepath")
 
         # Read the header and load the data for this dump file.
-        model = Jipole.Iharm.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit = beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
+        reader = Jipole.Kharma.is_kharma_dump(current_dump_filepath) ? Jipole.Kharma : Jipole.Iharm
+        model = reader.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
 
         #This will read the primitives and the variables derived from them.
-        simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 1)
-        simulation_data[1] = Jipole.Iharm.load_data(current_dump_filepath, Rhigh, model)
+        simulation_data = [reader.load_data(current_dump_filepath, Rhigh, model)]
 
         Rh = 1 + sqrt(1.0 - model.a^2)
         DXsize = SourceD / model.L_unit / Jipole.Constants.MUAS_PER_RAD * fov_size

@@ -253,6 +253,84 @@ p.M_unit, p.T_unit, p.L_unit, p.MBH, p.tp_over_te, p.RHO_unit, p.U_unit, p.B_uni
 p.mks3H0, p.mks3MY1, p.mks3MY2, p.mks3MP0,p.N1,p.N2,p.N3,SVector(p.dx),SVector(p.startx),SVector(p.stopx),SVector(p.cstartx),SVector(p.cstopx),p.rmin_geo,p.rmax_geo,p.th_beg,
 p.Rlow,p.Rhigh,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light)
 
+"""
+    build_data(t, rho, uu, u1, u2, u3, b1, b2, b3, Rhigh, model::IharmParams)
+
+Assemble an [`IharmData`](@ref) from fluid primitives already laid out on the `(N1, N2, N3)`
+grid, and compute the derived quantities the radiative transfer needs (`b`, then `ne`, `θe`,
+`sigma`, `beta` via [`init_physical_quantities`](@ref)). Shared by [`load_data`](@ref) and
+`Kharma.load_data`, which differ only in how they read the primitives from disk.
+"""
+function build_data(t, rho, uu, u1, u2, u3, b1, b2, b3, Rhigh, model::IharmParams)
+    data = IharmData(Float64(t), rho, uu, u1, u2, u3, b1, b2, b3,
+        zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)))
+
+    # The metric depends only on (i, j), so compute it once per (i, j); then sweep the grid
+    # with i innermost, which matches the arrays' memory layout.
+    gcovs = Matrix{SMatrix{4,4,Float64,16}}(undef, model.N1, model.N2)
+    gcons = similar(gcovs)
+    Threads.@threads for j in 1:(model.N2)
+        for i in 1:(model.N1)
+            X = zeros(MVector{4,Float64})
+            Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
+            gcov = zeros(MMatrix{4,4,Float64})
+            gcon = zeros(MMatrix{4,4,Float64})
+            Metrics.gcov_func!(X, model.a, model, gcov)
+            Metrics.gcon_func!(gcov, gcon)
+            gcovs[i, j] = SMatrix(gcov)
+            gcons[i, j] = SMatrix(gcon)
+        end
+    end
+
+    Threads.@threads for jk in CartesianIndices((model.N2, model.N3))
+        j, k = Tuple(jk)
+        for i in 1:(model.N1)
+            gcov = gcovs[i, j]
+            gcon = gcons[i, j]
+
+            Ufields = (data.U1, data.U2, data.U3)
+            UdotU = 0.0
+            for l in 1:(Constants.NDIM-1)
+                for m in 1:(Constants.NDIM-1)
+                    UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
+                end
+            end
+
+            ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
+            ucon = MVector{4,Float64}(undef)
+            ucon[1] = -ufac * gcon[1, 1]
+
+            for μ in 1:(Constants.NDIM-1)
+                ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
+            end
+
+            ucov = MVector{4,Float64}(undef)
+            Coordinates.flip_index!(ucov, ucon, gcov)
+            udotB = 0.0
+            Bfields = (data.B1, data.B2, data.B3)
+            for l in 1:(Constants.NDIM-1)
+                udotB += ucov[l+1] * Bfields[l][i, j, k]
+            end
+
+            bcon = MVector{4,Float64}(undef)
+            bcon[1] = udotB
+            for μ in 1:(Constants.NDIM-1)
+                bcon[μ+1] = (Bfields[μ][i, j, k] + ucon[μ+1] * udotB) / ucon[1]
+            end
+            bcov = MVector{4,Float64}(undef)
+            Coordinates.flip_index!(bcov, bcon, gcov)
+
+            bsq = 0.0
+            for l in 1:Constants.NDIM
+                bsq += bcov[l] * bcon[l]
+            end
+            data.b[i, j, k] = sqrt(bsq) * model.B_unit
+        end
+    end
+
+    init_physical_quantities([data], 1, model, Rhigh)
+    return data
+end
 
 """
     read_header(filename, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
@@ -488,33 +566,11 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
     return IharmParams(params)
 end
 
-
-"""
-    load_data(filename, Rhigh, model; advance_path!=nothing)
-
-Load a GRMHD dump file's fluid primitives and compute the derived
-electron/magnetic-field quantities used by the radiative transfer.
-
-# Arguments
-- `filename`: Path to the GRMHD dump file (HDF5).
-- `Rhigh`: Electron/ion temperature ratio at high magnetization
-  (`Rhigh`).
-- `model`: Iharm model parameters.
-- `advance_path!`: Optional zero-argument callback invoked after a
-  successful load (used by `Slowlight` to advance the dump sequence).
-
-# Returns
-- The loaded [`IharmData`](@ref).
-"""
 function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::Union{Nothing,Function}=nothing)
     println("Loading data from '$filename' into 'Iharm' module...")
     !isfile(filename) && error("File not found: $filename")
 
-    rho = uu = u1 = u2 = u3 = b1 = b2 = b3 = nothing
-
-    data_array = Vector{IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 1)
-
-    h5open(filename, "r") do file
+    t, fields = h5open(filename, "r") do file
         t = read(file, "t")
         haskey(file, "prims") || error("Dataset 'prims' not found in the HDF5 file.")
         prims = read(file["prims"])
@@ -524,83 +580,14 @@ function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::U
         Threads.@threads for i in eachindex(VALID_PRIMS)
             permutedims!(fields[i], view(prims, i, :, :, :), (3, 2, 1))
         end
-        rho, uu, u1, u2, u3, b1, b2, b3 = fields
-        data_array[1] = IharmData(t, rho, uu, u1, u2, u3, b1, b2, b3, zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)))
+        t, fields
     end
 
-    gcovs = Matrix{SMatrix{4,4,Float64,16}}(undef, model.N1, model.N2)
-    gcons = similar(gcovs)
-    Threads.@threads for j in 1:(model.N2)
-        for i in 1:(model.N1)
-            X = zeros(MVector{4,Float64})
-            Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
-            gcov = zeros(MMatrix{4,4,Float64})
-            gcon = zeros(MMatrix{4,4,Float64})
-            Metrics.gcov_func!(X, model.a, model, gcov)
-            Metrics.gcon_func!(gcov, gcon)
-            gcovs[i, j] = SMatrix(gcov)
-            gcons[i, j] = SMatrix(gcon)
-        end
-    end
+    data = build_data(t, fields..., Rhigh, model)
+    println("All primitives successfully loaded. Dimensions: ", size(data.RHO))
 
-    Threads.@threads for jk in CartesianIndices((model.N2, model.N3))
-        j, k = Tuple(jk)
-        for i in 1:(model.N1)
-            gcov = gcovs[i, j]
-            gcon = gcons[i, j]
-
-            Ufields = (data_array[1].U1, data_array[1].U2, data_array[1].U3)
-            UdotU = 0.0
-            for l in 1:(Constants.NDIM-1)
-                for m in 1:(Constants.NDIM-1)
-                    UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
-                end
-            end
-
-            ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
-            ucon = MVector{4,Float64}(undef)
-            ucon[1] = -ufac * gcon[1, 1]
-
-            for μ in 1:(Constants.NDIM-1)
-                ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
-            end
-
-            ucov = MVector{4,Float64}(undef)
-            Coordinates.flip_index!(ucov, ucon, gcov)
-            udotB = 0.0
-            Bfields = (data_array[1].B1, data_array[1].B2, data_array[1].B3)
-            for l in 1:(Constants.NDIM-1)
-                udotB += ucov[l+1] * Bfields[l][i, j, k]
-            end
-
-            bcon = MVector{4,Float64}(undef)
-            bcon[1] = udotB
-            for μ in 1:(Constants.NDIM-1)
-                bcon[μ+1] = (Bfields[μ][i, j, k] + ucon[μ+1] * udotB) / ucon[1]
-            end
-            bcov = MVector{4,Float64}(undef)
-            Coordinates.flip_index!(bcov, bcon, gcov)
-
-            bsq = 0.0
-            for l in 1:Constants.NDIM
-                bsq += bcov[l] * bcon[l]
-            end
-            data_array[1].b[i, j, k] = sqrt(bsq) * model.B_unit
-        end
-    end
-    init_physical_quantities(data_array, 1, model, Rhigh)
-
-    fields = [rho, uu, u1, u2, u3, b1, b2, b3]
-    if any(x -> x === nothing, fields)
-        @warn "Some primitives were missing in file '$filename'."
-    else
-        println("All primitives successfully loaded. Dimensions: ", size(rho))
-    end
-
-    if advance_path! !== nothing
-        advance_path!()
-    end
-    return data_array[1]
+    advance_path! === nothing || advance_path!()
+    return data
 end
 
 """

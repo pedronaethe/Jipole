@@ -2,6 +2,7 @@ using Jipole
 using StaticArrays
 using ProgressMeter
 using TOML
+using Printf
 if length(ARGS) != 1
     error("Usage: julia --project=. --threads=12 generate_image.jl path/to/config.toml")
 end
@@ -21,14 +22,15 @@ const slow_light = Jipole.Utils.get_config(config, "physical", "slow_light", fal
 m_unit_def = Jipole.Utils.get_config(config, "physical", "m_unit", "MAD")
 
 if m_unit_def == "MAD"
-    const M_unit = Jipole.Constants.M_UNIT_MAD
+    const M_unit_guess = Jipole.Constants.M_UNIT_MAD
 elseif m_unit_def == "SANE"
-    const M_unit = Jipole.Constants.M_UNIT_SANE
+    const M_unit_guess = Jipole.Constants.M_UNIT_SANE
 elseif m_unit_def isa Number
-    const M_unit = float(m_unit_def)
+    const M_unit_guess = float(m_unit_def)
 else
     error("m_unit par must be either 'MAD', 'SANE', or a numeric value, got: $m_unit_def")
 end
+
 
 # Dump parameters. Slow light requires dump_filepath to be a directory
 # (validated below) and derives its dump range from the
@@ -37,13 +39,12 @@ const dump_filepath = Jipole.Utils.get_config(config, "dump", "dump_filepath", "
 
 # t_init/t_final only mean anything when dump_filepath is a directory of dumps
 if isdir(dump_filepath)
-    const t_init = Jipole.Utils.get_config(config, "dump", "t_init", typemin(Int))
-    const t_final = Jipole.Utils.get_config(config, "dump", "t_final", typemax(Int))
+    const t_init = Jipole.Utils.get_config(config, "dump", "t_init", -Inf)
+    const t_final = Jipole.Utils.get_config(config, "dump", "t_final", Inf)
 else
-    const t_init = typemin(Int)
-    const t_final = typemax(Int)
+    const t_init = -Inf
+    const t_final = Inf
 end
-
 # Plasma parameters
 const Rhigh = Jipole.Utils.get_config(config, "plasma", "Rhigh", 20.0)
 const Rlow = Jipole.Utils.get_config(config, "plasma", "Rlow", 1.0)
@@ -90,6 +91,27 @@ const dump_files = Jipole.Utils.resolve_dump_files(dump_filepath, t_init, t_fina
 println("Found $(length(dump_files)) dump file(s).")
 
 
+const flux_fit = Jipole.Utils.get_config(config, "fit", "flux_fit", false)
+
+
+if flux_fit
+    const flux_value = Jipole.Utils.get_config(config, "fit", "flux_value", 0.5)
+    const fitting_res = Jipole.Utils.get_config(config, "fit", "fitting_res", 80)
+    const fit_amount = Jipole.Utils.get_config(config, "fit", "fit_amount", 100)
+    const fitting_tol = Jipole.Utils.get_config(config, "fit", "fitting_tol", 0.01)
+    const fit_save = Jipole.Utils.get_config(config, "fit", "fit_save", false)
+
+    # fit_amount dumps, equally spaced over the selected ones; all of them if there are fewer
+    const fit_files = dump_files[unique(round.(Int, range(1, length(dump_files); length=min(fit_amount, length(dump_files)))))]
+    # Fit images go to a "fit" folder next to the regular output, e.g. results/run/fit/
+    const fit_template = fit_save ? joinpath(dirname(output_filename), "fit", basename(output_filename)) : nothing
+    println("Fitting M_unit to a mean flux of $flux_value Jy over $(length(fit_files)) dump(s) at $(fitting_res)x$(fitting_res) pixels...")
+    const M_unit = Jipole.Fitting.fit_M_unit(fit_files, M_unit_guess, flux_value; res=fitting_res, tol=fitting_tol, save_template=fit_template)
+    @printf("Using fitted M_unit = %.6e g\n", M_unit)
+else
+    const M_unit = M_unit_guess
+end
+
 # Fast light branching
 if !slow_light
     const batched = length(dump_files) > 1
@@ -107,6 +129,7 @@ if !slow_light
 
     #Loop through every file in the directory chosen.
     for current_dump_filepath in dump_files
+        GC.gc()
         local model, simulation_data, Rh, DXsize, DYsize, fovx, fovy, Xcamera, p, scale_factor
         println("")
         println("Processing dump: $current_dump_filepath")

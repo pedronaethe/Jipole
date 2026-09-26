@@ -5,9 +5,93 @@ module Utils
 
 using StaticArrays
 using LinearAlgebra
+using HDF5
 using ..Constants
 
 export set_econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
+
+
+"""
+File extensions that hold dumps. Everything else in a dump directory (`.xdmf` descriptors,
+KHARMA restart files `.rhdf`, logs) is ignored.
+"""
+const DUMP_EXTENSIONS = (".h5", ".hdf5", ".phdf")
+
+"""
+    dump_time(filename)
+
+Simulation time of a dump: the `Info` attribute `Time` for KHARMA/Parthenon files, the `t`
+dataset for iharm3d files.
+"""
+function dump_time(filename::String)
+    return h5open(filename, "r") do file
+        haskey(file, "Info") ? Float64(read_attribute(file["Info"], "Time")) : Float64(read(file, "t"))
+    end
+end
+
+"""
+    first_dump_where(files, pred)
+
+Index of the first file in `files` whose dump time satisfies `pred`, or `length(files) + 1` if
+none does. `pred` must switch from false to true once as time grows, which holds because dump
+times increase with the dump number; that lets this binary search open only a few files.
+"""
+function first_dump_where(files, pred)
+    lo, hi = 1, length(files) + 1
+    while lo < hi
+        mid = (lo + hi) ÷ 2
+        if pred(dump_time(files[mid]))
+            hi = mid
+        else
+            lo = mid + 1
+        end
+    end
+    return lo
+end
+
+"""
+    resolve_dump_files(path, t_init, t_final)
+
+Turn dump_filepath into the ordered list of dump files to raytrace.
+
+- If `path` is a single file, that file is the whole list.
+- If `path` is a directory, its dump files (see [`DUMP_EXTENSIONS`](@ref)) with a numeric index
+  are sorted by that index, and those whose simulation time lies in `[t_init, t_final]` are
+  kept. If none does, the dump closest in time to `t_init` is used instead.
+"""
+function resolve_dump_files(path::String, t_init::Real, t_final::Real)
+    isfile(path) && return [path]
+
+    isdir(path) || error("dump_filepath '$path' is neither a file nor a directory")
+
+    indexed_files = Tuple{Int,String}[]
+    for entry in readdir(path; join=true)
+        isfile(entry) || continue
+        lowercase(splitext(entry)[2]) in DUMP_EXTENSIONS || continue
+        idx = extract_dump_index(basename(entry))
+        idx === nothing && continue
+        push!(indexed_files, (idx, entry))
+    end
+
+    isempty(indexed_files) && error("No dump files with a numeric index found in directory '$path'")
+
+    sort!(indexed_files; by=first)
+    files = last.(indexed_files)
+
+    first_in = first_dump_where(files, t -> t >= t_init)
+    last_in = first_dump_where(files, t -> t > t_final) - 1
+
+    if first_in > last_in
+        candidates = [i for i in (first_in - 1, first_in) if 1 <= i <= length(files)]
+        closest = candidates[argmin([abs(dump_time(files[i]) - t_init) for i in candidates])]
+        @warn "No dumps with simulation time between $t_init and $t_final. Using the closest one: $(files[closest]) (t = $(dump_time(files[closest])))"
+        return [files[closest]]
+    end
+
+    println("Using dumps number $(first_in) to $(last_in), with t = $(dump_time(files[first_in])) to $(dump_time(files[last_in]))")
+
+    return files[first_in:last_in]
+end
 
 """
     set_econ_from_trial(defdir, trial)
@@ -161,44 +245,6 @@ function extract_dump_index(filename::String)
     m = match(r"(\d+)(?=\.[^.\/]+$)", filename)
     m === nothing && return nothing
     return parse(Int, m.captures[1])
-end
-
-"""
-    resolve_dump_files(path, t_init, t_final)
-
-Turn dump_filepath into the ordered list of dump files to raytrace.
-
-- If `path` is a single file, that file is the whole list.
-- If `path` is a directory, every file in it is scanned and, it tracks which files are t_init and t_final. Files without a
-  parseable trailing index are skipped. If nothing falls in range, the
-  closest dump to t_init and t_final are used instead.
-"""
-function resolve_dump_files(path::String, t_init::Int, t_final::Int)
-    isfile(path) && return [path]
-
-    isdir(path) || error("dump_filepath '$path' is neither a file nor a directory")
-
-    indexed_files = Tuple{Int,String}[]
-    for entry in readdir(path; join=true)
-        isfile(entry) || continue
-        idx = extract_dump_index(basename(entry))
-        idx === nothing && continue
-        push!(indexed_files, (idx, entry))
-    end
-
-    isempty(indexed_files) && error("No dump files with a numeric index found in directory '$path'")
-
-    sort!(indexed_files; by=first)
-
-    selected = [file for (idx, file) in indexed_files if t_init <= idx <= t_final]
-
-    if isempty(selected)
-        closest_idx, closest_file = indexed_files[argmin([abs(idx - t_init) for (idx, _) in indexed_files])]
-        @warn "No dump files found with index between $t_init and $t_final. Using the closest match: $closest_file (index $closest_idx)"
-        return [closest_file]
-    end
-
-    return selected
 end
 
 """

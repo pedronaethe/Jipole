@@ -1,0 +1,42 @@
+[physical]
+MBH = 6.2e9
+slow_light = false
+m_unit = 3e26
+
+[dump]
+dump_filepath = "output/dump.h5"
+
+[plasma]
+Rhigh = 20.0
+Rlow = 1.0
+beta_crit = 1.0
+th_beg = 1.74e-2
+sigma_cut = 1.0
+sigma_cut_high = -1.0
+
+[camera]
+ro = 1000.0
+theta_o = 163.0
+phi = 0.0
+
+[image]
+pixels_x = 128
+pixels_y = 128
+fov_size = 160.0
+xoff = 0.0
+yoff = 0.0
+
+[observing]
+freq = 230e9
+source_distance_pc = 16.9e6
+
+[raytracing]
+maxnstep = 8000
+mode = "cpu"
+
+[fit]
+flux_fit = false
+
+[output]
+filename = "output/jipole.h5"
+format = "ipole"

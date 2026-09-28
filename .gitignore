@@ -38,3 +38,7 @@ scripts/*
 # Windows alternate data streams
 **/*:Zone.Identifier
 
+
+/test/ipole/
+/test/.cache/
+/test/*/output/

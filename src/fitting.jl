@@ -1,5 +1,8 @@
 module Fitting
 
+using Printf
+using ProgressMeter
+using StaticArrays
 
 """
     dump_flux(filepath, M_unit, res; save_template=nothing)

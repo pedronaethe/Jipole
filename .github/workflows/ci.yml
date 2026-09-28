@@ -2,13 +2,41 @@ name: CI
 
 on:
   push:
-    branches: [ master, main ]
-    pull_request:
-    workflow_dispatch:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
 
-env:
-  IPOLE_REPO: https://github.com/AFD-Illinois/ipole.git
-  IPOLE_REF: master           
-  DUMP_URL: https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/XZECPF #This is the MKS dump file (I should probably find the FMKS as well)
-  NPIX: 128
-  RCAM: 
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1.12'
+
+      - uses: julia-actions/cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: actions/cache@v4
+        with:
+          path: test/.cache/*.h5
+          key: test-inputs-${{ hashFiles('test/*/run.sh') }}
+
+      - name: Run tests
+        run: test/run_all.sh
+
+      - name: Upload test outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-outputs
+          path: |
+            test/*/output
+            !test/*/output/dump.h5

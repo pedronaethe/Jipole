@@ -187,6 +187,20 @@ function get_bk_angle(Kcon, Ucov, Bcon, Bcov)
     return acos(μ)
 end
 
+
+function segment_coeffs(ji, ki, jf, kf, dl)
+    javg = (ji + jf) / 2.0
+    kavg = (ki + kf) / 2.0
+    dtau = dl * kavg
+    if dtau < 1.e-3
+        g = dl * (1.0 - (dtau / 2.0) * (1.0 - dtau / 3.0))
+        return 1.0 - kavg * g, javg * g
+    else
+        efac = exp(-dtau)
+        return efac, (javg / kavg) * (1.0 - efac)
+    end
+end
+
 """
     approximate_solve(Ii, ji, ki, jf, kf, dl)
 

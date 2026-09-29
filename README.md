@@ -11,7 +11,7 @@ Jipole is an ipole-based Julia implementation designed to perform radiative tran
 
 ## Current Development Status
 
-The current version of Jipole is capable of producing images for Iharm3D file types. We also have implemented the test problems described in  **Section 3.2** of [Gold et al. 2020](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6) and thin disk model as described in the [Prather et al. 2023](http://iopscience.iop.org/article/10.3847/1538-4357/acc586).
+The current version of Jipole is capable of producing images for Iharm3D and KHARMA file types. We also have implemented the test problems described in  **Section 3.2** of [Gold et al. 2020](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6) and thin disk model as described in the [Prather et al. 2023](http://iopscience.iop.org/article/10.3847/1538-4357/acc586).
 
 The code is currently able to perform slow-light runs and has been compared with the well estabished code [Blacklight](https://github.com/c-white/blacklight) ([C. White. 2022](https://iopscience.iop.org/article/10.3847/1538-4365/ac77ef/meta)) and [ipole](https://github.com/moscibrodzka/ipole) ([Moscibrodzka & Gammie 2017](https://arxiv.org/abs/1712.03057)).
 
@@ -39,6 +39,57 @@ If this is your first time using Jipole, you'll need to set up the Julia environ
    ```
 
 This command will install all the packages specified in the `Project.toml` and `Manifest.toml` files.
+
+
+### Running Jipole from Terminal
+
+```bash
+julia --project=scripts --threads=32 scripts/main.jl scripts/pars/example_par.toml
+```
+
+- `--project=scripts` uses the scripts environment, which loads Jipole from this repository.
+- `--threads` sets the number of CPU threads used for raytracing.
+- The last argument is the parameter file.
+
+Every run is set up by a TOML parameter file (see `scripts/pars/example_par.toml`). Anything left out falls back to a default, and unknown entries print a warning. The sections are:
+
+| Section | What it sets |
+|---|---|
+| `[physical]` | Black hole mass `MBH` in solar masses, mass unit `m_unit` (`"MAD"`, `"SANE"` or a number in grams), `slow_light` switch |
+| `[dump]` | `dump_filepath`: a single dump or a directory of dumps (iharm3d `.h5` or KHARMA `.phdf`); `t_init`/`t_final` select dumps by simulation time when it is a directory |
+| `[plasma]` | Electron temperature model (`Rhigh`, `Rlow`, `beta_crit`), polar cut `th_beg`, magnetization cuts `sigma_cut`, `sigma_cut_high` |
+| `[camera]` | Observer distance `ro` in units of M, inclination `theta_o` and azimuth `phi` (degrees) |
+| `[image]` | Resolution `pixels_x`/`pixels_y`, field of view `fov_size` (µas), offsets `xoff`/`yoff` |
+| `[observing]` | Frequency `freq` (Hz), source distance `source_distance_pc` |
+| `[raytracing]` | Step limit per geodesic `maxnstep`, and `mode = "cpu"` or `"gpu"` |
+| `[output]` | Output `filename` and `format` (`"ipole"` writes ipole-compatible HDF5); with several dumps, the dump index is appended (`name_00945.h5`) |
+
+#### Gradients (`[gradient]`)
+
+With `on = true`, Jipole also computes the derivative of every pixel's intensity with respect to each parameter listed in `wrt`, using forward-mode automatic differentiation (ForwardDiff.jl). They are written next to the image as `grad/<parameter>`.
+
+Available parameters: `MBH`, `M_unit`, `Rhigh`, `Rlow`, `beta_crit`, `th_beg`, `sigma_cut`, `sigma_cut_high`, `ro`, `th`, `phi`, `sourceD`. Gradients currently require `mode = "cpu"` and `slow_light = false`.
+
+#### Flux fitting (`[fit]`)
+
+With `flux_fit = true`, Jipole first finds the `m_unit` for which the mean flux over the selected dumps equals `flux_value` (Jy), and then renders with it; `m_unit` is used as the starting guess.
+
+- The fit averages `fit_amount` evenly spaced dumps, rendered at a reduced resolution `fitting_res`, and stops when the mean flux is within `fitting_tol` of the target.
+- `fit_save = true` also keeps the fit images in `<output folder>/fit/`.
+
+#### Slow light (`[physical].slow_light`, `[slowlight]`)
+
+By default, each dump is imaged on its own (fast light). With `slow_light = true`, Jipole accounts for the light travel time through the evolving flow:
+
+- Every pixel's geodesic is traced once.
+- Radiative transfer is then integrated through a sliding window of three consecutive dumps as simulation time advances.
+- This produces one frame every `image_cadence` (GM/c³).
+
+`dump_filepath` must be a directory. `engine = "cpu"` or `"gpu"` selects where the transfer runs. Output goes to a `slow_sims` folder.
+
+#### GPU
+
+`mode = "gpu"` raytraces on an NVIDIA GPU through CUDA.jl, which is loaded only when requested. The first image includes a few seconds of kernel compilation, so the GPU pays off for large images or many dumps; for small images the multithreaded CPU is often faster.
 
 ### Jupyter Kernel Installation
 
@@ -134,7 +185,7 @@ Two standalone scripts complement the notebooks for command-line use, both under
 Raytraces one or more images from a single TOML configuration file. Every parameter Jipole accepts is read from that file, falling back to a documented default for anything left out. It will shout warnings if the parameter is not identified. `scripts/pars/example_par.toml` is an example.
 
 ```bash
-julia --project="." --threads=xx scripts/generate_image.jl scripts/pars/example_par.toml
+julia --project="." --threads=xx scripts/main.jl scripts/pars/example_par.toml
 ```
 
 What gets produced depends on `[dump].dump_filepath`:

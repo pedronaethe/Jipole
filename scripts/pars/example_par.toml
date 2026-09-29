@@ -44,8 +44,8 @@ theta_o = 30.0
 phi = 0.0
 
 [image]
-pixels_x = 400
-pixels_y = 400
+pixels_x = 2048
+pixels_y = 2048
 fov_size = 200.0
 xoff = 0.0
 yoff = 0.0

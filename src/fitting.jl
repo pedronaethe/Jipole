@@ -3,6 +3,7 @@ module Fitting
 using Printf
 using ProgressMeter
 using StaticArrays
+import ..Constants, ..Camera, ..Utils, ..Imaging, ..Iharm, ..Kharma, ..Output
 
 """
     dump_flux(filepath, M_unit, res; save_template=nothing)
@@ -12,27 +13,29 @@ run's camera, frequency and plasma parameters. Its output is silenced: the fit c
 hundreds of times. With `save_template`, the image is also written to that path, numbered
 with the dump index.
 """
-function dump_flux(filepath, M_unit, res; save_template=nothing)
+function dump_flux(filepath, M_unit, res, settings; save_template=nothing)
+    (; MBH, th_beg, Rlow, Rhigh, beta_crit, sigma_cut, sigma_cut_high, SourceD, fov_size,
+       ro, th, phi, freq, maxnstep, xoff, yoff, output_format) = settings
     return redirect_stdio(stdout=devnull, stderr=devnull) do
-        reader = Jipole.Kharma.is_kharma_dump(filepath) ? Jipole.Kharma : Jipole.Iharm
+        reader = Kharma.is_kharma_dump(filepath) ? Kharma : Iharm
         model = reader.read_header(filepath, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
         simulation_data = [reader.load_data(filepath, Rhigh, model)]
         Rh = 1 + sqrt(1.0 - model.a^2)
-        DXsize = SourceD / model.L_unit / Jipole.Constants.MUAS_PER_RAD * fov_size
+        DXsize = SourceD / model.L_unit / Constants.MUAS_PER_RAD * fov_size
         fov = DXsize / ro
-        image = Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, res, res, fov, fov, maxnstep, Rh, xoff, yoff)
-        scale = Jipole.Imaging.calculate_scale_factor(DXsize, DXsize, res, res, SourceD, model.L_unit)
+        image = Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, res, res, fov, fov, maxnstep, Rh, xoff, yoff)
+        scale = Imaging.calculate_scale_factor(DXsize, DXsize, res, res, SourceD, model.L_unit)
 
         if save_template !== nothing
-            Xcamera = MVector{4,Float64}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
+            Xcamera = MVector{4,Float64}(Camera.camera_position(ro, th, phi, model.a, model))
             output_data = Dict{String,Any}(
                 "image" => image, "img_time" => 0.0, "params" => model, "data" => simulation_data[1],
                 "ro" => ro, "theta_o" => th, "phi" => phi, "fovx" => fov, "fovy" => fov, "freq" => freq,
                 "SourceD" => SourceD, "scale" => scale, "Xcamera" => Xcamera, "Rhigh" => Rhigh,
             )
-            fit_output = Jipole.Utils.dump_output_filename(save_template, Jipole.Utils.extract_dump_index(basename(filepath)))
+            fit_output = Utils.dump_output_filename(save_template, Utils.extract_dump_index(basename(filepath)))
             mkpath(dirname(fit_output))
-            Jipole.Output.generate_output_file(fit_output, output_data; format=output_format)
+            Output.generate_output_file(fit_output, output_data; format=output_format)
         end
 
         sum(image) * scale
@@ -46,11 +49,11 @@ Average of [`dump_flux`](@ref) over `files`, freeing each dump before loading th
 the render loop below for why the empty threaded loop is needed). Shows a progress bar
 labelled `desc`.
 """
-function mean_flux(files, M_unit, res; save_template=nothing, desc="Flux fit")
+function mean_flux(files, M_unit, res, settings; save_template=nothing, desc="Flux fit")
     total = 0.0
     p = Progress(length(files); desc="$desc: ", showspeed=true, barlen=30)
     for (n, f) in enumerate(files)
-        total += dump_flux(f, M_unit, res; save_template=save_template)
+        total += dump_flux(f, M_unit, res, settings; save_template=save_template)
         Threads.@threads :greedy for _ in 1:Threads.nthreads()
         end
         GC.gc()
@@ -68,10 +71,10 @@ log(flux) against log(M_unit); each iteration is one pass over `files`. With
 `save_template`, every pass writes its images there, so the files left at the end are the
 ones at the returned M_unit.
 """
-function fit_M_unit(files, M_guess, target; res, tol, maxiter=10, save_template=nothing)
+function fit_M_unit(files, M_guess, target, settings; res, tol, maxiter=10, save_template=nothing)
     logM = [log(M_guess)]
     #Calculate the first mean flux
-    logF = [log(mean_flux(files, M_guess, res; save_template=save_template, desc=@sprintf("Flux fit pass 0 (M_unit = %.4e g)", M_guess)))]
+    logF = [log(mean_flux(files, M_guess, res, settings; save_template=save_template, desc=@sprintf("Flux fit pass 0 (M_unit = %.4e g)", M_guess)))]
     for iteration in 0:maxiter
        
         @printf("Flux fit %d: M_unit = %.6e g gives mean flux %.6g Jy (target %.6g Jy)\n", iteration, exp(logM[end]), exp(logF[end]), target)
@@ -85,7 +88,7 @@ function fit_M_unit(files, M_guess, target; res, tol, maxiter=10, save_template=
         # At most a factor 1000 in M_unit per step
         step = clamp((log(target) - logF[end]) / slope, -log(1000.0), log(1000.0))
         push!(logM, logM[end] + step)
-        push!(logF, log(mean_flux(files, exp(logM[end]), res; save_template=save_template,  desc=@sprintf("Flux fit pass %d (M_unit = %.4e g)", length(logM) - 1, exp(logM[end])))))
+        push!(logF, log(mean_flux(files, exp(logM[end]), res, settings; save_template=save_template,  desc=@sprintf("Flux fit pass %d (M_unit = %.4e g)", length(logM) - 1, exp(logM[end])))))
     end
     @warn "Flux fit did not reach $(100tol)% of $target Jy in $maxiter iterations; using M_unit = $(exp(logM[end]))"
     return exp(logM[end])

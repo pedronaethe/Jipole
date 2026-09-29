@@ -119,7 +119,10 @@ if flux_fit
     # Fit images go to a "fit" folder next to the regular output, e.g. results/run/fit/
     const fit_template = fit_save ? joinpath(dirname(output_filename), "fit", basename(output_filename)) : nothing
     println("Fitting M_unit to a mean flux of $flux_value Jy over $(length(fit_files)) dump(s) at $(fitting_res)x$(fitting_res) pixels...")
-    const M_unit = Jipole.Fitting.fit_M_unit(fit_files, M_unit_guess, flux_value; res=fitting_res, tol=fitting_tol, save_template=fit_template)
+     const fit_settings = (; MBH, th_beg, Rlow, Rhigh, beta_crit, sigma_cut, sigma_cut_high, SourceD, fov_size,
+                            ro, th, phi, freq, maxnstep, xoff, yoff, output_format)
+    const M_unit = Jipole.Fitting.fit_M_unit(fit_files, M_unit_guess, flux_value, fit_settings;
+                                             res=fitting_res, tol=fitting_tol, save_template=fit_template)
     @printf("Using fitted M_unit = %.6e g\n", M_unit)
 else
     const M_unit = M_unit_guess
@@ -182,8 +185,11 @@ if !slow_light
             gpu_sim_data = (Jipole.Utils_GPU.copy_iharm_to_gpu(simulation_data[1]),)
 
             println("Processing image in tiles...")
-            global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=256)
+            gpu_time = @elapsed begin
+                global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
+                    nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+            end
+            @printf("GPU raytracing took %.3f s\n", gpu_time)
             println("Raytracing complete!")
         end
 

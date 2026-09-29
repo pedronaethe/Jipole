@@ -126,6 +126,11 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     write(h5file, "unpol", image)
     write(h5file, "tau", tau)
     write(h5file, "pol", zeros(nx, ny, NIMG))
+    if haskey(data, "grads")
+        for (name, g) in pairs(data["grads"])
+            write(h5file, "grad/$(name)", Matrix{Float64}(g))
+        end
+    end
 
     write(h5file, "header/version", "Jipole-1.0")
     write(h5file, "header/githash", "unknown") # Jipole has no build-time githash yet

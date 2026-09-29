@@ -161,6 +161,16 @@ ensure_julia() {
     fi
 }
 
+run_jipole() {
+    local par="$1"
+    local log_file="output/$(basename "${par%.toml}").log"
+    $JULIA --project="$REPO_ROOT/scripts" --threads="$NPROC" "$REPO_ROOT/scripts/generate_image.jl" "$par" > "$log_file" 2>&1 || {
+        tail -20 "$log_file" >&2
+        log "Jipole failed on $par"
+        return 1
+    }
+}
+
 file_md5() {
     if command -v md5sum > /dev/null; then
         md5sum "$1" | cut -d' ' -f1

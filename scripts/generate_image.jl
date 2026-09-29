@@ -65,6 +65,7 @@ const fov_size = Jipole.Utils.get_config(config, "image", "fov_size", 160.0)
 const xoff = Jipole.Utils.get_config(config, "image", "xoff", 0.0)
 const yoff = Jipole.Utils.get_config(config, "image", "yoff", 0.0)
 
+
 # Observing parameters
 const freq = Jipole.Utils.get_config(config, "observing", "freq", 230e9)
 const source_distance_pc = Jipole.Utils.get_config(config, "observing", "source_distance_pc", 16.9e6)
@@ -72,6 +73,18 @@ const source_distance_pc = Jipole.Utils.get_config(config, "observing", "source_
 # Raytracing parameters
 const maxnstep = Jipole.Utils.get_config(config, "raytracing", "maxnstep", 25000)
 const mode = Jipole.Utils.get_config(config, "raytracing", "mode", "cpu")
+
+
+#check how to do gradients
+const do_gradients = Jipole.Utils.get_config(config, "gradient", "on", false)
+const gradient_wrt = Tuple(Symbol.(Jipole.Utils.get_config(config, "gradient", "wrt", String[])))
+if do_gradients
+    slow_light && error("Gradients are not supported in slow light mode.")
+    mode == "gpu" && error("Gradients are only implemented for mode = \"cpu\".")
+    isempty(gradient_wrt) && error("[gradient].wrt must list at least one parameter, e.g. wrt = [\"M_unit\"]")
+    unknown = setdiff(gradient_wrt, Jipole.Iharm.GRADIENT_PARAM_NAMES)
+    isempty(unknown) || error("Unknown gradient parameter(s) $(unknown); choose from $(Jipole.Iharm.GRADIENT_PARAM_NAMES)")
+end
 
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
@@ -154,7 +167,16 @@ if !slow_light
 
         #Again, we have to separate CPU and GPU here, as they have different memory management strategies and different execution paths.
         if mode == "cpu"
-            copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
+            if do_gradients
+                ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
+                grad_image, grads = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
+                    MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
+                    M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
+                    wrt=gradient_wrt);
+                copyto!(Image, grad_image)
+            else
+                copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
+            end
         else
             println("Copying simulation data grid to the GPU...")
             gpu_sim_data = (Jipole.Utils_GPU.copy_iharm_to_gpu(simulation_data[1]),)
@@ -218,6 +240,9 @@ if !slow_light
             "Xcamera" => Xcamera,
             "Rhigh" => Rhigh,
         )
+
+        #Add gradients to the output data if they were calculated.
+        do_gradients && (output_data["grads"] = grads)
 
 
         # Determine the output filename based on whether we are processing a batch of dumps or a single dump.

@@ -1,20 +1,16 @@
 [physical]
-MBH = 4.14e6
+MBH = 6.2e9
 # When true, dump_filepath below must be a directory: the whole
 # t_init..t_final range is used as the slow-light dump sequence (see
 # [slowlight]) instead of one image per dump.
 slow_light = false
 
 #it can be MAD/SANE or any float value
-m_unit = 2.679361e+17
+m_unit = 3e26
 
 [dump]
 # dump_filepath can point to a single dump file, or to a directory of dumps.
-dump_filepath = "/n/netscratch/narayan_lab/Lab/cprather_scratch/dumps/supermad/mad_beta10/dumps_kharma"
-
-#These parameters are only read when dump_filepath reads a directory with multiple dumps inside.
-t_init = 3000
-t_final = 6000
+dump_filepath = "output/dump.h5"
 
 # Only read when [physical].slow_light = true.
 [slowlight]
@@ -23,15 +19,14 @@ image_cadence = 10.0
 engine = "cpu"
 
 
-[gradients]
-# here, we set up the kind of gradients we want to calculate. 
-# options: Rhigh, m_unit, 
-on = false
-# any of: MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit, ro, th, phi, sourceD
-wrt = ["M_unit", "Rhigh"]
+[gradient]
+# here, we set up the kind of gradients we want to calculate.
+on = true
+# any of: MBH, Rhigh, Rlow, beta_crit, M_unit, ro, th, phi, sourceD
+wrt = ["M_unit", "Rhigh", "Rlow", "beta_crit", "ro", "th", "phi", "sourceD"]
 
 [plasma]
-Rhigh = 160.0
+Rhigh = 20.0
 Rlow = 1.0
 beta_crit = 1.0
 th_beg = 1.74e-2
@@ -40,19 +35,19 @@ sigma_cut_high = -1.0
 
 [camera]
 ro = 1000.0
-theta_o = 30.0
+theta_o = 163.0
 phi = 0.0
 
 [image]
-pixels_x = 400
-pixels_y = 400
-fov_size = 200.0
+pixels_x = 128
+pixels_y = 128
+fov_size = 160.0
 xoff = 0.0
 yoff = 0.0
 
 [observing]
 freq = 230e9
-source_distance_pc = 8.127e3
+source_distance_pc = 16.9e6
 
 [raytracing]
 maxnstep = 8000
@@ -61,7 +56,7 @@ maxnstep = 8000
 mode = "cpu"
 
 [fit]
-flux_fit = true
+flux_fit = false
 flux_value = 2.4     # target mean flux, Jy
 fitting_res = 80      # image resolution used during the fit
 fit_amount = 100      # number of evenly spaced dumps averaged (all of them if there are fewer)
@@ -71,5 +66,5 @@ fitting_tol = 0.03    # stop when the mean flux is within 3% of flux_value
 [output]
 #if the directory does not exist, it will create it.
 #with slowlight on, the results are saved in a slow_sims folder.
-filename = "results/mad_beta10/jipole_output.h5"
+filename = "output/ad.h5"
 format = "ipole"

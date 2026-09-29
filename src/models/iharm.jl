@@ -20,7 +20,7 @@ using ..MaxwellJuettner
 using ..Imaging
 
 export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data, jar_calc_ad,
-    compute_accretion_diagnostics, load_grmhd_context, calculate_gradients
+    compute_accretion_diagnostics, grmhd_context, calculate_gradients
 
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
 const USE_GEODESIC_SIGMACUT = true
@@ -1222,9 +1222,9 @@ function Camera.camera_position(cam_dist, cam_theta_angle, cam_phi_angle, bhspin
 end
 
 
-function load_grmhd_context(dump_filepath::String)
-    params0 = Iharm.read_header(dump_filepath, 1.0)
-    data0 = Iharm.load_data(dump_filepath, 1.0, params0) 
+# This is the same as load_grmhd_context, but we don't need to load the data from a file,
+# the file is already loaded in memory
+function grmhd_context(params0::IharmParams, data0::IharmData)
     b_normalized = data0.b ./ params0.B_unit
     return (; N1=params0.N1, N2=params0.N2, N3=params0.N3,
               dx=params0.dx, startx=params0.startx, stopx=params0.stopx,
@@ -1271,9 +1271,6 @@ function calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep, 
         MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit,
         ro, th, phi, sourceD, wrt::NTuple{N,Symbol}=()) where N
 
-    seed(val, sym) = sym in wrt ?
-        ForwardDiff.Dual{Nothing,Float64,N}(val, ntuple(i -> Float64(ctx_slot(wrt, sym) == i), N)) : val
-    ctx_slot(wrt, sym) = findfirst(==(sym), wrt)
     dualize(val, sym) = sym in wrt ? ForwardDiff.Dual{Nothing,Float64,N}(val, ForwardDiff.Partials(ntuple(i -> i == findfirst(==(sym), wrt) ? 1.0 : 0.0, N))) : val
 
     MBH_d, Rhigh_d, Rlow_d = dualize(MBH, :MBH), dualize(Rhigh, :Rhigh), dualize(Rlow, :Rlow)

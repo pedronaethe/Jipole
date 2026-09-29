@@ -23,7 +23,7 @@ image_cadence = 10.0
 engine = "cpu"
 
 
-[gradients]
+[gradient]
 # here, we set up the kind of gradients we want to calculate. 
 # options: Rhigh, m_unit, 
 on = false

@@ -11,14 +11,17 @@ Jipole is an ipole-based Julia implementation designed to perform radiative tran
 
 ## Current Development Status
 
-The current version of Jipole is capable of producing images for Iharm3D and KHARMA file types. We also have implemented the test problems described in  **Section 3.2** of [Gold et al. 2020](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6) and thin disk model as described in the [Prather et al. 2023](http://iopscience.iop.org/article/10.3847/1538-4357/acc586).
+The current version of Jipole is capable of producing images for Iharm3D and KHARMA file types. 
 
 The code is currently able to perform slow-light runs and has been compared with the well estabished code [Blacklight](https://github.com/c-white/blacklight) ([C. White. 2022](https://iopscience.iop.org/article/10.3847/1538-4365/ac77ef/meta)) and [ipole](https://github.com/moscibrodzka/ipole) ([Moscibrodzka & Gammie 2017](https://arxiv.org/abs/1712.03057)).
 
+We also have implemented the test problems described in  **Section 3.2** of [Gold et al. 2020](https://iopscience.iop.org/article/10.3847/1538-4357/ab96c6) and thin disk model as described in the [Prather et al. 2023](http://iopscience.iop.org/article/10.3847/1538-4357/acc586).
 
 ## Installation and Setup
 
 ### First-Time Setup
+
+We advise you to run Jipole on Julia 1.12+ 
 
 If this is your first time using Jipole, you'll need to set up the Julia environment and install the required dependencies:
 
@@ -63,6 +66,10 @@ Every run is set up by a TOML parameter file (see `scripts/pars/example_par.toml
 | `[observing]` | Frequency `freq` (Hz), source distance `source_distance_pc` |
 | `[raytracing]` | Step limit per geodesic `maxnstep`, and `mode = "cpu"` or `"gpu"` |
 | `[output]` | Output `filename` and `format` (`"ipole"` writes ipole-compatible HDF5); with several dumps, the dump index is appended (`name_00945.h5`) |
+
+
+#### Example GRMHD Dump
+You can download an example dump file in [dataverse](https://dataverse.harvard.edu/dataset.xhtml?persistentId=doi:10.7910/DVN/XZECPF).
 
 #### Gradients (`[gradient]`)
 
@@ -178,9 +185,9 @@ Computes the **final intensity map** for a GRMHD Iharm3D snapshot, performing **
 
 ## Script Overview
 
-Two standalone scripts complement the notebooks for command-line use, both under `scripts/`.
+A standalone scripts complement the notebooks for command-line use, under `scripts/`.
 
-### `generate_image.jl`
+### `main.jl`
 
 Raytraces one or more images from a single TOML configuration file. Every parameter Jipole accepts is read from that file, falling back to a documented default for anything left out. It will shout warnings if the parameter is not identified. `scripts/pars/example_par.toml` is an example.
 
@@ -193,15 +200,6 @@ What gets produced depends on `[dump].dump_filepath`:
 - A directory → one image per dump whose index falls in `[t_init, t_final]` (every dump in the directory, if left unset).
 
 Setting `[physical].slow_light = true` switches to time-dependent rendering instead: every pixel's geodesic is traced once, then radiative transfer is re-integrated as a sliding 3-dump window advances through simulation time, producing a movie (one frame per `[slowlight].image_cadence`). It still reads its dump sequence from `[dump]`, but requires `dump_filepath` to be a directory. Slow-light output currently goes to `../slow_sims/<timestamp>/`, not to `[output].filename`.
-
-### `plot_imgs.jl`
-
-Batch-plots every `.h5` image in a folder (as produced by `generate_image.jl`) into PNG heatmaps, saved to a `figs/` subfolder created alongside them. Files are plotted in parallel across threads.
-
-```bash
-julia --project="." --threads=xx scripts/plot_imgs.jl path/to/results_folder
-julia --project="." --threads=xx scripts/plot_imgs.jl path/to/results_folder vmin vmax   # fixed color scale across the whole batch
-```
 
 ## References
 

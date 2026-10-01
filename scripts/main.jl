@@ -4,7 +4,7 @@ using ProgressMeter
 using TOML
 using Printf
 if length(ARGS) != 1
-    error("Usage: julia --project=. --threads=12 generate_image.jl path/to/config.toml")
+    error("Usage: julia --project=. --threads=12 main.jl path/to/config.toml")
 end
 
 config_filepath = ARGS[1]
@@ -90,6 +90,11 @@ end
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
 const use_gpu = slow_light ? Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" : mode == "gpu"
+
+if do_gradients && use_gpu
+    println("Using GPU for gradient computations in this version has not been tested. This will land soon, for now, use CPU mode.")
+end
+
 if use_gpu
     using CUDA
 end

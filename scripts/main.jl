@@ -35,7 +35,8 @@ end
 # Dump parameters. Slow light requires dump_filepath to be a directory
 # (validated below) and derives its dump range from the
 # same t_init/t_final-filtered listing that fast light uses.
-const dump_filepath = Jipole.Utils.get_config(config, "dump", "dump_filepath", "")
+# expanduser is used to expand the ~ to the user's home directory
+const dump_filepath = expanduser(Jipole.Utils.get_config(config, "dump", "dump_filepath", ""))
 
 # t_init/t_final only mean anything when dump_filepath is a directory of dumps
 if isdir(dump_filepath)

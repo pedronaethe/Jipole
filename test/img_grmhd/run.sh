@@ -25,7 +25,7 @@ OMP_NUM_THREADS="${OMP_NUM_THREADS:-$NPROC}" "$IPOLE_BIN" -par ipole.par > outpu
 }
 
 log "Running Jipole"
-$JULIA --project="$REPO_ROOT/scripts" --threads="$NPROC" "$REPO_ROOT/scripts/generate_image.jl" jipole.toml > output/jipole.log 2>&1 || {
+$JULIA --project="$REPO_ROOT/scripts" --threads="$NPROC" "$REPO_ROOT/scripts/main.jl" jipole.toml > output/jipole.log 2>&1 || {
     tail -20 output/jipole.log >&2
     log "Jipole failed"
     exit 1

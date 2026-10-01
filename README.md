@@ -47,7 +47,7 @@ This command will install all the packages specified in the `Project.toml` and `
 ### Running Jipole from Terminal
 
 ```bash
-julia --project=scripts --threads=32 scripts/main.jl scripts/pars/example_par.toml
+julia --project="." --threads=32 scripts/main.jl scripts/pars/example_par.toml
 ```
 
 - `--project=scripts` uses the scripts environment, which loads Jipole from this repository.
@@ -182,24 +182,6 @@ Computes the **final intensity map** for a GRMHD Iharm3D snapshot, performing **
 - **Autodiff.ipynb**  
   Performs **differentiable ray tracing** to compute **derivatives of the image intensity** with respect to parameters like black hole spin (`a`) and observer inclination (`θ`). Uses the **conjugate gradient algorithm** to recover ground truth parameters from a computed intensity map, demonstrating **gradient-based parameter estimation**.
 
-
-## Script Overview
-
-A standalone scripts complement the notebooks for command-line use, under `scripts/`.
-
-### `main.jl`
-
-Raytraces one or more images from a single TOML configuration file. Every parameter Jipole accepts is read from that file, falling back to a documented default for anything left out. It will shout warnings if the parameter is not identified. `scripts/pars/example_par.toml` is an example.
-
-```bash
-julia --project="." --threads=xx scripts/main.jl scripts/pars/example_par.toml
-```
-
-What gets produced depends on `[dump].dump_filepath`:
-- A single file → one output image.
-- A directory → one image per dump whose index falls in `[t_init, t_final]` (every dump in the directory, if left unset).
-
-Setting `[physical].slow_light = true` switches to time-dependent rendering instead: every pixel's geodesic is traced once, then radiative transfer is re-integrated as a sliding 3-dump window advances through simulation time, producing a movie (one frame per `[slowlight].image_cadence`). It still reads its dump sequence from `[dump]`, but requires `dump_filepath` to be a directory. Slow-light output currently goes to `../slow_sims/<timestamp>/`, not to `[output].filename`.
 
 ## References
 

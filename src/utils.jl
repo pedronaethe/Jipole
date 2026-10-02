@@ -5,9 +5,93 @@ module Utils
 
 using StaticArrays
 using LinearAlgebra
+using HDF5
 using ..Constants
 
 export set_econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
+
+
+"""
+File extensions that hold dumps. Everything else in a dump directory (`.xdmf` descriptors,
+KHARMA restart files `.rhdf`, logs) is ignored.
+"""
+const DUMP_EXTENSIONS = (".h5", ".hdf5", ".phdf")
+
+"""
+    dump_time(filename)
+
+Simulation time of a dump: the `Info` attribute `Time` for KHARMA/Parthenon files, the `t`
+dataset for iharm3d files.
+"""
+function dump_time(filename::String)
+    return h5open(filename, "r") do file
+        haskey(file, "Info") ? Float64(read_attribute(file["Info"], "Time")) : Float64(read(file, "t"))
+    end
+end
+
+"""
+    first_dump_where(files, pred)
+
+Index of the first file in `files` whose dump time satisfies `pred`, or `length(files) + 1` if
+none does. `pred` must switch from false to true once as time grows, which holds because dump
+times increase with the dump number; that lets this binary search open only a few files.
+"""
+function first_dump_where(files, pred)
+    lo, hi = 1, length(files) + 1
+    while lo < hi
+        mid = (lo + hi) ÷ 2
+        if pred(dump_time(files[mid]))
+            hi = mid
+        else
+            lo = mid + 1
+        end
+    end
+    return lo
+end
+
+"""
+    resolve_dump_files(path, t_init, t_final)
+
+Turn dump_filepath into the ordered list of dump files to raytrace.
+
+- If `path` is a single file, that file is the whole list.
+- If `path` is a directory, its dump files (see [`DUMP_EXTENSIONS`](@ref)) with a numeric index
+  are sorted by that index, and those whose simulation time lies in `[t_init, t_final]` are
+  kept. If none does, the dump closest in time to `t_init` is used instead.
+"""
+function resolve_dump_files(path::String, t_init::Real, t_final::Real)
+    isfile(path) && return [path]
+
+    isdir(path) || error("dump_filepath '$path' is neither a file nor a directory")
+
+    indexed_files = Tuple{Int,String}[]
+    for entry in readdir(path; join=true)
+        isfile(entry) || continue
+        lowercase(splitext(entry)[2]) in DUMP_EXTENSIONS || continue
+        idx = extract_dump_index(basename(entry))
+        idx === nothing && continue
+        push!(indexed_files, (idx, entry))
+    end
+
+    isempty(indexed_files) && error("No dump files with a numeric index found in directory '$path'")
+
+    sort!(indexed_files; by=first)
+    files = last.(indexed_files)
+
+    first_in = first_dump_where(files, t -> t >= t_init)
+    last_in = first_dump_where(files, t -> t > t_final) - 1
+
+    if first_in > last_in
+        candidates = [i for i in (first_in - 1, first_in) if 1 <= i <= length(files)]
+        closest = candidates[argmin([abs(dump_time(files[i]) - t_init) for i in candidates])]
+        @warn "No dumps with simulation time between $t_init and $t_final. Using the closest one: $(files[closest]) (t = $(dump_time(files[closest])))"
+        return [files[closest]]
+    end
+
+    println("Using dumps number $(first_in) to $(last_in), with t = $(dump_time(files[first_in])) to $(dump_time(files[last_in]))")
+
+    return files[first_in:last_in]
+end
 
 """
     set_econ_from_trial(defdir, trial)
@@ -133,5 +217,63 @@ function check_handedness(Econ, Gcov)
     dot_var = g * det(Econ)
     return (0, dot_var)
 end
+
+
+
+"""
+    get_config(config, section, key, default)
+
+    Retrieve a configuration value from a nested dictionary, returning a default if the key is not found.
+"""
+
+function get_config(config::Dict, section::String, key::String, default)
+    if haskey(config, section) && haskey(config[section], key)
+        return config[section][key]
+    else
+        @warn "Parameter [$section].$key not found in configuration. Using default value: $default"
+        return default
+    end
+end
+
+"""
+    extract_dump_index(filename)
+
+Pull the run of digits that sits right before a dump file's extension. Returns `nothing` if the filename has
+no numeric field.
+"""
+function extract_dump_index(filename::String)
+    m = match(r"(\d+)(?=\.[^.\/]+$)", filename)
+    m === nothing && return nothing
+    return parse(Int, m.captures[1])
+end
+
+"""
+    dump_path_template(example_filepath)
+
+Turn one dump file's path into a format string for the whole
+sequence, by replacing its numeric field with the format
+`%0Nd` specifier of the same width. Used by slow-light rendering, which walks
+the sequence by index (see `Slowlight.update_dump_path`).
+"""
+function dump_path_template(example_filepath::String)
+    m = match(r"(\d+)(?=\.[^.\/]+$)", example_filepath)
+    m === nothing && error("Could not find a numeric dump index in '$example_filepath'")
+    width = length(m.match)
+    prefix = example_filepath[1:m.offset-1]
+    suffix = example_filepath[m.offset+width:end]
+    return prefix * "%0$(width)d" * suffix
+end
+
+"""
+    dump_output_filename(template, index)
+
+Insert the dump index into the output filename template. If `index` is `nothing`, returns the template unchanged.
+"""
+function dump_output_filename(template::String, index::Union{Int,Nothing})
+    index === nothing && return template
+    base, ext = splitext(template)
+    return "$(base)_$(lpad(index, 5, '0'))$(ext)"
+end
+
 
 end

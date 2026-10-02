@@ -13,44 +13,28 @@ using StaticArrays
 using ..Constants
 using ..Radiation
 using ..Iharm
-
-export OfImg, OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
+using ..Output
+using ..GeoTypes
+using ..Utils_GPU
+using Dates
+export OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
     process_slowlight_images!
 
-"""
-Per-pixel, per-frame accumulator used while rendering a slow-light movie.
-"""
-mutable struct OfImg
-    nstep::Int
-    Intensity::Float64
-    tau::Float64
-    tauF::Float64
-    N_coord::MMatrix{4,4,ComplexF64}
-end
 
 """
-    Base.zero(::Type{OfImg})
-
-Construct a zeroed [`OfImg`](@ref).
+    GPU functions defined in JipoleCUDAExt.jl
 """
-function Base.zero(::Type{OfImg})
-    OfImg(
-        0,
-        0.0,
-        0.0,
-        0.0,
-        MMatrix{4,4,ComplexF64}(zeros(ComplexF64, 4, 4))
-    )
-end
+function gpu_tile_plan end
+function render_round_gpu! end
 
 """
 Slow-light run state: which dump is currently loaded/being advanced to,
 and the time window `[tA, tB]` currently bracketed by `simulation_data`.
 """
 mutable struct OfSlowLight
-    dump_max::Int64
     nloaded::Int64
-    ImageCadence::Int64
+    dump_max::Int64
+    ImageCadence::Float64
     tA::Float64
     tB::Float64
     tf::Float64
@@ -101,7 +85,7 @@ function get_specific_dump_time(dump_idx::Int64, all_dumps_path::String)
 end
 
 """
-    update_data!(params_slowlight, simulation_data, trat_large, model, all_dumps_path)
+    update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)
 
 Slide the 3-snapshot window `simulation_data` forward by one dump,
 loading the next dump into the (reused) oldest slot.
@@ -110,11 +94,11 @@ loading the next dump into the (reused) oldest slot.
 - `params_slowlight`: Slow-light run state, updated with the new time
   window `[tA, tB]`.
 - `simulation_data`: 3-element window of loaded GRMHD snapshots.
-- `trat_large`: Electron/ion temperature ratio at high magnetization.
+- `Rhigh`: Electron/ion temperature ratio at high magnetization.
 - `model`: Iharm model parameters.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
 """
-function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large::Float64, model::Iharm.IharmParams, all_dumps_path::String)
+function update_data!(params_slowlight::OfSlowLight, simulation_data, Rhigh::Float64, model::Iharm.IharmParams, all_dumps_path::String)
     oldest_data = simulation_data[1]
 
     simulation_data[1] = simulation_data[2]
@@ -122,7 +106,7 @@ function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large
 
     simulation_data[3] = oldest_data
 
-    simulation_data[3] = Iharm.load_data(params_slowlight.current_dumps_path, trat_large, model;
+    simulation_data[3] = Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model;
         advance_path! = () -> (params_slowlight.current_dumps_path = update_dump_path(params_slowlight, all_dumps_path)))
 
     params_slowlight.tA = simulation_data[1].t
@@ -132,7 +116,192 @@ function update_data!(params_slowlight::OfSlowLight, simulation_data, trat_large
 end
 
 """
-    process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path)
+    render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times,
+        pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
+
+Render one round on the CPU: for every pixel and every currently-open
+frame in `valid_ks`, continue integrating intensity along that pixel's
+trajectory, threaded over pixels. Called from
+[`process_slowlight_images!`](@ref) when `engine = :CPU`.
+
+# Arguments
+- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
+  in place.
+- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten
+  in place.
+- `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per
+  pixel.
+- `valid_ks`: Indices of the currently-active frames to render this
+  round.
+- `target_times`: Target simulation time for each frame.
+- `pixels_x`, `pixels_y`: Image resolution.
+- `params_slowlight`: Slow-light run state (time window `[tA, tB]`).
+- `freq`: Frequency, in cgs units.
+- `model`: Iharm model parameters.
+- `simulation_data`: 3-element window of loaded GRMHD snapshots.
+"""
+function render_round_cpu!(
+    movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
+    params_slowlight::OfSlowLight, freq, model, simulation_data
+)
+    p = Progress(length(valid_ks) * pixels_x * pixels_y;
+        desc = "Rendering $(length(valid_ks)) frame(s) this round on CPU...", showspeed = true, barlen = 30)
+    progress_lock = ReentrantLock()
+
+    Threads.@threads :greedy for i in 1:pixels_x
+        for j in 1:pixels_y
+            traj = all_geodesics[i, j]
+            for k in valid_ks
+                nstep = movie_nstep[i, j, k]
+                Intensity = movie_intensity[i, j, k]
+                dt = target_times[k] + 1e-5
+
+                while (nstep > 2)
+                    Xi = traj[nstep].X
+                    Xf = traj[nstep-1].X
+                    Kconi = traj[nstep].Kcon
+                    Kconf = traj[nstep-1].Kcon
+
+                    Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
+                    Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
+                    if Xi[1] < params_slowlight.tA
+                        shift = params_slowlight.tA - Xi[1]
+                        Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
+                        Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
+                    end
+                    if Xi[1] >= params_slowlight.tB
+                        if Xf[1] >= params_slowlight.tf
+                            shift = params_slowlight.tf - Xf[1]
+                            Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
+                            Xf = SVector{4,Float64}(params_slowlight.tf, Xf[2], Xf[3], Xf[4])
+                        else
+                            break
+                        end
+                    end
+
+                    ji, ki = Radiation.get_jk(Xi, Kconi, freq, model.a, model, simulation_data)
+                    jf, kf = Radiation.get_jk(Xf, Kconf, freq, model.a, model, simulation_data)
+
+                    Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
+
+                    nstep -= 1
+                end
+                movie_nstep[i, j, k] = nstep
+                movie_intensity[i, j, k] = Intensity
+            end
+
+            lock(progress_lock) do
+                for _ in valid_ks
+                    ProgressMeter.next!(p)
+                end
+            end
+        end
+    end
+    finish!(p)
+    return nothing
+end
+
+"""
+    pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
+
+Each pixel's traced light ray has its own number of steps, so
+`all_geodesics` stores them as a list of differently-sized lists. The GPU
+instead needs one same-sized rectangular block. This function builds that
+block for one strip of the image (rows `j0` to `j1`): it copies each
+pixel's steps into `dest`, padding any leftover space with zeros for
+pixels whose ray was shorter than the longest one in the strip.
+
+Only one strip at a time, not the whole image, to keep memory use down --
+padding every pixel in the whole image to the single longest ray anywhere
+could need tens of GB. Called from [`render_round_gpu!`](@ref), once per
+strip per round.
+
+# Arguments
+- `dest`: Output buffer, overwritten with the packed trajectories.
+- `all_geodesics`: Matrix of per-pixel geodesic trajectories.
+- `nsteps`: Matrix of trajectory lengths, one per pixel.
+- `pixels_x`: Image width.
+- `j0`, `j1`: Range of image rows to pack.
+
+# Returns
+- `dest`.
+"""
+function pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
+    zero_vec = SVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
+    dummy = OfTrajGeneric{Float64}(0.0, zero_vec, zero_vec, zero_vec, zero_vec)
+    fill!(dest, dummy)
+    @inbounds for j in j0:j1, i in 1:pixels_x
+        traj = all_geodesics[i, j]
+        n = nsteps[i, j]
+        jj = j - j0 + 1
+        for s in 1:n
+            dest[i, jj, s] = traj[s]
+        end
+    end
+    return dest
+end
+
+"""
+    upload_gpu_snapshot(cpu_snapshot)
+
+Copy one CPU-resident GRMHD snapshot to the GPU. Small helper used by
+[`init_gpu_data`](@ref) and [`refresh_gpu_data!`](@ref).
+
+# Arguments
+- `cpu_snapshot`: GRMHD snapshot with `Array`-backed fields.
+
+# Returns
+- The same snapshot, with `CuArray`-backed fields.
+"""
+upload_gpu_snapshot(cpu_snapshot) = Utils_GPU.copy_iharm_to_gpu(cpu_snapshot)
+
+"""
+    init_gpu_data(simulation_data)
+
+Upload all 3 starting GRMHD snapshots to the GPU. Called once from
+[`process_slowlight_images!`](@ref) when a `:GPU` run starts; after that,
+[`refresh_gpu_data!`](@ref) takes over for each new round.
+
+# Arguments
+- `simulation_data`: 3-element window of loaded GRMHD snapshots.
+
+# Returns
+- 3-element `Vector` of GPU-resident snapshots.
+"""
+function init_gpu_data(simulation_data)
+    return [upload_gpu_snapshot(simulation_data[1]),
+            upload_gpu_snapshot(simulation_data[2]),
+            upload_gpu_snapshot(simulation_data[3])]
+end
+
+"""
+    refresh_gpu_data!(gpu_data, simulation_data)
+
+Keep the GPU's copy of the GRMHD snapshots in sync after
+[`update_data!`](@ref) slides the CPU-side window forward by one dump:
+slots 1 and 2 just get re-pointed at the snapshots already on the GPU,
+and only the genuinely new slot 3 is re-uploaded. Called from
+[`process_slowlight_images!`](@ref) after each `update_data!` call, when
+`engine = :GPU`.
+
+# Arguments
+- `gpu_data`: 3-element vector of GPU-resident snapshots, overwritten in
+  place.
+- `simulation_data`: 3-element window of loaded (CPU) GRMHD snapshots,
+  already advanced by [`update_data!`](@ref).
+
+# Returns
+- `gpu_data`.
+"""
+function refresh_gpu_data!(gpu_data, simulation_data)
+    gpu_data[1] = gpu_data[2]
+    gpu_data[2] = gpu_data[3]
+    gpu_data[3] = upload_gpu_snapshot(simulation_data[3])
+    return gpu_data
+end
+
+"""
+    process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path)
 
 Render a slow-light movie: repeatedly integrate the (already-traced)
 geodesics against the sliding GRMHD snapshot window, writing out one
@@ -151,24 +320,61 @@ allows, until every requested frame has been produced.
 - `tgeoi`: Newest simulation time needed by the active geodesics.
 - `pixels_x`, `pixels_y`: Image resolution.
 - `freq`: Frequency, in cgs units.
-- `trat_large`: Electron/ion temperature ratio at high magnetization.
+- `Rhigh`: Electron/ion temperature ratio at high magnetization.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
+- `Xcamera`: 4-vector camera position.
+- `ro`, `theta_o`, `phi`: Camera position in KS spherical coordinates.
+- `fovx`, `fovy`: Field of view, in radians.
+- `SourceD`: Source distance, in cgs units.
+- `scale`: Jy-per-pixel-intensity scale factor.
+- `engine`: `:CPU` (default) integrates radiative transfer threaded over
+  pixels on the CPU, exactly as before. `:GPU` runs the same physics on
+  the GPU instead ([`render_round_gpu!`](@ref)/[`slowlight_kernel!`](@ref)).
 """
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
-    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, trat_large, all_dumps_path
+    model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
+    engine::Symbol = :CPU
 )
+    if engine === :GPU && isnothing(Base.get_extension(parentmodule(@__MODULE__), :JipoleCUDAExt))
+        error("engine = :GPU needs CUDA.jl loaded: run `using CUDA` first")
+    end
+    base_dir = joinpath("..", "slow_sims")
+    
+    if !isdir(base_dir)
+        mkpath(base_dir)
+    end
+    
+
+    timestamp = Dates.format(now(), "yyyy-mm-dd-HH:MM:SS")
+    
+    output_dir = joinpath(base_dir, timestamp)
+    mkpath(output_dir)
+    println("Outputs will be saved to: $output_dir")
+
     last_img_target = params_slowlight.tA - tgeof
     nimgs_concurrently = round(Int, 2 + abs(t0) / params_slowlight.ImageCadence)
 
-    MovieArray = [zero(OfImg) for _ in 1:pixels_x, _ in 1:pixels_y, _ in 1:nimgs_concurrently]
+    movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
+    movie_intensity = zeros(Float64, pixels_x, pixels_y, nimgs_concurrently)
     target_times = zeros(Float64, nimgs_concurrently)
     valid_images = zeros(Float64, nimgs_concurrently)
 
     println("First Image will be produced at $last_img_target")
     nimg = 1
     nopenimgs = 1
-    output = "Image.%05d.txt"
+    output = "Image.%07.1f.h5"
+
+    max_nstep = 0
+    tile_height = pixels_y
+    gpu_data = nothing
+    if engine === :GPU
+        println("Preparing GPU workspace...")
+        max_nstep = maximum(nsteps)
+        tile_height = gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+        gpu_data = init_gpu_data(simulation_data)
+        println("GPU tiling: $(cld(pixels_y, tile_height)) tile(s) of height $tile_height (image is $(pixels_x)x$(pixels_y), up to $max_nstep steps/pixel)")
+    end
 
     while true
         while (last_img_target + t0 < params_slowlight.tB)
@@ -178,10 +384,8 @@ function process_slowlight_images!(
                 nopenimgs += 1
                 for i in 1:pixels_x
                     for j in 1:pixels_y
-                        MovieArray[i, j, nimg].nstep = nsteps[i, j]
-                        MovieArray[i, j, nimg].Intensity = 0.0
-                        MovieArray[i, j, nimg].tau = 0.0
-                        MovieArray[i, j, nimg].tauF = 0.0
+                        movie_nstep[i, j, nimg] = nsteps[i, j]
+                        movie_intensity[i, j, nimg] = 0.0
                     end
                 end
                 nimg += 1
@@ -193,69 +397,47 @@ function process_slowlight_images!(
         end
 
         valid_ks = [k for k in 1:nimgs_concurrently if valid_images[k] == 1]
-        p = Progress(length(valid_ks) * pixels_x * pixels_y;
-            desc = "Rendering $(length(valid_ks)) frame(s) this round...", showspeed = true, barlen = 30)
-        progress_lock = ReentrantLock()
+
+        elapsed = @elapsed if engine === :CPU
+            render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
+                params_slowlight, freq, model, simulation_data)
+        else
+            render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks,
+                nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
+        end
+        println("Round rendered in $(round(elapsed, digits=3))s on $engine")
+
+        # do_output is derived from movie_nstep's final state, so it's identical
+        # regardless of which engine produced that state.
         do_output = trues(nimgs_concurrently)
-
-        Threads.@threads :greedy for i in 1:pixels_x
-            for j in 1:pixels_y
-                traj = all_geodesics[i, j]
-                for k in valid_ks
-                    nstep = MovieArray[i, j, k].nstep
-                    dt = target_times[k] + 1e-5
-
-                    while (nstep > 2)
-                        Xi = traj[nstep].X
-                        Xf = traj[nstep-1].X
-                        Kconi = traj[nstep].Kcon
-                        Kconf = traj[nstep-1].Kcon
-
-                        Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
-                        Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
-                        if Xi[1] < params_slowlight.tA
-                            shift = params_slowlight.tA - Xi[1]
-                            Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
-                            Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
-                        end
-                        if Xi[1] >= params_slowlight.tB
-                            if Xf[1] >= params_slowlight.tf
-                                shift = params_slowlight.tf - Xf[1]
-                                Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
-                                Xf = SVector{4,Float64}(params_slowlight.tf, Xf[2], Xf[3], Xf[4])
-                            else
-                                break
-                            end
-                        end
-
-                        ji, ki = Radiation.get_jk(Xi, Kconi, freq, model.a, model, simulation_data)
-                        jf, kf = Radiation.get_jk(Xf, Kconf, freq, model.a, model, simulation_data)
-
-                        MovieArray[i, j, k].Intensity = Radiation.approximate_solve(MovieArray[i, j, k].Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
-
-                        nstep -= 1
-                    end
-                    MovieArray[i, j, k].nstep = nstep
-                    if nstep != 2
-                        do_output[k] = false
-                    end
-                end
-
-                lock(progress_lock) do
-                    for _ in valid_ks
-                        ProgressMeter.next!(p)
-                    end
-                end
+        for k in valid_ks
+            if !all(==(2), @view movie_nstep[:, :, k])
+                do_output[k] = false
             end
         end
-        finish!(p)
 
         for k in valid_ks
             if do_output[k]
-                Image_out = map(x -> x.Intensity, MovieArray[:, :, k]) .* freq^3
+                Image_out = movie_intensity[:, :, k] .* freq^3
 
-                file_name = Printf.format(Printf.Format(output), target_times[k])
-                writedlm(file_name, Image_out)
+                file_name = joinpath(output_dir, Printf.format(Printf.Format(output), target_times[k]))
+                out_data = Dict{String, Any}(
+                    "image"      => Image_out,
+                    "img_time"   => target_times[k],
+                    "params"     => model,                
+                    "data"       => simulation_data[1],   
+                    "ro"         => ro,           
+                    "theta_o"    => theta_o,       
+                    "phi"        => phi,         
+                    "fovx"       => fovx,           
+                    "fovy"       => fovy,           
+                    "freq"       => freq,                 
+                    "SourceD"    => SourceD,        
+                    "scale"      => scale,          
+                    "Xcamera"    => Xcamera,        
+                    "Rhigh" => Rhigh            
+                )
+                Output.generate_output_file(file_name, out_data; format="ipole")
                 println("Saving image $(file_name)")
 
                 valid_images[k] = 0
@@ -266,7 +448,10 @@ function process_slowlight_images!(
         if nopenimgs <= 1
             break
         end
-        update_data!(params_slowlight, simulation_data, trat_large, model, all_dumps_path)
+        update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)
+        if engine === :GPU
+            refresh_gpu_data!(gpu_data, simulation_data)
+        end
     end
 end
 

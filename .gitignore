@@ -1,4 +1,6 @@
 /output/pixel*
+
+/results
 src/models/iharm3dDumps/sample_dump_SANE_a+0.94_MKS_0900.h5
 scripts/*
 .CondaPkg
@@ -12,16 +14,23 @@ scripts/*
 !License.txt
 /example_notebooks/*
 
-#except for the following notebooks: Autodiff_GRMHD.ipynb Autodiff.ipynb ComputeGeodesics.ipynb GenerateImageGRMHD.ipynb Generateimages.ipynb
-!example_notebooks/Autodiff_GRMHD.ipynb
-!example_notebooks/Autodiff.ipynb
-!example_notebooks/ComputeGeodesics.ipynb
-!example_notebooks/GenerateImageGRMHD.ipynb
-!example_notebooks/GenerateImages.ipynb
-!example_notebooks/SlowLightGRMHD.ipynb
+#except for the following notebooks: 
+!example_notebooks/calculate_gradients.ipynb
+!example_notebooks/generate_image_GRMHD.ipynb
+!example_notebooks/generate_images_analytics.ipynb
+!example_notebooks/slowlight_GRMHD.ipynb
 !scripts/run_slowlight.jl
 # Generated figures
 *.png
+
+
+#scripts
+!scripts/generate_image.jl
+!scripts/pars/
+!scripts/pars/example_par.toml
+
+!scripts/Project.toml
+!scripts/Manifest.toml
 
 # Jupyter noise
 **/.ipynb_checkpoints/
@@ -29,3 +38,7 @@ scripts/*
 # Windows alternate data streams
 **/*:Zone.Identifier
 
+
+/test/ipole/
+/test/.cache/
+/test/*/output/

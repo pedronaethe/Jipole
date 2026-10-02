@@ -8,7 +8,50 @@ using LinearAlgebra
 using ..Coordinates
 using ..Metrics
 
-export x_to_ijk_ghost, x_in_domain, ijk_to_x, interp_scalar, interp_scalar_time, gdet_zone
+export x_to_ijk_ghost, x_in_domain, ijk_to_x, interp_scalar, interp_scalar_time, gdet_zone, ZoneLoc, locate
+
+
+"""
+    ZoneLoc{T}
+
+A struct representing the location and interpolation weights for a position `X`
+within the GRMHD simulation grid. It contains the 1-based zone indices `(i, j, k)`,
+the fractional offsets `(del2, del3, del4)` within the zone, the interpolation
+weights `(b1, b2)`, and a boolean flag `in_domain` indicating whether `X` is
+within the grid bounds.
+"""
+struct ZoneLoc{T}
+    i::Int; j::Int; k::Int
+    del2::T; del3::T; del4::T
+    b1::T; b2::T
+    in_domain::Bool
+end
+
+
+"""
+    locate(X, model)
+
+Locate the grid zone and interpolation weights for the position `X` on
+`model`'s simulation grid.
+
+# Arguments
+- `X`: Position four-vector in internal coordinates.
+- `model`: Model parameters, providing the grid geometry.
+
+# Returns
+- A `ZoneLoc` struct containing the zone indices, interpolation weights, and a flag indicating if `X` is within the grid bounds.
+
+"""
+
+@inline function locate(X, model)
+    if x_in_domain(X, model) == 0
+        z = zero(eltype(X))
+        return ZoneLoc(0, 0, 0, z, z, z, z, z, false)
+    end
+    i, j, k, del2, del3, del4 = x_to_ijk_ghost(X, model)
+    return ZoneLoc(i, j, k, del2, del3, del4, 1.0 - del2, 1.0 - del3, true)
+end
+
 
 """
     x_to_ijk_ghost(X, model)
@@ -94,46 +137,31 @@ function ijk_to_x(i, j, k, X, model)
 end
 
 """
-    interp_scalar(X, data, model)
+    interp_scalar(data_arr, zone::ZoneLoc)
 
 Quadrilinearly interpolate the scalar field `data` at the position `X`.
 
 # Arguments
-- `X`: Position four-vector in internal coordinates.
-- `data`: Scalar field defined on `model`'s simulation grid.
-- `model`: Model parameters, providing the grid geometry.
+- `data_arr`: Scalar field defined on `model`'s simulation grid.
+- `zone`: A `ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
 
 # Returns
 - The interpolated scalar value.
 """
-function interp_scalar(X, data, model)
-    i, j, k, del2, del3, del4 = x_to_ijk_ghost(X, model)
-
-    (N1_data, N2_data, N3_data) = size(data)
-
-    ip1 = i + 1
-    jp1 = j + 1
-
-    kp1 = k + 1
-    if kp1 > N3_data
-        kp1 = 1
-    end
-
-    b1 = 1.0 - del2
-    b2 = 1.0 - del3
-
-    interp = data[i, j, k] * b1 * b2 +
-             data[ip1, j, k] * del2 * b2 +
-             data[i, jp1, k] * b1 * del3 +
-             data[ip1, jp1, k] * del2 * del3
-
-    interp = interp * (1.0 - del4) + (
-                 data[i, j, kp1] * b1 * b2 +
-                 data[ip1, j, kp1] * del2 * b2 +
-                 data[i, jp1, kp1] * b1 * del3 +
-                 data[ip1, jp1, kp1] * del2 * del3
-             ) * del4
-
+@inline function interp_scalar(data_arr, zone::ZoneLoc)
+    N3_data = size(data_arr, 3)
+    ip1 = zone.i + 1; jp1 = zone.j + 1
+    kp1 = zone.k + 1 > N3_data ? 1 : zone.k + 1
+    @inbounds interp = data_arr[zone.i, zone.j, zone.k] * zone.b1 * zone.b2 +
+                        data_arr[ip1, zone.j, zone.k] * zone.del2 * zone.b2 +
+                        data_arr[zone.i, jp1, zone.k] * zone.b1 * zone.del3 +
+                        data_arr[ip1, jp1, zone.k] * zone.del2 * zone.del3
+    @inbounds interp = interp * (1.0 - zone.del4) + (
+        data_arr[zone.i, zone.j, kp1] * zone.b1 * zone.b2 +
+        data_arr[ip1, zone.j, kp1] * zone.del2 * zone.b2 +
+        data_arr[zone.i, jp1, kp1] * zone.b1 * zone.del3 +
+        data_arr[ip1, jp1, kp1] * zone.del2 * zone.del3
+    ) * zone.del4
     return interp
 end
 
@@ -155,11 +183,11 @@ set) linearly in time between the `dataA` and `dataB` snapshots.
 # Returns
 - The interpolated scalar value.
 """
-function interp_scalar_time(X, dataA, dataB, tfac, slow_light::Bool, model)
-    vA = interp_scalar(X, dataA, model)
+function interp_scalar_time(zone::ZoneLoc, dataA, dataB, tfac, slow_light::Bool)
+    vA = interp_scalar(dataA, zone)
     if slow_light
-        vB = interp_scalar(X, dataB, model)
-        return (tfac) * vA + (1.0 - tfac) * vB
+        vB = interp_scalar(dataB, zone)
+        return tfac * vA + (1.0 - tfac) * vB
     end
     return vA
 end

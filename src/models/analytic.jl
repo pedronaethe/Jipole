@@ -31,8 +31,8 @@ Parameters for the [`Analytic`](@ref) torus emission model.
 - `RHO_unit`, `U_unit`, `B_unit`: Density/internal-energy/magnetic-field
   units (g/cm^3, erg/cm^3, Gauss).
 """
-struct AnalyticParams <: AbstractModel
-    a::Float64
+struct AnalyticParams{T} <: AbstractModel
+    a::T
     Rout::Float64
     cstartx::MVector{4,Float64}
     cstopx::MVector{4,Float64}
@@ -47,10 +47,11 @@ struct AnalyticParams <: AbstractModel
     RHO_unit::Float64
     U_unit::Float64
     B_unit::Float64
+    rmax_geo::T
 end
 
 """
-    AnalyticParams(bhspin, Rout, cstartx, cstopx, MBH; A=1.e6, α=-0.0, height=100.0/3.0, l0=1.0, RHO_unit=3.e-18)
+    AnalyticParams(bhspin, Rout, cstartx, cstopx, rmax_geo, MBH; A=1.e6, α=-0.0, height=100.0/3.0, l0=1.0, RHO_unit=3.e-18)
 
 Construct [`AnalyticParams`](@ref), deriving the length/time/density units
 from the black hole mass `MBH`.
@@ -66,13 +67,13 @@ from the black hole mass `MBH`.
 - `l0`: Normalization of the specific angular momentum profile.
 - `RHO_unit`: Density unit, in g/cm^3.
 """
-function AnalyticParams(bhspin, Rout, cstartx, cstopx, MBH; A=1.e6, α=-0.0, height=100.0 / 3.0, l0=1.0, RHO_unit=3.e-18)
+function AnalyticParams(bhspin, Rout, cstartx, cstopx, rmax_geo, MBH; A=1.e6, α=-0.0, height=100.0 / 3.0, l0=1.0, RHO_unit=3.e-18)
     L_unit = Constants.GNEWT * MBH * Constants.MSUN / Constants.CL^2
     T_unit = L_unit / Constants.CL
     U_unit = RHO_unit * Constants.CL^2
     B_unit = Constants.CL * sqrt(4 * π * RHO_unit)
     return AnalyticParams(bhspin, Rout, MVector{4,Float64}(cstartx), MVector{4,Float64}(cstopx),
-        Metrics.METRIC_MKS, 1.0, A, α, height, l0, L_unit, T_unit, RHO_unit, U_unit, B_unit)
+        Metrics.METRIC_MKS, 1.0, A, α, height, l0, L_unit, T_unit, RHO_unit, U_unit, B_unit, rmax_geo)
 end
 
 """

@@ -40,6 +40,7 @@ struct ThinDiskParams <: AbstractModel
     T0::Float64
     L_unit::Float64
     T_unit::Float64
+    rmax_geo::Float64
 end
 
 """
@@ -57,7 +58,7 @@ mass accretion rate `Mdot`.
 - `Mdot`: Mass accretion rate, in g/s.
 - `f`: Spectral hardening factor.
 """
-function ThinDiskParams(bhspin, Rout, cstartx, cstopx, MBH, Mdot; f=1.8)
+function ThinDiskParams(bhspin, Rout, cstartx, cstopx, MBH, Mdot, Rstop; f=1.8)
     L_unit = Constants.GNEWT * MBH * Constants.MSUN / Constants.CL^2
     T_unit = L_unit / Constants.CL
 
@@ -67,7 +68,7 @@ function ThinDiskParams(bhspin, Rout, cstartx, cstopx, MBH, Mdot; f=1.8)
     T0 = (3.0 / (8.0) / π * Constants.GNEWT * MBH * Constants.MSUN * Mdot / L_unit^3 / Constants.SIG)^(1.0 / 4.0)
 
     return ThinDiskParams(bhspin, Rout, MVector{4,Float64}(cstartx), MVector{4,Float64}(cstopx),
-        Metrics.METRIC_MKS, 1.0, f, r_isco, T0, L_unit, T_unit)
+        Metrics.METRIC_MKS, 1.0, f, r_isco, T0, L_unit, T_unit, Rstop)
 end
 
 """
@@ -396,13 +397,13 @@ integral: `Image[I, J]` is set to the surface intensity of the last
 disk-midplane crossing found along the trajectory (`data` is unused by
 this model).
 """
-function Radiation.integrate_emission!(traj::Vector{OfTrajS}, nsteps::Int, Image::Matrix{Float64}, I::Int, J::Int, freq::Float64, bhspin::Float64, model::ThinDiskParams, data=nothing)
-    Xi = MVector{4,Float64}(undef)
-    Kconi = MVector{4,Float64}(undef)
-    Xf = MVector{4,Float64}(undef)
-    Rh::Float64 = 1 + sqrt(1.0 - bhspin * bhspin)
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing) where {T}
+    Xi = MVector{4,T}(undef)
+    Kconi = MVector{4,T}(undef)
+    Xf = MVector{4,T}(undef)
+    Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
-    Intensity = 0.0
+    Intensity = zero(T)
     for nstep = nsteps:-1:2
         for k in 1:Constants.NDIM
             Xi[k] = traj[nstep].X[k]

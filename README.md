@@ -98,6 +98,18 @@ By default, each dump is imaged on its own (fast light). With `slow_light = true
 
 `mode = "gpu"` raytraces on an NVIDIA GPU through CUDA.jl, which is loaded only when requested. The first image includes a few seconds of kernel compilation, so the GPU pays off for large images or many dumps; for small images the multithreaded CPU is often faster.
 
+### Plotting
+
+There is a plotting script provided in `scripts/` folder. If the path is a directory, the script will plot all the output `h5` files inside it, if it is just a single file, this one single file will be plotted.
+
+The script can be executed from terminal following:
+
+```bash
+julia --project=. scripts/plot.jl path/to/folder
+```
+
+The script will be added to a folder called `Figs` within the path specified.
+
 ### Jupyter Kernel Installation
 
 To use Jipole with Jupyter notebooks, install the project-specific kernel:
@@ -139,7 +151,7 @@ From there, the same calls (`Jipole.Camera.camera_position(...)`, `Jipole.Geodes
 see `example_notebooks/GenerateImages.ipynb` for the analytic/thin-disk models side by side, and
 `example_notebooks/GenerateImageGRMHD.ipynb` for the GRMHD model.
 
-## Running Jipole
+## Running Jipole in a Jupyter Notebook
 
 ### Starting the Environment
 

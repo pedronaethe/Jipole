@@ -16,7 +16,7 @@ using ..Constants
 using ..Imaging
 using ..Polarization
 
-export raytrace_image_pol, polarization_summary, output_stokes_parameters_pol
+export raytrace_image_pol, render_image_gpu_pol!, polarization_summary, output_stokes_parameters_pol
 
 """
     raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y,
@@ -51,6 +51,15 @@ function raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x,
                                    fovx, fovy, maxnstep, Rh, xoff, yoff)
     return Image, pol
 end
+
+"""
+    render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny; kwargs...)
+
+GPU counterpart of [`raytrace_image_pol`](@ref), the polarized analogue of
+`Imaging.render_image_gpu!`. The method lives in the CUDA extension
+(`ext/polarized_kernel.jl`) and exists once `CUDA` is loaded.
+"""
+function render_image_gpu_pol! end
 
 """
     polarization_summary(pol, scale_factor)

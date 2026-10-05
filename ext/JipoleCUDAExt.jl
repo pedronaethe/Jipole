@@ -450,4 +450,8 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
     CUDA.unsafe_free!(d_traj)
     return nmaxstep
 end
+
+# Polarized imaging (Stokes Q, U, V): kernel and launcher.
+include("polarized_kernel.jl")
+
 end

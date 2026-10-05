@@ -210,8 +210,14 @@ if !slow_light
 
             println("Processing image in tiles...")
             gpu_time = @elapsed begin
-                global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                    nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                if do_polarization
+                    pol = zeros(Float64, Jipole.Polarization.NIMG, pixels_x, pixels_y)
+                    global gpu_maxnstep = Jipole.ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
+                        nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                else
+                    global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
+                        nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                end
             end
             @printf("GPU raytracing took %.3f s\n", gpu_time)
             println("Raytracing complete!")

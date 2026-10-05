@@ -77,6 +77,14 @@ With `on = true`, Jipole also computes the derivative of every pixel's intensity
 
 Available parameters: `MBH`, `M_unit`, `Rhigh`, `Rlow`, `beta_crit`, `th_beg`, `sigma_cut`, `sigma_cut_high`, `ro`, `th`, `phi`, `sourceD`. Gradients currently require `mode = "cpu"` and `slow_light = false`.
 
+#### Polarization (`[polarization]`)
+
+With `on = true`, Jipole also computes Stokes Q, U, V and the Faraday depth of every pixel, as ipole does without `-unpol`: the coherency tensor is parallel-transported along each geodesic and evolved with thermal synchrotron emission, absorption and Faraday rotation and conversion. The output file then holds them in `pol` (Stokes I, Q, U, V in CGS intensity, then the Faraday depth), next to the unpolarized image `unpol`; Q and U follow the IAU convention (EVPA East of North).
+
+- The section is optional; leaving it out is the same as `on = false`.
+- It works with `mode = "cpu"` and with `[gradient]`, which then also writes the derivatives of `pol` as `grad_pol/<parameter>`. It does not work with slow light.
+- `mode = "gpu"` is implemented but has not been run on a GPU yet.
+
 #### Flux fitting (`[fit]`)
 
 With `flux_fit = true`, Jipole first finds the `m_unit` for which the mean flux over the selected dumps equals `flux_value` (Jy), and then renders with it; `m_unit` is used as the starting guess.

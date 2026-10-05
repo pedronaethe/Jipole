@@ -30,6 +30,13 @@ on = false
 # any of: MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit, ro, th, phi, sourceD
 wrt = ["M_unit", "Rhigh"]
 
+[polarization]
+# Polarized transfer: also compute Stokes Q, U, V and the Faraday depth, as ipole does without
+# -unpol. The output file then holds them in "pol", next to the unpolarized image "unpol".
+# Works with mode = "cpu" (also with [gradient]) and mode = "gpu"; not with slow light.
+# This whole section is optional: leaving it out is the same as on = false.
+on = false
+
 [plasma]
 Rhigh = 160.0
 Rlow = 1.0

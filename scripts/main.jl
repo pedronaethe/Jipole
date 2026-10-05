@@ -87,6 +87,13 @@ if do_gradients
     isempty(unknown) || error("Unknown gradient parameter(s) $(unknown); choose from $(Jipole.Iharm.GRADIENT_PARAM_NAMES)")
 end
 
+# Polarized transfer (Stokes Q, U, V and Faraday depth). The [polarization] section is optional:
+# without it the run is unpolarized, exactly as before.
+const do_polarization = get(get(config, "polarization", Dict{String,Any}()), "on", false)
+if do_polarization
+    slow_light && error("Polarization is not supported in slow light mode.")
+end
+
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
 const use_gpu = slow_light ? Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" : mode == "gpu"
@@ -153,6 +160,7 @@ if !slow_light
     for current_dump_filepath in dump_files
         GC.gc()
         local model, simulation_data, Rh, DXsize, DYsize, fovx, fovy, Xcamera, p, scale_factor
+        local pol, grads_pol
         println("")
         println("Processing dump: $current_dump_filepath")
 
@@ -176,13 +184,23 @@ if !slow_light
 
         #Again, we have to separate CPU and GPU here, as they have different memory management strategies and different execution paths.
         if mode == "cpu"
-            if do_gradients
+            if do_gradients && do_polarization
+                ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
+                grad_image, pol, grads, grads_pol = Jipole.IharmPol.calculate_gradients_pol(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
+                    MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
+                    M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
+                    wrt=gradient_wrt);
+                copyto!(Image, grad_image)
+            elseif do_gradients
                 ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
                 grad_image, grads = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
                     MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
                     M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
                     wrt=gradient_wrt);
                 copyto!(Image, grad_image)
+            elseif do_polarization
+                unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff)
+                copyto!(Image, unpol_image)
             else
                 copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
             end
@@ -208,6 +226,7 @@ if !slow_light
         (stokes_output_rd, stokes_output_wr) = redirect_stdout()
         try
             Jipole.Imaging.output_stokes_parameters(Image, freq, scale_factor, pixels_x, pixels_y, SourceD)
+            do_polarization && Jipole.ImagingPol.output_stokes_parameters_pol(pol, freq, scale_factor, SourceD)
         finally
             redirect_stdout(original_stdout)
         end
@@ -255,6 +274,10 @@ if !slow_light
 
         #Add gradients to the output data if they were calculated.
         do_gradients && (output_data["grads"] = grads)
+
+        #Add the polarized image, and its gradients, if they were calculated.
+        do_polarization && (output_data["pol"] = pol)
+        do_polarization && do_gradients && (output_data["grads_pol"] = grads_pol)
 
 
         # Determine the output filename based on whether we are processing a batch of dumps or a single dump.

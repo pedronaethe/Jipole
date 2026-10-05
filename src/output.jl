@@ -103,8 +103,12 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
 
     Ftot_unpol = sum(image) * scale
     nuLnu_unpol = 4π * Ftot_unpol * SourceD^2 * Constants.JY * freq
-    Ftot = 0.0    
-    nuLnu = 0.0
+    # Polarized image (Stokes I, Q, U, V and Faraday depth), present only if the caller ran
+    # polarized transfer (ImagingPol.raytrace_image_pol). It is stored as (NIMG, nx, ny).
+    has_pol = haskey(data, "pol")
+    pol = has_pol ? data["pol"] : zeros(nx, ny, NIMG)
+    Ftot = has_pol ? sum(@view pol[1, :, :]) * scale : 0.0
+    nuLnu = 4π * Ftot * SourceD^2 * Constants.JY * freq
 
     fov_to_d = SourceD / params.L_unit / Constants.MUAS_PER_RAD
     DXsize = fovx * ro
@@ -125,10 +129,15 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     write(h5file, "Ladv", Ladv)
     write(h5file, "unpol", image)
     write(h5file, "tau", tau)
-    write(h5file, "pol", zeros(nx, ny, NIMG))
+    write(h5file, "pol", pol)
     if haskey(data, "grads")
         for (name, g) in pairs(data["grads"])
             write(h5file, "grad/$(name)", Matrix{Float64}(g))
+        end
+    end
+    if haskey(data, "grads_pol")
+        for (name, g) in pairs(data["grads_pol"])
+            write(h5file, "grad_pol/$(name)", Array{Float64,3}(g))
         end
     end
 

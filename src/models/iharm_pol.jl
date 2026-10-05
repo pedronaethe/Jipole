@@ -13,6 +13,7 @@ using ForwardDiff
 using ..Constants
 using ..Grid
 using ..Radiation
+using ..MaxwellJuettnerPol: primal
 using ..Polarization
 using ..Imaging
 using ..ImagingPol
@@ -54,7 +55,7 @@ the Leung et al. fit; it could be rewritten on top of this function.)
         eltype(data[1].b), eltype(data[1].θe), typeof(zone.del2))
     z = zero(T)
 
-    if !(Ne > 0)
+    if !(primal(Ne) > 0)
         return (Ne=z, nu=z, θe=z, B=z, θ=z, Ucon=Ucon, Ucov=Ucov, Bcon=Bcon, Bcov=Bcov)
     end
 

@@ -39,6 +39,9 @@ Every per-step routine is a pure function of immutable values (`SVector`,
 `SMatrix`, tuples): it does not allocate, does not print or throw on its code
 path, and contains no dynamic dispatch. This is what lets the same code run
 inside the CPU pixel loop, inside a GPU kernel, and under `ForwardDiff`.
+
+Branches are decided on `primal` values (see `MaxwellJuettnerPol.primal`), so
+that a run on dual numbers follows the same code path as a run on plain numbers.
 """
 module Polarization
 
@@ -237,7 +240,7 @@ equation, `dS/dλ = ρ × S` for `S = (Q, U, V)`, over a path `x` with constant
 """
 @inline function rotate_stokes(SQ, SU, SV, rQ, rU, rV, x)
     rho2 = rQ * rQ + rU * rU + rV * rV
-    if rho2 > CUT_PREVENT_NAN
+    if primal(rho2) > CUT_PREVENT_NAN
         rho = sqrt(rho2)
         rdS = rQ * SQ + rU * SU + rV * SV
         c = cos(rho * x)
@@ -285,7 +288,7 @@ fractional polarization of the emissivity.
     aI, aQ, aU, aV = c.aI, c.aQ, c.aU, c.aV
 
     aP2 = aQ * aQ + aU * aU + aV * aV
-    if aP2 > CUT_PREVENT_NAN
+    if primal(aP2) > CUT_PREVENT_NAN
         aP = sqrt(aP2)
         tauP = aP * x
         tauI = aI * x
@@ -315,15 +318,15 @@ fractional polarization of the emissivity.
         afacm = 1 - efacm
         afac = 1 - efac
         afacp = 1 - efacp
-        if tauI - tauP <= CUT_SMALL_OPTICAL_DEPTH
+        if primal(tauI - tauP) <= CUT_SMALL_OPTICAL_DEPTH
             e = tauI - tauP
             afacm = e * (1 - (e / 2) * (1 - e / 3))
 
-            if tauI <= CUT_SMALL_OPTICAL_DEPTH
+            if primal(tauI) <= CUT_SMALL_OPTICAL_DEPTH
                 e = tauI
                 afac = e * (1 - (e / 2) * (1 - e / 3))
 
-                if tauI + tauP <= CUT_SMALL_OPTICAL_DEPTH
+                if primal(tauI + tauP) <= CUT_SMALL_OPTICAL_DEPTH
                     e = tauI + tauP
                     afacp = e * (1 - (e / 2) * (1 - e / 3))
                 end
@@ -422,14 +425,13 @@ infinite derivative there), so it contributes no derivative under AD.
 
     # Don't emit where there are no electrons. A non-positive frequency cannot occur
     # for a future-directed photon; it is excluded so the fits never see it.
-    if !(Ne > 0) || !(ν > 0)
+    if !(primal(Ne) > 0) || !(primal(ν) > 0)
         return zero(PolCoeffs{T})
     end
 
     # No emission/absorption along field lines, but keep Faraday rotation.
-    if θ <= 0 || θ >= Float64(π)
-        p = MaxwellJuettnerPol._primal
-        rV = MaxwellJuettnerPol.maxwell_juettner_rho_v_dexter(p(Ne), p(ν), p(θe), p(B), p(θ)) * p(ν)
+    if primal(θ) <= 0 || primal(θ) >= Float64(π)
+        rV = MaxwellJuettnerPol.maxwell_juettner_rho_v_dexter(primal(Ne), primal(ν), primal(θe), primal(B), primal(θ)) * primal(ν)
         return PolCoeffs{T}(z, z, z, z, z, z, z, z, z, z, T(rV))
     end
 
@@ -444,8 +446,8 @@ infinite derivative there), so it contributes no derivative under AD.
 
     # Transport does not like 100% polarization.
     jP2 = jQ * jQ + jU * jU + jV * jV
-    jP = jP2 > 0 ? sqrt(jP2) : zero(jP2)
-    if jI < jP / MAX_POL_FRAC_E
+    jP = primal(jP2) > 0 ? sqrt(jP2) : zero(jP2)
+    if primal(jI) < primal(jP) / MAX_POL_FRAC_E
         pol_frac_e = jI / jP * MAX_POL_FRAC_E
         jQ *= pol_frac_e
         jU *= pol_frac_e
@@ -454,7 +456,7 @@ infinite derivative there), so it contributes no derivative under AD.
 
     # ABSORPTIVITIES from Kirchhoff's law. Already invariant, and aI > aP by construction.
     Bnuinv = Radiation.bnu_inv(ν, θe)
-    if Bnuinv > 0
+    if primal(Bnuinv) > 0
         aI = jI / Bnuinv
         aQ = jQ / Bnuinv
         aU = jU / Bnuinv
@@ -572,7 +574,7 @@ end point `Xf` and held constant over the step:
     # Guess B if we absolutely must (e.g. outside the simulation domain), so that
     # the tetrad is still defined.
     bsq = Bcon[1] * Bcov[1] + Bcon[2] * Bcov[2] + Bcon[3] * Bcov[3] + Bcon[4] * Bcov[4]
-    if bsq <= 0
+    if primal(bsq) <= 0
         o = one(eltype(Bcon))
         Bcon = typeof(Bcon)(zero(o), o, o, o)
     end

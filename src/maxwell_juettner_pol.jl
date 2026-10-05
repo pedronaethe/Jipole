@@ -34,7 +34,7 @@ using ForwardDiff
 using ..Constants
 using ..MaxwellJuettner
 
-export dexter_shape_function_q, dexter_shape_function_v, maxwell_juettner_dexter_iqv,
+export primal, dexter_shape_function_q, dexter_shape_function_v, maxwell_juettner_dexter_iqv,
     bessel_k_ratios, maxwell_juettner_rho_q, maxwell_juettner_rho_v, maxwell_juettner_rho_v_dexter
 
 """
@@ -113,12 +113,19 @@ convention"). `Polarization.thermal_jar` flips it to the tetrad convention.
 end
 
 """
-    _primal(x)
+    primal(x)
 
-Strip every level of `ForwardDiff.Dual` from `x`, returning the plain number.
+The plain number carried by `x`: `x` itself, or the value of a `ForwardDiff.Dual`
+with every level of partials stripped.
+
+Used for every branch decision in the polarized code (`if primal(x) > 0 ...`).
+ForwardDiff (since version 1) orders dual numbers by value and then by partials,
+so on an exact tie, typically a quantity that underflowed to zero, `x > 0` can be
+true for a dual whose value is `0.0`. Comparing primal values makes the
+differentiated code take exactly the branches the plain code takes.
 """
-@inline _primal(x::Real) = x
-@inline _primal(x::ForwardDiff.Dual) = _primal(ForwardDiff.value(x))
+@inline primal(x::Real) = x
+@inline primal(x::ForwardDiff.Dual) = primal(ForwardDiff.value(x))
 
 """
     _bessel_k_ratios_flag(z)
@@ -179,7 +186,7 @@ end
     zv = ForwardDiff.value(z)
     # Recurse on the value, so that nested duals are handled too.
     r0, r1 = bessel_k_ratios(zv)
-    _, _, regular = _bessel_k_ratios_flag(_primal(zv))
+    _, _, regular = _bessel_k_ratios_flag(primal(zv))
     dz = ForwardDiff.partials(z)
     if regular
         dr0 = -r1 + r0 * r1 + 2.0 * r0 / zv
@@ -203,7 +210,7 @@ dual numbers with `NaN`.
 @inline function _faraday_x(θe, B, θ, ν)
     omega0 = Constants.EE * B / (Constants.ME * Constants.CL)
     arg = sqrt(2.0) * sin(θ) * (1.e3 * omega0 / (2.0 * π * ν))
-    x = arg > 0 ? θe * sqrt(arg) : zero(θe * arg)
+    x = primal(arg) > 0 ? θe * sqrt(arg) : zero(θe * arg)
     return x, omega0
 end
 

@@ -45,7 +45,7 @@ def read_ipole(path):
         scale = _scale(f)
         unpol = f["unpol"][()].T * scale
         pol = f["pol"][()].transpose(1, 0, 2).copy()
-        header = {k: f["header/" + k][()] for k in HEADER_KEYS if "header/" + k in f}
+        header = {k: f["header/" + k][()] for k in HEADER_KEYS + EXTRA_KEYS if "header/" + k in f}
     pol[..., :4] *= scale
     return unpol, pol, header
 
@@ -55,7 +55,7 @@ def read_jipole(path):
         scale = _scale(f)
         unpol = f["unpol"][()] * scale
         pol = f["pol"][()].copy()
-        header = {k: f["header/" + k][()] for k in HEADER_KEYS if "header/" + k in f}
+        header = {k: f["header/" + k][()] for k in HEADER_KEYS + EXTRA_KEYS if "header/" + k in f}
     pol[..., :4] *= scale
     return unpol, pol, header
 
@@ -63,6 +63,8 @@ def read_jipole(path):
 HEADER_KEYS = ["camera/nx", "camera/ny", "camera/thetacam", "camera/phicam", "camera/rcam",
                "camera/fovx_dsource", "units/M_unit", "electrons/rhigh", "electrons/rlow",
                "electrons/beta_crit", "sigma_cut", "freqcgs", "dsource"]
+# Read when present, but not part of the settings comparison.
+EXTRA_KEYS = ["camera/dx", "camera/dy"]
 
 
 def headers_match(header_j, header_i, keys=HEADER_KEYS):

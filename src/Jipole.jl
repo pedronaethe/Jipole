@@ -34,6 +34,7 @@ include("models/thin_disk.jl")
 include("models/iharm.jl")
 include("models/kharma.jl")
 include("models/thin_disk_pol.jl")
+include("models/iharm_pol.jl")
 
 include("output.jl")
 include("fitting.jl")

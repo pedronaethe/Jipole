@@ -99,7 +99,8 @@ the frequency.
 function trace_ray(model, Xcam, fov, Rh)
     zero4 = zero(SVector{4,Float64})
     X = Xcam
-    K = Jipole.Geodesics.init_kcon(0, 0, Xcam, 2, 2, fov, fov, model.a, model)
+    _, Econ, _ = Jipole.Tetrads.make_camera_tetrad(Xcam, model.a, model)
+    K = Jipole.Geodesics.init_kcon(0, 0, Econ, 2, 2, fov, fov)
     traj = [Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, X, K, X, K)]
     while !(X[2] < Rh + 0.0001 || (X[2] > model.rmax_geo && K[2] < 0.0))
         dl = Jipole.Geodesics.stepsize(X, K, zero4, zero4)

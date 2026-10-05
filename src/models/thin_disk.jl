@@ -165,7 +165,7 @@ function thindisk_vals(r::Float64, bhspin::Float64, model::ThinDiskParams)
     b = 1.0 - 3.0 / r + 2.0 * bhspin / r^(3 / 2)
     kc = krolikc(r, bhspin, model)
     d = r * r - 2.0 * r + bhspin * bhspin
-    lc = (model.r_isco * model.r_isco - 2.0 * bhspin * sqrt(model.r_isco) + bhspin * bhspin) / (sqrt(model.r_isco) - 2.0 * sqrt(model.r_isco) + bhspin)
+    lc = (model.r_isco * model.r_isco - 2.0 * bhspin * sqrt(model.r_isco) + bhspin * bhspin) / ((model.r_isco)^(1.5) - 2.0 * sqrt(model.r_isco) + bhspin)
     hc = (2.0 * r - bhspin * lc) / d
     ar = (r * r + bhspin * bhspin)^2 - bhspin * bhspin * d * sin(π / 2.0)^2
     om = 2.0 * bhspin * r / ar

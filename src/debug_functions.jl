@@ -20,7 +20,7 @@ Print a labeled 4-vector, one component per line.
 - `name`: Label to print above the vector.
 - `vec`: The 4-vector to print.
 """
-function print_vector(name::String, vec::MVector{4,Float64})
+function print_vector(name::String, vec)
     println("Vector: $name")
     for i in eachindex(vec)
         print("$(vec[i]) ")

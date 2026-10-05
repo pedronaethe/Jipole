@@ -1,5 +1,6 @@
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 Jipole = "2347fae0-cb17-4e37-b3ba-1e469be55413"
 ProgressMeter = "92933f4c-e287-5a05-a399-4b506db050ca"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"

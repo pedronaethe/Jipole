@@ -14,12 +14,13 @@ using ..AbstractModels
 using ..Coordinates
 using ..Metrics
 using ..Camera
+using ..MaxwellJuettnerPol
 using ..Grid
 using ..Radiation
 using ..MaxwellJuettner
 using ..Imaging
 
-export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data, jar_calc_ad,
+export IharmParams, IharmParamsBuilder, IharmData, read_header, load_data,
     compute_accretion_diagnostics, grmhd_context, calculate_gradients
 
 const VALID_PRIMS = ["RHO", "UU", "U1", "U2", "U3", "B1", "B2", "B3"]
@@ -38,7 +39,7 @@ primitives (`RHO`/`UU`/`U1`-`U3`/`B1`-`B3`, loaded directly from the dump
 and always `Float64`-valued. This means `Array{Float64,3}` on the CPU,
 `CuArray{Float64,3}` on the GPU via [`Utils_GPU.copy_iharm_to_gpu`](@ref)),
 and `Ader` for the derived electron/magnetic-field quantities
-(`ne`/`b`/`θe`/`sigma`/`beta`/`dθedRhi`). These are independent so that a
+(`ne`/`b`/`θe`/`sigma`/`beta`). These are independent so that a
 `ForwardDiff.Dual`-valued M_unit/Rhigh (see
 [`build_dual_params_and_data`](@ref)) only needs to promote the derived
 quantities. The raw primitives, which are M_unit/Rhigh-
@@ -411,7 +412,10 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
 
         metric_name_str = read(header, "metric")
 
-        if startswith(metric_name_str, "MKS")
+        if startswith(metric_name_str, "MKS3")
+            params.metric = Metrics.METRIC_MKS3
+            cstopx_2 = 1.0
+        elseif startswith(metric_name_str, "MKS")
             params.metric = Metrics.METRIC_MKS
             cstopx_2 = 1.0
         elseif startswith(metric_name_str, "BHAC_MKS")
@@ -419,9 +423,6 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
             cstopx_2 = π
         elseif startswith(metric_name_str, "MMKS") || startswith(metric_name_str, "FMKS")
             params.metric = Metrics.METRIC_FMKS
-            cstopx_2 = 1.0
-        elseif startswith(metric_name_str, "MKS3")
-            params.metric = Metrics.METRIC_MKS3
             cstopx_2 = 1.0
         elseif startswith(metric_name_str, "EKS")
             params.metric = Metrics.METRIC_EKS
@@ -715,7 +716,7 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2)
             dθe_unit_dRhi = -θe_factor * game_minus_1 / ((game_minus_1 * trat + gamp_minus_1)^2) * dtratdRhi
             dθe_dRhi = dθe_unit_dRhi * uu_ijk / rho_ijk
 
-            if θe_val > 1.0e-3
+            if MaxwellJuettnerPol.primal(θe_val) > 1.0e-3
                 θe_arr[i, j, k] = θe_val
                 dθedRhi[i, j, k] = dθe_dRhi
             else
@@ -723,8 +724,8 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2)
                 dθedRhi[i, j, k] = 0.0
             end
 
-            sigma_arr[i, j, k] = sigma_m > Constants.SMALL ? sigma_m : Constants.SMALL
-            beta_arr[i, j, k] = beta_m > Constants.SMALL ? beta_m : Constants.SMALL
+            sigma_arr[i, j, k] = MaxwellJuettnerPol.primal(sigma_m) > Constants.SMALL ? sigma_m : Constants.SMALL
+            beta_arr[i, j, k] = MaxwellJuettnerPol.primal(beta_m) > Constants.SMALL ? beta_m : Constants.SMALL
         end
     end
 end
@@ -751,7 +752,7 @@ function set_tinterp_ns(X, model::IharmParams, data)
     if model.slow_light
         nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
         dataA, dataB = data[nA], data[nB]
-        tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
+        tinterp = clamp(1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t), 0.0, 1.0)
         return dataA, dataB, tinterp
     else
         return data[1], data[1], 0.0
@@ -832,7 +833,7 @@ function get_sigma_smoothfac(sigma, model::IharmParams)
     if sigma < model.sigma_cut
         return one(T)
     end
-    if sigma > sigma_above
+    if sigma >= sigma_above
         return zero(T)
     end
     dsig = sigma_above - model.sigma_cut
@@ -862,7 +863,7 @@ geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
     sigma_smoothfac = one(T)
     if USE_GEODESIC_SIGMACUT
         sigma = get_model_sigma(zone, X, model, data)
-        sigma > model.sigma_cut && return zero(T)
+        MaxwellJuettnerPol.primal(sigma) > model.sigma_cut && return zero(T)
         sigma_smoothfac = get_sigma_smoothfac(sigma, model)
     end
     dataA, dataB, tfac = set_tinterp_ns(X, model, data)
@@ -1029,7 +1030,7 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
     zone = Grid.locate(X, model)
     Ne = get_model_ne(zone, X, model, data)
     z_base = zero(typeof(Ne))
-    if Ne == 0.0
+    if MaxwellJuettnerPol.primal(Ne) == 0.0
         return (z_base, z_base, z_base, z_base)
     end
 
@@ -1042,7 +1043,7 @@ function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)
     b = get_model_b(zone, X, model, data)
 
     θe = get_model_thetae(zone, X, model, data)
-    if θ <= zero(elT) || θ >= elT(π)
+    if MaxwellJuettnerPol.primal(θ) <= zero(elT) || MaxwellJuettnerPol.primal(θ) >= elT(π)
         return (z_base, z_base, z_base, z_base)
     end
 
@@ -1078,46 +1079,12 @@ end
 
 
 """
-    jar_calc_ad(X, Kcon, bhspin, model, data)
-
-Variant of [`jar_calc`](@ref) with no `Val{B}` branch, for use when `X`/`Kcon`
-are already `ForwardDiff.Dual` (the θo-sensitivity embedding used by
-[`Autodiff.calculate_gradients`](@ref)). Keeping this separate from `jar_calc`
-avoids GPU-compiling `jar_calc`'s nested-derivative `Val{true}` branch for the
-Dual-X specialization, which is otherwise fatal to compile.
-"""
-@inline function jar_calc_ad(X, Kcon, bhspin, model::IharmParams, data)
-    #TODO (PNM): We need to erradicate this function.
-    zone = Grid.locate(X, model)
-    Ne = get_model_ne(zone, X, model, data)
-    z_base = zero(typeof(Ne))
-    if Ne == 0.0
-        return (z_base, z_base)
-    end
-    elT = promote_type(eltype(X), typeof(bhspin))
-    Ucon, Ucov, Bcon, Bcov = get_model_fourv(zone, X, Kcon, bhspin, model, data)
-    nu = Radiation.get_fluid_nu(Kcon, Ucov)
-    nusq = nu * nu
-    θ = Radiation.get_bk_angle(Kcon, Ucov, Bcon, Bcov)
-    b = get_model_b(zone, X, model, data)
-    θe = get_model_thetae(zone, X, model, data)
-    if θ <= zero(elT) || θ >= elT(π)
-        return (z_base, z_base)
-    end
-    j = MaxwellJuettner.maxwell_juettner_leung_i(Ne, nu, θe, b, θ) / nusq
-    Bnuinv = Radiation.bnu_inv(nu, θe)
-    z_jk = zero(typeof(j))
-    k = (Bnuinv > 0) ? j / Bnuinv : z_jk
-    return (j, k)
-end
-
-"""
     Radiation.get_jk(X, Kcon, freq, bhspin, model::IharmParams, data, derivative_calculation=Val(false))
 
 Compute the emissivity and absorption coefficient of the GRMHD model
 (delegates to [`jar_calc`](@ref)).
 """
-function Radiation.get_jk(X, Kcon, freq::Float64, bhspin, model::IharmParams, data, derivative_calculation::Val{B}=Val(false)) where {B}
+function Radiation.get_jk(X, Kcon, freq, bhspin, model::IharmParams, data, derivative_calculation::Val{B}=Val(false)) where {B}
     return jar_calc(X, Kcon, bhspin, model, data, derivative_calculation)
 end
 

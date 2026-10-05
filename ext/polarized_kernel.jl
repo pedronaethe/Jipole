@@ -49,7 +49,7 @@ kept.
 end
 
 """
-    calculate_image_pol!(traj, d_Image, d_pol, d_truncated, ro, θo, phi, bhspin, nx, ny, nmaxstep,
+    calculate_image_pol!(traj, d_Image, d_pol, d_truncated, Xcam, Econ, Ecov, bhspin, nx, ny, nmaxstep,
         i_global, j_global, i_local, j_local, freq, fovx, fovy, Rstop, qu_conv, params, data)
 
 Per-pixel body of the polarized GPU kernel: the polarized counterpart of
@@ -70,7 +70,8 @@ alternative is to store `OfTrajGeneric`s (136 bytes per point).
 - `d_Image`: Unpolarized image, overwritten at `(i_global + 1, j_global + 1)`.
 - `d_pol`: Polarized image of size `(NIMG, nx, ny)`, overwritten for the same pixel.
 - `d_truncated`: Set `true` at `(i_local, j_local)` if `nmaxstep` was too small.
-- `ro`, `θo`, `phi`: Camera radial distance, inclination, and azimuth.
+- `Xcam`: Camera position in internal coordinates.
+- `Econ`, `Ecov`: Camera tetrad (`Tetrads.make_camera_tetrad`), built once per image.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `nx`, `ny`: Full image resolution.
 - `nmaxstep`: Maximum number of geodesic integration steps.
@@ -85,7 +86,7 @@ alternative is to store `OfTrajGeneric`s (136 bytes per point).
 """
 function calculate_image_pol!(
     traj, d_Image, d_pol, d_truncated,
-    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64,
+    Xcam::SVector{4,Float64}, Econ::SMatrix{4,4,Float64}, Ecov::SMatrix{4,4,Float64}, bhspin::Float64,
     nx::Int64, ny::Int64, nmaxstep::Int64,
     i_global::Int64, j_global::Int64,
     i_local::Int64, j_local::Int64,
@@ -96,9 +97,7 @@ function calculate_image_pol!(
     if (i_global >= nx || j_global >= ny)
         return nothing
     end
-    Xcam = Camera.camera_position(ro, θo, phi, bhspin, params)
-
-    Kcon0 = Geodesics.init_kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, params)
+    Kcon0 = Geodesics.init_kcon(i_global, j_global, Econ, nx, ny, fovx, fovy)
     Kcon = Kcon0 * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
 
     dl_unit::Float64 = params.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
@@ -136,7 +135,7 @@ function calculate_image_pol!(
         end
     end
 
-    SI, SQ, SU, SV = Polarization.project_n(N, Xcam, bhspin, params)
+    SI, SQ, SU, SV = Polarization.project_n(N, Ecov)
 
     @inbounds d_Image[i_global+1, j_global+1] = Intensity * (freq^3)
     Polarization.save_pixel!(d_pol, i_global + 1, j_global + 1, SI, SQ, SU, SV, tauF, freq, qu_conv)
@@ -146,7 +145,7 @@ end
 
 """
     raytrace_image_gpu_pol!(d_traj, d_Image, d_pol, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
-        ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rstop, qu_conv, data, params)
+        Xcam, Econ, Ecov, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rstop, qu_conv, data, params)
 
 GPU kernel for one tile of the polarized image: the polarized counterpart of
 `Imaging.raytrace_image_gpu!`. Maps the CUDA thread to a pixel of the tile and
@@ -155,7 +154,7 @@ calls [`calculate_image_pol!`](@ref) for it.
 function raytrace_image_gpu_pol!(
     d_traj, d_Image, d_pol, d_truncated,
     i_offset, j_offset, block_size_x, block_size_y,
-    ro, θo, phi, bhspin, nx, ny, nmaxstep,
+    Xcam, Econ, Ecov, bhspin, nx, ny, nmaxstep,
     freq, fovx, fovy, Rstop, qu_conv, data, params
 )
     local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
@@ -166,7 +165,7 @@ function raytrace_image_gpu_pol!(
 
     if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
         calculate_image_pol!(
-            d_traj, d_Image, d_pol, d_truncated, ro, θo, phi, bhspin, nx, ny, nmaxstep,
+            d_traj, d_Image, d_pol, d_truncated, Xcam, Econ, Ecov, bhspin, nx, ny, nmaxstep,
             i, j, local_i, local_j, freq, fovx, fovy, Rstop, qu_conv, params, data
         )
     end
@@ -193,6 +192,11 @@ function ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, �
 
     T = promote_type(typeof(ro), typeof(θo), typeof(phi), typeof(model.a))
 
+    Xcam = SVector{4,Float64}(Camera.camera_position(ro, θo, phi, model.a, model))
+    _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, model.a, model)
+    Econ = SMatrix{4,4,Float64,16}(Econ)
+    Ecov = SMatrix{4,4,Float64,16}(Ecov)
+
     d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
     d_truncated = CUDA.zeros(Bool, block_size, block_size)
     d_Image = CUDA.zeros(Float64, nx, ny)
@@ -207,7 +211,7 @@ function ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, �
                     @cuda threads=threads_per_block blocks=blocks_per_grid raytrace_image_gpu_pol!(
                         d_traj, d_Image, d_pol, d_truncated,
                         i_offset, j_offset, block_size, block_size,
-                        ro, θo, phi, model.a, nx, ny, nmaxstep,
+                        Xcam, Econ, Ecov, model.a, nx, ny, nmaxstep,
                         freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model
                     )
                     CUDA.synchronize()

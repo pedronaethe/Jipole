@@ -189,13 +189,10 @@ function render_round_cpu!(
                 movie_nstep[i, j, k] = nstep
                 movie_intensity[i, j, k] = Intensity
             end
-
-            lock(progress_lock) do
-                for _ in valid_ks
-                    ProgressMeter.next!(p)
-                end
-            end
         end
+        lock(progress_lock) do
+            ProgressMeter.next!(p; step = pixels_y * length(valid_ks))
+        end 
     end
     finish!(p)
     return nothing

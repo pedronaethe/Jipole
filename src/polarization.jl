@@ -669,6 +669,16 @@ yet, so it is always called with the default `0`.
 """
 @inline function project_n(N, Xcam, bhspin, model, rotcam=0.0)
     _, _, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
+    return project_n(N, Ecov, rotcam)
+end
+
+"""
+    project_n(N, Ecov, rotcam=0.0)
+
+As above, with the camera tetrad `Ecov` (`Tetrads.make_camera_tetrad`) given, so that an
+image builds it once rather than once per pixel.
+"""
+@inline function project_n(N, Ecov::SMatrix{4,4}, rotcam=0.0)
     N_tetrad = complex_coord_to_tetrad_rank2(N, Ecov)
     SI, Q, U, SV = tensor_to_stokes(N_tetrad)
 

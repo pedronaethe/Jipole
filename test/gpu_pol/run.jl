@@ -55,8 +55,13 @@ pol_k = zeros(Jipole.Polarization.NIMG, nx, nx)
 truncated = zeros(Bool, nx, nx)
 gpu_like_data = (data[1],)
 function run_kernel_body!(traj, unpol_k, pol_k, truncated, model, gpu_like_data, ro, th, phi, freq, fov, nx, nmaxstep)
+    # Camera position and tetrad, built once per image as render_image_gpu_pol! does.
+    Xcam = SVector{4,Float64}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, Ecov = Jipole.Tetrads.make_camera_tetrad(Xcam, model.a, model)
+    Econ = SMatrix{4,4,Float64,16}(Econ)
+    Ecov = SMatrix{4,4,Float64,16}(Ecov)
     for i in 0:nx-1, j in 0:nx-1
-        ext.calculate_image_pol!(traj, unpol_k, pol_k, truncated, ro, th, phi, model.a, nx, nx, nmaxstep,
+        ext.calculate_image_pol!(traj, unpol_k, pol_k, truncated, Xcam, Econ, Ecov, model.a, nx, nx, nmaxstep,
             i, j, i + 1, j + 1, freq, fov, fov, model.rmax_geo, 0, model, gpu_like_data)
     end
 end
@@ -120,9 +125,13 @@ function validate_kernel(f, tt)
     end
 end
 
-common = (Int64, Int64, Int64, Int64, Float64, Float64, Float64, Float64, Int64, Int64, Int64, Float64, Float64, Float64)
-tt_unpol = Tuple{TrajArray,DeviceArray(Float64, 2),DeviceArray(Bool, 2),common...,Float64,Float64,Tuple{DeviceData},typeof(model)}
-tt_pol = Tuple{TrajArray,DeviceArray(Float64, 2),DeviceArray(Float64, 3),DeviceArray(Bool, 2),common...,Float64,Int64,Tuple{DeviceData},typeof(model)}
+# Tile offsets and sizes; then, after the camera arguments, bhspin, nx, ny, nmaxstep, freq, fovx, fovy.
+head = (Int64, Int64, Int64, Int64)
+tail = (Float64, Int64, Int64, Int64, Float64, Float64, Float64)
+CamPos = SVector{4,Float64}
+CamTetrad = SMatrix{4,4,Float64,16}
+tt_unpol = Tuple{TrajArray,DeviceArray(Float64, 2),DeviceArray(Bool, 2),head...,CamPos,CamTetrad,tail...,Float64,Float64,Tuple{DeviceData},typeof(model)}
+tt_pol = Tuple{TrajArray,DeviceArray(Float64, 2),DeviceArray(Float64, 3),DeviceArray(Bool, 2),head...,CamPos,CamTetrad,CamTetrad,tail...,Float64,Int64,Tuple{DeviceData},typeof(model)}
 try
     errors_unpol, math_unpol = validate_kernel(Jipole.Imaging.raytrace_image_gpu!, tt_unpol)
     errors_pol, math_pol = validate_kernel(ext.raytrace_image_gpu_pol!, tt_pol)

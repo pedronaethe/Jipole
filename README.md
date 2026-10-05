@@ -145,10 +145,10 @@ global model switch to edit.
 using Jipole
 
 # Analytic torus (Gold et al. 2020)
-model = Jipole.Analytic.AnalyticParams(bhspin, Rout, cstartx, cstopx, MBH)
+model = Jipole.Analytic.AnalyticParams(bhspin, Rout, cstartx, cstopx, rmax_geo, MBH)
 
 # Thin disk
-model = Jipole.ThinDisk.ThinDiskParams(bhspin, Rout, cstartx, cstopx, MBH, Mdot)
+model = Jipole.ThinDisk.ThinDiskParams(bhspin, Rout, cstartx, cstopx, MBH, Mdot, Rstop)
 
 # GRMHD simulation dump
 model = Jipole.Iharm.read_header(dump_filepath, MBH)

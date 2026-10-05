@@ -20,93 +20,38 @@ using ..Metrics
 using ..Tetrads
 using ..DebugFunctions
 
-export init_xk!, init_kcon, get_pixel, calculate_geodesics, models_and_mks_connection_analytic,
+export init_kcon, get_pixel, models_and_mks_connection_analytic,
     fmks_connection_analytic, get_connection_analytic, get_connection_analytic!,
     compute_dkcon, push_photon, push_photon!, get_connection, stepsize,
     stop_backward_integration, trace_geodesic
 
 """
-    init_xk!(X, Kcon, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
+    init_kcon(i, j, Econ, nx, ny, fovx, fovy, xoff=0, yoff=0)
 
-Initialize the position and photon 4-momentum for the geodesic launched
-from camera pixel `(i, j)`.
-
-The logic follows: Create an orthonormal tetrad at the camera position through gram-schmidt process, then construct a null 4-momentum.
-Normalize the 4-momentum and transform it to the coordinate basis. The initial position is always the camera position, so no position output is needed.
-
-# Arguments
-- `X`: Output vector, overwritten with the initial position.
-- `Kcon`: Output vector, overwritten with the initial 4-momentum.
-- `i`, `j`: Pixel indices in the image plane.
-- `Xcam`: Camera position in internal coordinates.
-- `nx`, `ny`: Image resolution.
-- `fovx`, `fovy`: Field of view, in radians.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters.
-- `xoff`, `yoff`: Image plane offsets.
-"""
-function init_xk!(X::AbstractVector{T}, Kcon::AbstractVector{T}, i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
-    _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
-    dxoff::Float64 = (i + 0.5 + xoff - 0.01) / nx - 0.5
-    dyoff::Float64 = (j + 0.5 + yoff) / ny - 0.5
-
-    Kcon_tetrad = SVector{4,T}(
-        zero(T),
-        (dxoff * cos(zero(T)) - dyoff * sin(zero(T))) * fovx,
-        (dxoff * sin(zero(T)) + dyoff * cos(zero(T))) * fovy,
-        one(T)
-    )
-
-    Kcon_tetrad = Tetrads.null_normalize(Kcon_tetrad, one(T))
-
-    Tetrads.tetrad_to_coordinate!(Kcon, Econ, Kcon_tetrad)
-
-    @inbounds for mu in 1:Constants.NDIM
-        X[mu] = Xcam[mu]
-    end
-end
-
-"""
-    init_kcon(i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff=0, yoff=0)
-
-Non-mutating, GPU-safe variant of [`init_xk!`](@ref) that returns the
-initial photon 4-momentum directly. The initial position is always
-`Xcam`, so no position output is needed.
-
-The logic follows: Create an orthonormal tetrad at the camera position through gram-schmidt process, then construct a null 4-momentum.
-Normalize the 4-momentum and transform it to the coordinate basis. The initial position is always the camera position, so no position output is needed.
+Initial photon 4-momentum for camera pixel `(i, j)`: a null vector built in the camera
+tetrad, transformed to the coordinate basis. The tetrad is the same for every pixel, so it is
+built once per image by `Tetrads.make_camera_tetrad` and passed in. The initial position is
+always the camera position, so no position output is needed. GPU-safe.
 
 # Arguments
 - `i`, `j`: Pixel indices in the image plane.
-- `Xcam`: Camera position in internal coordinates.
+- `Econ`: Camera tetrad (`Tetrads.make_camera_tetrad`).
 - `nx`, `ny`: Image resolution.
 - `fovx`, `fovy`: Field of view, in radians.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters.
 - `xoff`, `yoff`: Image plane offsets.
 
 # Returns
 - The initial photon 4-momentum.
 """
-function init_kcon(i::Int, j::Int, Xcam::AbstractVector{T}, nx::Int, ny::Int, fovx, fovy, bhspin, model, xoff=0, yoff=0) where {T}
-    _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, bhspin, model)
-    dxoff::Float64 = (i + 0.5 + xoff - 0.01) / nx - 0.5
-    dyoff::Float64 = (j + 0.5 + yoff) / ny - 0.5
-
-    Kcon_tetrad = SVector{4,T}(
-        zero(T),
-        (dxoff * cos(zero(T)) - dyoff * sin(zero(T))) * fovx,
-        (dxoff * sin(zero(T)) + dyoff * cos(zero(T))) * fovy,
-        one(T)
-    )
-
-    Kcon_tetrad = Tetrads.null_normalize(Kcon_tetrad, one(T))
-
+@inline function init_kcon(i::Int, j::Int, Econ::SMatrix{4,4,T}, nx::Int, ny::Int, fovx, fovy, xoff=0, yoff=0) where {T}
+    dxoff = (i + 0.5 + xoff - 0.01) / nx - 0.5
+    dyoff = (j + 0.5 + yoff) / ny - 0.5
+    Kcon_tetrad = Tetrads.null_normalize(SVector{4,T}(zero(T), dxoff * fovx, dyoff * fovy, one(T)), one(T))
     return Tetrads.tetrad_to_coordinate(Econ, Kcon_tetrad)
 end
 
 """
-    get_pixel(traj, i, j, Xcam, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0)
+    get_pixel(traj, i, j, Xcam, Econ, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0)
 
 Trace the geodesic for camera pixel `(i, j)`, filling `traj` with the
 trajectory steps.
@@ -117,6 +62,7 @@ The function initializes the four-position and four-momentum of the photon, then
 - `traj`: Output trajectory vector, filled by [`trace_geodesic`](@ref).
 - `i`, `j`: Pixel indices in the image plane.
 - `Xcam`: Camera position in internal coordinates.
+- `Econ`: Camera tetrad (`Tetrads.make_camera_tetrad`), built once per image.
 - `fovx`, `fovy`: Field of view, in radians.
 - `freq`: Unitless photon frequency (already scaled by `Kcon`).
 - `nx`, `ny`: Image resolution.
@@ -129,14 +75,9 @@ The function initializes the four-position and four-momentum of the photon, then
 # Returns
 - A tuple `(nstep, midplane_crossings)`.
 """
-function get_pixel(traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j,  Xcam::AbstractVector{T}, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0) where {T}
-    X_mut = MVector{4,T}(undef)
-    Kcon_mut = MVector{4,T}(undef)
-
-    init_xk!(X_mut, Kcon_mut, i, j, Xcam, nx, ny, fovx, fovy, bhspin, model, xoff, yoff)
-
-    X = SVector{4,T}(X_mut)
-    Kcon = SVector{4,T}(Kcon_mut) * freq
+function get_pixel(traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j, Xcam::AbstractVector{T}, Econ, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0) where {T}
+    X = SVector{4,T}(Xcam)
+    Kcon = init_kcon(i, j, Econ, nx, ny, fovx, fovy, xoff, yoff) * freq
 
     nstep, midplane_crossings = trace_geodesic(X, Kcon, traj, i, j, bhspin, Rh, Rstop, model)
 

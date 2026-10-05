@@ -11,25 +11,18 @@ export get_nu_c, dexter_shape_function, maxwell_juettner_dexter_i, maxwell_juett
 
 
 """
-    Bessels.besselk(v::Real, x::ForwardDiff.Dual{T,V,N}) where {T,V,N}
+    besselk_ad(v, x)
 
-Compute the modified Bessel function of the second kind for a ForwardDiff.Dual number. 
-This is a patch because the Bessels.jl package does not natively support ForwardDiff.Dual types.
-
-# Arguments
-- `v`: Order of the Bessel function.
-- `x`: Input value, which can be a ForwardDiff.Dual number.
-
-# Returns
-- The value of the modified Bessel function of the second kind evaluated at `x` and its derivative with respect to `x`.
+`Bessels.besselk(v, x)` that also accepts a `ForwardDiff.Dual` `x` (Bessels.jl does not
+support duals), propagating dK_v/dx = -K_{v-1}(x) - (v/x) K_v(x). A private function rather
+than a new method of `Bessels.besselk`, so loading Jipole does not change Bessels for other code.
 """
-function Bessels.besselk(v::Real, x::ForwardDiff.Dual{T,V,N}) where {T,V,N}
+besselk_ad(v, x::Real) = Bessels.besselk(v, x)
+function besselk_ad(v, x::ForwardDiff.Dual{T}) where {T}
     val = ForwardDiff.value(x)
-    partials = ForwardDiff.partials(x)
-    kv = Bessels.besselk(v, val)
-    kv_minus = Bessels.besselk(v - 1, val)
-    deriv = -kv_minus - (v / val) * kv
-    return ForwardDiff.Dual{T}(kv, deriv * partials)
+    kv = besselk_ad(v, val)
+    deriv = -besselk_ad(v - 1, val) - (v / val) * kv
+    return ForwardDiff.Dual{T}(kv, deriv * ForwardDiff.partials(x))
 end
 
 """
@@ -111,7 +104,7 @@ Leung et al. (2011) fit for the thermal synchrotron emissivity.
 """
 function maxwell_juettner_leung_i(Ne, ν, θe, B, θ)
     T = promote_type(typeof(Ne), typeof(ν), typeof(θe), typeof(B), typeof(θ))
-    K2 = max(besselk(2, 1.0 / θe), T(Constants.SMALL))
+    K2 = max(besselk_ad(2, 1.0 / θe), T(Constants.SMALL))
     nuc = Constants.EE * B / (2.0 * π * Constants.ME * Constants.CL)
     nus = (2.0 / 9.0) * nuc * θe * θe * sin(θ)
     if ν > 1.e12 * nus
@@ -123,51 +116,8 @@ function maxwell_juettner_leung_i(Ne, ν, θe, B, θ)
     return j
 end
 
-"""
-    maxwell_juettner_i(B, θ, θe, ν, ne)
-
-Thermal synchrotron emissivity used by the radiative transfer.
-
-Currently always uses the Leung et al. (2011) fit ([`maxwell_juettner_leung_i`](@ref)),
-since it is unpolarized; the Dexter (2016) fit below is kept for when
-polarized transport is added (`ipole`'s C implementation selects the
-Dexter fit via `params.dexter_fit = 1`). This will be used as a wrapper in the future.
-
-# Arguments
-- `B`: Magnetic field strength.
-- `θ`: Angle between the photon wavevector and the magnetic field.
-- `θe`: Dimensionless electron temperature.
-- `ν`: Frequency.
-- `ne`: Electron number density.
-
-# Returns
-- The emissivity (erg/s/cm^3).
-"""
 function maxwell_juettner_i(B, θ, θe, ν, ne)
-    #TODO: For now, we are gonna return leung as it's non polarized, but original IPOLE code implementation has dexter params.dexter_fit = 1 for polarized transport
     return maxwell_juettner_leung_i(ne, ν, θe, B, θ)
-
-    νc = get_nu_c(B)
-
-    νs = (2.0 / 9.0) * νc * θe * θ^2
-
-    X = ν / νs
-
-    prefactor = ne * Constants.EE^2 * νc / (Constants.CL)
-
-    term1 = sqrt(2.0) * π / 27.0 * sin(θ)
-    term2 = ((X^(1.0 / 2.0)) + 2.0^(11.0 / 12.0) * X^(1.0 / 6.0))^2
-    term3 = exp(-X^(1.0 / 3.0))
-
-    ans = prefactor * term1 * term2 * term3
-
-    if isnan(ans) || isinf(ans)
-        println("Invalid maxwell_juettner_i calculation:")
-        println("B = $B, θ = $θ, θe = $θe, ν = $ν, ne = $ne")
-        println("Computed values: νc = $νc, νs = $νs, X = $X, prefactor = $prefactor, term1 = $term1, term2 = $term2, term3 = $term3")
-        error("Resulting intensity is NaN or Inf")
-    end
-    return ans
 end
 
 end

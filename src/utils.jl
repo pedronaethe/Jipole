@@ -177,22 +177,6 @@ function project_out(vcona, vconb, Gcov)
 end
 
 """
-    levi_civita(i, j, k, l)
-
-Compute the (4-index) Levi-Civita symbol.
-
-# Arguments
-- `i`, `j`, `k`, `l`: Indices for which the Levi-Civita symbol is computed.
-
-# Returns
-- `0` if any two indices coincide, otherwise `+1`/`-1` depending on the
-  permutation parity.
-"""
-function levi_civita(i::Int, j::Int, k::Int, l::Int)
-    return (i == j || i == k || i == l || j == k || j == l || k == l) ? 0 : sign((i - j) * (k - l))
-end
-
-"""
     check_handedness(Econ, Gcov)
 
 Check the handedness of a tetrad basis.

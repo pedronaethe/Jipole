@@ -69,7 +69,7 @@ along `b`, `e^3` is along the spatial part of `K`.
 - A tuple `(oddflag, Econ, Ecov)`.
 """
 function make_plasma_tetrad(Ucon, Kcon, Bcon, Gcov)
-    T = eltype(Ucon)
+    T = promote_type(eltype(Ucon), eltype(Kcon), eltype(Bcon), eltype(Gcov))
     ones_vector = SVector{4,T}(1.0, 1.0, 1.0, 1.0)
 
     e1 = Utils.set_econ_from_trial(1, Ucon)

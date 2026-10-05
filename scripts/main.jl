@@ -331,6 +331,7 @@ else
     fovx = DXsize / ro
     fovy = DYsize / ro
     Xcamera = MVector{4,Float64}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, _ = Jipole.Tetrads.make_camera_tetrad(Xcamera, model.a, model)
     scale_factor = Jipole.Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
 
     println("Tracing geodesics (dump-independent; traced once for the whole slow-light run)...")
@@ -338,11 +339,10 @@ else
     dummy_svec = zero(SVector{4,Float64})
     dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
 
-    row_trajs = [Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep) for _ in 1:pixels_x]
-    for i in 1:pixels_x
-        for k in 1:maxnstep
-            row_trajs[i][k] = dummy_traj
-        end
+    nbuf = Threads.nthreads()
+    traj_pool = Channel{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(nbuf)
+    for _ in 1:nbuf
+        put!(traj_pool, fill(dummy_traj, maxnstep))
     end
 
     all_geodesics = Matrix{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(undef, pixels_x, pixels_y)
@@ -356,10 +356,10 @@ else
     progress_lock = ReentrantLock()
     #Calculate the geodesic in slowlight has to be done first.
     Threads.@threads :greedy for i in 0:(pixels_x - 1)
-        my_traj = row_trajs[i + 1]
-
+        #my_traj = row_trajs[i + 1]
+        my_traj = take!(traj_pool)
         for j in 0:(pixels_y - 1)
-            nstep, _ = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
+            nstep, _ = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, Econ, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
 
             nsteps[i + 1, j + 1] = nstep
             all_geodesics[i + 1, j + 1] = my_traj[1:nstep]
@@ -395,11 +395,11 @@ else
             elseif pixel_tgeof > 0.0 && final_step_time < row_tgeof[i + 1]
                 row_tgeof[i + 1] = final_step_time
             end
-
-            lock(progress_lock) do
-                ProgressMeter.next!(p; showvalues=[(:pixel, "($i, $j)"), (:total_done, "$(i * pixels_y + j)/$(pixels_x * pixels_y)")])
-            end
         end
+        lock(progress_lock) do
+            ProgressMeter.next!(p; step = pixels_y)
+        end
+        put!(traj_pool, my_traj)
     end
     finish!(p)
 
@@ -411,7 +411,7 @@ else
     println("Calculated tgeof (oldest active time): $tgeof")
     println("Calculated tgeoi (newest active time): $tgeoi")
 
-    row_trajs = nothing
+    traj_pool = nothing
     GC.gc()
 
     #Finally generate the image

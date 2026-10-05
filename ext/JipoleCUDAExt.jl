@@ -7,7 +7,7 @@ module JipoleCUDAExt
 using CUDA
 using StaticArrays
 using Jipole
-using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Slowlight, Utils_GPU
+using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Slowlight, Utils_GPU, Tetrads
 using Jipole.GeoTypes: OfTrajGeneric, GPUTrajStep
 using Jipole.Slowlight: OfSlowLight, pack_trajectory_tile!
 
@@ -34,7 +34,7 @@ end
 
 """
     raytrace_image_gpu!(d_traj, d_Image, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
-        ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rout, Rstop, data, params)
+        Xcam, Econ, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rout, Rstop, data, params)
 
 GPU kernel launcher for [`calculate_image!`](@ref): raytraces and
 integrates the emission for one tile of the image plane (the tile given by
@@ -57,7 +57,8 @@ The division in tiles is necessary depending on the size of the image due to GPU
 - `i_offset`, `j_offset`: Pixel offset of this tile within the full image.
 - `block_size_x`, `block_size_y`: Tile size (must match `d_traj`'s first
   two dimensions and the launch's thread/block configuration).
-- `ro`, `θo`, `phi`: Camera radial distance, inclination, and azimuth.
+- `Xcam`: Camera position in internal coordinates.
+- `Econ`: Camera's orthonormal tetrad.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `nx`, `ny`: Full image resolution.
 - `nmaxstep`: Maximum number of geodesic integration steps.
@@ -71,10 +72,9 @@ The division in tiles is necessary depending on the size of the image due to GPU
 function Imaging.raytrace_image_gpu!(
     d_traj, d_Image, d_truncated,
     i_offset, j_offset, block_size_x, block_size_y, # New offset parameters
-    ro, θo, phi, bhspin, nx, ny, nmaxstep,
+    Xcam, Econ, bhspin, nx, ny, nmaxstep,
     freq, fovx, fovy, Rout, Rstop, data, params
 )
-    #TODO (PNM): This function is necessarily GPU specific, maybe it shouldn't be and we can find a way to abstract it out.
     local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
 
@@ -84,7 +84,7 @@ function Imaging.raytrace_image_gpu!(
     if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
 
         calculate_image!(
-            d_traj, d_Image, d_truncated, ro, θo, phi, bhspin, nx, ny, nmaxstep,
+            d_traj, d_Image, d_truncated, Xcam, Econ, bhspin, nx, ny, nmaxstep,
             i, j, local_i, local_j, freq, fovx, fovy, Rout, Rstop, params, data
         )
     end
@@ -93,7 +93,7 @@ end
 
 
 """
-    calculate_image!(traj, d_Image, d_truncated, ro, θo, phi, bhspin, nx, ny, nmaxstep, i_global,
+    calculate_image!(traj, d_Image, d_truncated, Xcam, Econ, bhspin, nx, ny, nmaxstep, i_global,
         j_global, i_local, j_local, freq, fovx, fovy, Rout, Rstop, params, data=nothing)
 
 GPU per-pixel kernel body for [`raytrace_image_gpu!`](@ref): traces the
@@ -125,7 +125,7 @@ far end back to the camera), writing the result into `d_Image`.
 """
 function calculate_image!(
     traj, d_Image, d_truncated,
-    ro::Float64, θo::Float64, phi::Float64, bhspin::Float64,
+    Xcam::SVector{4,Float64}, Econ::SMatrix{4,4,Float64}, bhspin::Float64,
     nx::Int64, ny::Int64, nmaxstep::Int64,
     i_global::Int64, j_global::Int64,
     i_local::Int64, j_local::Int64, # Accept local matrix indices directly
@@ -136,9 +136,8 @@ function calculate_image!(
     if (i_global >= nx || j_global >= ny)
         return nothing
     end
-    Xcam = Camera.camera_position(ro, θo, phi, bhspin, params)
 
-    Kcon0 = Geodesics.init_kcon(i_global, j_global, Xcam, nx, ny, fovx, fovy, bhspin, params)
+    Kcon0 = Geodesics.init_kcon(i_global, j_global, Econ, nx, ny, fovx, fovy)
     Kcon = Kcon0 * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
 
     dl_unit::Float64 = params.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
@@ -409,7 +408,11 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
     threads_per_block = (16, 16)
     blocks_per_grid = (cld(block_size, threads_per_block[1]), cld(block_size, threads_per_block[2]))
 
-     T = promote_type(typeof(ro), typeof(θo), typeof(phi), typeof(model.a))
+    T = promote_type(typeof(ro), typeof(θo), typeof(phi), typeof(model.a))
+
+    Xcam = SVector{4, Float64}(Camera.camera_position(ro, θo, phi, model.a, model))
+    _, Econ, _ = Tetrads.make_camera_tetrad(Xcam, model.a, model)
+    Econ = SMatrix{4, 4, Float64, 16}(Econ)
 
     d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
     d_truncated = CUDA.zeros(Bool, block_size, block_size)
@@ -424,7 +427,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
                     @cuda threads=threads_per_block blocks=blocks_per_grid Imaging.raytrace_image_gpu!(
                         d_traj, d_Image, d_truncated,
                         i_offset, j_offset, block_size, block_size,
-                        ro, θo, phi, model.a, nx, ny, nmaxstep,
+                        Xcam, Econ, model.a, nx, ny, nmaxstep,
                         freq, fovx, fovy, model.Rout, model.rmax_geo, gpu_sim_data, model
                     )
                     CUDA.synchronize()

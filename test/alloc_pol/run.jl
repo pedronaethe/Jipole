@@ -62,10 +62,11 @@ function setup_pixel(model, ro, th, phi, sourceD, i, j)
     Rh = 1 + sqrt(1.0 - FD.value(model.a)^2)
     fov = sourceD / model.L_unit / C.MUAS_PER_RAD * fov_uas / ro
     Xcam = SVector{4,T}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, _ = Jipole.Tetrads.make_camera_tetrad(Xcam, model.a, model)
     traj = Vector{Jipole.GeoTypes.OfTrajGeneric{T}}(undef, maxnstep)
     frequ = freq * C.HPL / (C.ME * C.CL^2)
-    nstep, _ = Jipole.Geodesics.get_pixel(traj, i, j, Xcam, fov, fov, frequ, nx, nx, model.a, Rh, model.rmax_geo, model, 0.0, 0.0)
-    return (; T, traj, nstep, Xcam, fov, frequ, Rh)
+    nstep, _ = Jipole.Geodesics.get_pixel(traj, i, j, Xcam, Econ, fov, fov, frequ, nx, nx, model.a, Rh, model.rmax_geo, model, 0.0, 0.0)
+    return (; T, traj, nstep, Xcam, Econ, fov, frequ, Rh)
 end
 
 # A pixel whose ray crosses the emitting plasma (checked below through its Faraday depth).
@@ -135,7 +136,7 @@ for (label, m, d, p) in (("Float64", model, data, px), ("Dual", dp.model, dp.dat
 
     # Existing routines the polarized pixel is built on (reported, not gated).
     b1 = @bytes Jipole.Radiation.integrate_emission!(traj, nstep, Image, 1, 1, freq, m.a, m, d)
-    b2 = @bytes Jipole.Geodesics.get_pixel(traj, 7, 8, p.Xcam, p.fov, p.fov, p.frequ, nx, nx, m.a, p.Rh, m.rmax_geo, m, 0.0, 0.0)
+    b2 = @bytes Jipole.Geodesics.get_pixel(traj, 7, 8, p.Xcam, p.Econ, p.fov, p.fov, p.frequ, nx, nx, m.a, p.Rh, m.rmax_geo, m, 0.0, 0.0)
     println("info  $label: existing Radiation.integrate_emission! (Stokes I) allocates $b1 bytes, existing Geodesics.get_pixel $b2 bytes")
 end
 
@@ -151,9 +152,10 @@ let bhspin = 0.99, Rout = 100.0
     td = Jipole.ThinDisk.ThinDiskParams(bhspin, Rout, cstartx, cstopx, 10.0, Mdot, Rout)
     tdfreq = 2.417989e17
     Xcam = SVector{4,Float64}(Jipole.Camera.camera_position(1.0e4, 75.0, 0.0, bhspin, td))
+    _, Econ, _ = Jipole.Tetrads.make_camera_tetrad(Xcam, bhspin, td)
     traj = Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep)
     frequ = tdfreq * C.HPL / (C.ME * C.CL^2)
-    nstep, _ = Jipole.Geodesics.get_pixel(traj, 20, 30, Xcam, 40.0 / 1.0e4, 40.0 / 1.0e4, frequ, 80, 80, bhspin, Rh, td.rmax_geo, td, 0.0, 0.0)
+    nstep, _ = Jipole.Geodesics.get_pixel(traj, 20, 30, Xcam, Econ, 40.0 / 1.0e4, 40.0 / 1.0e4, frequ, 80, 80, bhspin, Rh, td.rmax_geo, td, 0.0, 0.0)
     nstop = Jipole.ThinDiskPol.disk_stop_index(traj, nstep, td)
     S = P.integrate_emission_pol(traj, nstop, tdfreq, bhspin, td, nothing)
     report(S[1] > 0 && S[2] != 0, "thin disk: test ray hits the disk (I = $(round(S[1] * tdfreq^3, sigdigits=4)) cgs)")

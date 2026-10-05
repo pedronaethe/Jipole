@@ -33,6 +33,7 @@ include("models/analytic.jl")
 include("models/thin_disk.jl")
 include("models/iharm.jl")
 include("models/kharma.jl")
+include("models/thin_disk_pol.jl")
 
 include("output.jl")
 include("fitting.jl")

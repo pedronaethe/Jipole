@@ -1277,6 +1277,53 @@ end
 
 
 
+"""
+    dual_model_data(ctx, T, MBH, M_unit, Rlow, Rhigh, beta_crit, th_beg,
+                    sigma_cut, sigma_cut_high) -> (model, data)
+
+Rebuild an [`IharmParams`](@ref) and an [`IharmData`](@ref) with element type
+`T` from a context produced by [`grmhd_context`](@ref), recomputing every
+derived field from the supplied scalars.
+
+This is how a `ForwardDiff.Dual` gets into the radiative transfer. It cannot
+come in through [`read_header`](@ref), whose builder has concrete `Float64`
+fields; instead the header is read once in `Float64`, a context keeps the raw
+primitives, and this function re-derives `ne`, `theta_e`, `sigma`, `beta`,
+`dtheta_e/dRhigh` and `b` at the requested type. Only the derived fields
+promote — the raw primitives are shared with the context, not copied — which is
+why `IharmData` carries separate type parameters for the two groups.
+
+Factored out of [`calculate_gradients`](@ref) because a time-dependent mode
+needs it once per resident snapshot, not once per image.
+"""
+function dual_model_data(ctx, ::Type{T}, MBH_d, M_unit_d, Rlow_d, Rhigh_d,
+                         beta_crit_d, th_beg_d, sigma_cut_d, sigma_cut_high_d) where {T}
+    L_unit_d = Constants.GNEWT * MBH_d * Constants.MSUN / Constants.CL^2
+    T_unit_d = L_unit_d / Constants.CL
+    RHO_unit_d = M_unit_d / L_unit_d^3
+    U_unit_d = RHO_unit_d * Constants.CL^2
+    B_unit_d = Constants.CL * sqrt(4π * RHO_unit_d)
+
+    model_d = IharmParams{T}(ctx.metric, ctx.ELECTRONS, ctx.RADIATION,
+        ctx.gam, ctx.game, ctx.gamp, (0.0), (0.0),
+        ctx.mu_i, ctx.mu_e, ctx.mu_tot, ctx.Ne_factor,
+        M_unit_d, T_unit_d, L_unit_d, MBH_d, ctx.tp_over_te,
+        RHO_unit_d, U_unit_d, B_unit_d, ctx.a, ctx.hslope, ctx.Rin, ctx.Rout,
+        ctx.poly_xt, ctx.poly_alpha, ctx.mks_smooth, ctx.poly_norm,
+        ctx.mks3R0, ctx.mks3H0, ctx.mks3MY1, ctx.mks3MY2, ctx.mks3MP0,
+        ctx.N1, ctx.N2, ctx.N3, ctx.dx, ctx.startx, ctx.stopx, ctx.cstartx, ctx.cstopx,
+        ctx.rmin_geo, ctx.rmax_geo, th_beg_d, Rlow_d, Rhigh_d, beta_crit_d, sigma_cut_d,
+        sigma_cut_high_d, ctx.slow_light)
+
+    b_d = ctx.b_normalized .* T(B_unit_d)
+    data_d = IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3,
+                       ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d,
+                       similar(ctx.RHO, T), similar(ctx.RHO, T),
+                       similar(ctx.RHO, T), similar(ctx.RHO, T))
+    init_physical_quantities([data_d], 1, model_d, Rhigh_d)
+    return model_d, data_d
+end
+
 const GRADIENT_PARAM_NAMES = (:MBH, :Rhigh, :Rlow, :beta_crit, :th_beg, :sigma_cut, :sigma_cut_high,
                                :M_unit, :ro, :th, :phi, :sourceD)
 
@@ -1322,20 +1369,8 @@ function calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep, 
     U_unit_d = RHO_unit_d * Constants.CL^2
     B_unit_d = Constants.CL * sqrt(4π * RHO_unit_d)
 
-    model_d = IharmParams{T}(ctx.metric, ctx.ELECTRONS, ctx.RADIATION,
-        ctx.gam, ctx.game, ctx.gamp, (0.0), (0.0),
-        ctx.mu_i, ctx.mu_e, ctx.mu_tot, ctx.Ne_factor,
-        M_unit_d, T_unit_d, L_unit_d, MBH_d, ctx.tp_over_te,
-        RHO_unit_d, U_unit_d, B_unit_d, ctx.a, ctx.hslope, ctx.Rin, ctx.Rout,
-        ctx.poly_xt, ctx.poly_alpha, ctx.mks_smooth, ctx.poly_norm,
-        ctx.mks3R0, ctx.mks3H0, ctx.mks3MY1, ctx.mks3MY2, ctx.mks3MP0,
-        ctx.N1, ctx.N2, ctx.N3, ctx.dx, ctx.startx, ctx.stopx, ctx.cstartx, ctx.cstopx,
-        ctx.rmin_geo, ctx.rmax_geo, th_beg_d, Rlow_d, Rhigh_d, beta_crit_d, sigma_cut_d,
-        sigma_cut_high_d, ctx.slow_light)
-
-    b_d = ctx.b_normalized .* T(B_unit_d)
-    data_d = IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3, ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d, similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T))
-    init_physical_quantities([data_d], 1, model_d, Rhigh_d)
+    model_d, data_d = dual_model_data(ctx, T, MBH_d, M_unit_d, Rlow_d, Rhigh_d,
+                                      beta_crit_d, th_beg_d, sigma_cut_d, sigma_cut_high_d)
 
     Dxsize = sourceD_d / L_unit_d / Constants.MUAS_PER_RAD * fovx_uas
     fovx_d = Dxsize / ro_d

@@ -845,15 +845,23 @@ synchronization reference `t̄_0`, and the availability clamp `[tA, tB]` set by
 the first and last snapshot actually loaded.
 """
 function build_timemap(s::BandStats{T}, t_frame::Real, tA::Real, tB::Real) where {T}
+    # Promote rather than taking the element type from the statistics: the frame
+    # time is a legitimate differentiation variable (fitting a light curve's
+    # phase, say), and the statistics are always Float64 because they come from a
+    # KDE over sampled times. Pinning the map to the statistics' type would make
+    # a Dual frame time a MethodError.
+    R = promote_type(T, typeof(float(t_frame)), typeof(float(tA)), typeof(float(tB)))
     nb = nbins(s)
-    los = Vector{T}(undef, nb)
-    his = Vector{T}(undef, nb)
+    los = Vector{R}(undef, nb)
+    his = Vector{R}(undef, nb)
     for b in 1:nb
-        los[b], his[b] = band_interval(s, b)
+        lo, hi = band_interval(s, b)
+        los[b] = lo
+        his[b] = hi
     end
-    return TimeMap{nb,T}(T(t_frame), s.t_ref,
-                         SVector{nb,T}(los), SVector{nb,T}(his),
-                         T(tA), T(tB))
+    return TimeMap{nb,R}(R(t_frame), R(s.t_ref),
+                         SVector{nb,R}(los), SVector{nb,R}(his),
+                         R(tA), R(tB))
 end
 
 """
@@ -874,9 +882,10 @@ here corresponds to slow light's target time `t_frame - stats.t_ref`.
 """
 function slowlight_reference_timemap(s::BandStats{T}, t_frame::Real,
                                      tA::Real, tB::Real) where {T}
+    R = promote_type(T, typeof(float(t_frame)), typeof(float(tA)), typeof(float(tB)))
     sup_lo, sup_hi = s.support
-    return TimeMap{1,T}(T(t_frame), s.t_ref,
-                        SVector{1,T}(sup_lo), SVector{1,T}(sup_hi), T(tA), T(tB))
+    return TimeMap{1,R}(R(t_frame), R(s.t_ref),
+                        SVector{1,R}(sup_lo), SVector{1,R}(sup_hi), R(tA), R(tB))
 end
 
 """

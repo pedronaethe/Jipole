@@ -73,20 +73,19 @@ export OfBriskLight, BandWindowState,
 @inline nbins(n_bands::Int) = n_bands + 3
 @inline approach_bin_index(n_bands::Int) = n_bands + 2
 @inline shadow_bin_index(n_bands::Int)   = n_bands + 3
-
 """
-Brisk-light run state.
+    get_dump_time(dump_idx, all_dumps_path)
 
-# Fields
-- `n_bands::Int`: highest AART band index tracked
-- `modal_times::Vector{Float64}`: t̄_n per bin, geometric time (negative); `NaN` if invalid
-- `hdi_intervals::Vector{NTuple{2,Float64}}`: T_{n,p} per bin, geometric time
-- `band_time_ranges::Vector{NTuple{2,Float64}}`: [t_min, t_max] of sampled times per bin
-- `band_valid::Vector{Bool}`: false for bins with too few samples; excluded from all reductions
-- `p::Float64`: retained probability mass, in [0, 1]
-- `image_cadence::Float64`: observer-time step between frames
-- `t_obs::Float64`: observer time of the frame currently being rendered
+Read the coordinate time `t` from a dump without loading fluid primitives.
 """
+function get_dump_time(dump_idx::Int, all_dumps_path::String)::Float64
+    dump_path = Printf.format(Printf.Format(all_dumps_path), dump_idx)
+    t::Float64 = 0.0
+    h5open(dump_path, "r") do file
+        t = read(file, "t")
+    end
+    return t
+end
 mutable struct OfBriskLight
     n_bands::Int
     modal_times::Vector{Float64}

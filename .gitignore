@@ -32,8 +32,6 @@ scripts/*
 
 # Brisk light. The first two are `include`d by scripts/main.jl, so the blanket
 # `scripts/*` rule above would leave a clone with a CLI that cannot run.
-!scripts/brisklight_run.jl
-!scripts/fastlight_cadence_run.jl
 !scripts/benchmark_lightmodes.jl
 
 !scripts/Project.toml

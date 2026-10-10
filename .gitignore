@@ -42,3 +42,6 @@ scripts/*
 /test/ipole/
 /test/.cache/
 /test/*/output/
+
+# local validation output
+test/brisklight/output/

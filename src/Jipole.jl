@@ -15,6 +15,7 @@ module Jipole
 include("model_base.jl")
 include("constants.jl")
 include("geo_types.jl")
+include("timeinterp.jl")
 include("debug_functions.jl")
 include("coords.jl")
 include("metrics.jl")
@@ -35,6 +36,7 @@ include("output.jl")
 include("fitting.jl")
 include("utils_gpu.jl")
 include("slowlight.jl")
+include("brisklight.jl")
 
 
 using PrecompileTools: @setup_workload, @compile_workload

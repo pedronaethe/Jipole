@@ -15,6 +15,7 @@ using ..Coordinates
 using ..Metrics
 using ..Camera
 using ..Grid
+using ..TimeInterp
 using ..Radiation
 using ..MaxwellJuettner
 using ..Imaging
@@ -732,39 +733,61 @@ end
 """
     set_tinterp_ns(X, model, data)
 
-Select the two GRMHD snapshots used for time interpolation, along with
-the per-position time-interpolation factor. Returns `(dataA, dataB,
-tinterp)` — the snapshots themselves, rather than their indices into
-`data`.
+Select the two GRMHD snapshots used for time interpolation at position `X`.
+Returns `(dataA, dataB, tinterp, interp)` — the snapshots themselves rather
+than their indices, the weight on `dataA`, and whether a time interpolation
+should actually be performed.
 
-On the CPU, `data` is a `Vector` and this dispatches to the generic
-method below, branching on `model.slow_light` at runtime exactly as
-before. On the GPU, `data` is a `Tuple` of one (non-slow-light) or three
-(slow-light) snapshots; indexing a `Tuple` with a runtime-computed index
-isn't GPU-compilable (even inside a branch that's never actually taken,
-since `model.slow_light` is a runtime field, not a compile-time
-constant, so the compiler can't prove that branch dead and skip
-compiling it) — so the `Tuple`-specific methods below select on the
-tuple's length instead, which is resolved at compile time.
+`interp` exists so that the mode is carried by the *data container's type*
+rather than by a field of `model`. For a `SnapshotSet` or a `Tuple` it is a
+compile-time constant, so `Grid.interp_scalar_time` folds the branch away and
+the second spatial interpolation disappears entirely when there is nothing to
+interpolate between. Only the legacy `Vector` path falls back to the runtime
+`model.slow_light` flag.
+
+On the CPU, `data` is a `Vector` (slow light's three-snapshot window) or a
+[`TimeInterp.SnapshotSet`](@ref) (brisk light, and fast light on a cadence
+grid). On the GPU, `data` is a `Tuple` of one or three snapshots, or a
+`SnapshotSet`; indexing a `Tuple` with a runtime-computed index isn't
+GPU-compilable — even inside a branch that is never taken, since
+`model.slow_light` is a runtime field and the compiler cannot prove the branch
+dead — so the `Tuple` methods select on the tuple's length instead, which is
+resolved at compile time.
 """
 function set_tinterp_ns(X, model::IharmParams, data)
     if model.slow_light
         nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
         dataA, dataB = data[nA], data[nB]
         tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
-        return dataA, dataB, tinterp
+        return dataA, dataB, tinterp, true
     else
-        return data[1], data[1], 0.0
+        return data[1], data[1], 0.0, false
     end
+end
+
+"""
+    set_tinterp_ns(X, model, data::TimeInterp.SnapshotSet)
+
+Pick the two snapshots nearest `X[1]` out of the set and the linear weight
+between them. This is the only temporal interpolation brisk light performs: the
+pair is chosen purely by time proximity over the snapshots the frame has
+loaded, with no reference to which lensing band asked for them. A one-element
+set returns its single snapshot with weight 1, so `p = 0` on a dump time and
+fast light are the same code path with nothing to blend.
+"""
+@inline function set_tinterp_ns(X, model::IharmParams, data::TimeInterp.SnapshotSet{N}) where {N}
+    dataA, dataB, w = TimeInterp.nearest_pair(data, X[1])
+    return dataA, dataB, w, N > 1
 end
 
 """
     set_tinterp_ns(X, model, data::Tuple{T}) where {T}
 
-GPU, non-slow-light variant of [`set_tinterp_ns`](@ref): `data` is a
+GPU, single-snapshot variant of [`set_tinterp_ns`](@ref): `data` is a
 1-tuple, so there's nothing to interpolate between.
 """
-@inline set_tinterp_ns(X, model::IharmParams, data::Tuple{T}) where {T} = (data[1], data[1], 0.0)
+@inline set_tinterp_ns(X, model::IharmParams, data::Tuple{T}) where {T} =
+    (data[1], data[1], 0.0, false)
 
 """
     set_tinterp_ns(X, model, data::NTuple{3,T}) where {T}
@@ -782,7 +805,7 @@ time via the tuple's length, unlike the `Vector` method's runtime
         dataA, dataB = data[2], data[3]
     end
     tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
-    return dataA, dataB, tinterp
+    return dataA, dataB, tinterp, true
 end
 
 """
@@ -803,8 +826,8 @@ density) at position `X`.
 @inline function get_model_sigma(zone::Grid.ZoneLoc, X, model::IharmParams, data)
     T = promote_type(typeof(zone.del2), eltype(data[1].sigma))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.sigma, dataB.sigma, tfac, model.slow_light)
+    dataA, dataB, tfac, do_interp = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(zone, dataA.sigma, dataB.sigma, tfac, do_interp)
 end
 
 """
@@ -865,8 +888,8 @@ geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
         sigma > model.sigma_cut && return zero(T)
         sigma_smoothfac = get_sigma_smoothfac(sigma, model)
     end
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.ne, dataB.ne, tfac, model.slow_light) * sigma_smoothfac
+    dataA, dataB, tfac, do_interp = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(zone, dataA.ne, dataB.ne, tfac, do_interp) * sigma_smoothfac
 end
 
 """
@@ -887,8 +910,8 @@ Interpolate the dimensionless electron temperature at position `X`, using the zo
 @inline function get_model_thetae(zone::Grid.ZoneLoc, X, model::IharmParams, data)
     T = promote_type(typeof(zone.del2), eltype(data[1].θe))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.θe, dataB.θe, tfac, model.slow_light)
+    dataA, dataB, tfac, do_interp = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(zone, dataA.θe, dataB.θe, tfac, do_interp)
 end
 
 """
@@ -910,8 +933,8 @@ respect to `Rhigh`, at position `X`.
     #TODO (PNM): This whole function has to go, comeback to this.
     T = promote_type(typeof(zone.del2), eltype(data[1].dθedRhi))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.dθedRhi, dataB.dθedRhi, tfac, model.slow_light)
+    dataA, dataB, tfac, do_interp = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(zone, dataA.dθedRhi, dataB.dθedRhi, tfac, do_interp)
 end
 
 """
@@ -931,8 +954,8 @@ Interpolate the magnetic field strength at position `X`.
 @inline function get_model_b(zone::Grid.ZoneLoc, X, model::IharmParams, data)
     T = promote_type(typeof(zone.del2), eltype(data[1].b))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.b, dataB.b, tfac, model.slow_light)
+    dataA, dataB, tfac, do_interp = set_tinterp_ns(X, model, data)
+    return Grid.interp_scalar_time(zone, dataA.b, dataB.b, tfac, do_interp)
 end
 
 """
@@ -971,10 +994,10 @@ with the rest of the differentiable call path.
         return Ucon, Ucov, zero_vec, zero_vec
     end
 
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    Vcon2 = Grid.interp_scalar_time(zone, dataA.U1, dataB.U1, tfac, model.slow_light)
-    Vcon3 = Grid.interp_scalar_time(zone, dataA.U2, dataB.U2, tfac, model.slow_light)
-    Vcon4 = Grid.interp_scalar_time(zone, dataA.U3, dataB.U3, tfac, model.slow_light)
+    dataA, dataB, tfac, do_interp = set_tinterp_ns(X, model, data)
+    Vcon2 = Grid.interp_scalar_time(zone, dataA.U1, dataB.U1, tfac, do_interp)
+    Vcon3 = Grid.interp_scalar_time(zone, dataA.U2, dataB.U2, tfac, do_interp)
+    Vcon4 = Grid.interp_scalar_time(zone, dataA.U3, dataB.U3, tfac, do_interp)
     Vcon = SVector{4,elT}(0.0, Vcon2, Vcon3, Vcon4)
     VdotV = zero(elT)
     for μ in 2:Constants.NDIM
@@ -993,9 +1016,9 @@ with the rest of the differentiable call path.
 
     Ucov = Coordinates.flip_index(Ucon, gcov)
 
-    Bcon1_interp = Grid.interp_scalar_time(zone, dataA.B1, dataB.B1, tfac, model.slow_light)
-    Bcon2_interp = Grid.interp_scalar_time(zone, dataA.B2, dataB.B2, tfac, model.slow_light)
-    Bcon3_interp = Grid.interp_scalar_time(zone, dataA.B3, dataB.B3, tfac, model.slow_light)
+    Bcon1_interp = Grid.interp_scalar_time(zone, dataA.B1, dataB.B1, tfac, do_interp)
+    Bcon2_interp = Grid.interp_scalar_time(zone, dataA.B2, dataB.B2, tfac, do_interp)
+    Bcon3_interp = Grid.interp_scalar_time(zone, dataA.B3, dataB.B3, tfac, do_interp)
     Bcon1 = (Ucov[2] * Bcon1_interp + Ucov[3] * Bcon2_interp + Ucov[4] * Bcon3_interp)
     Bcon2 = (Bcon1_interp + Ucon[2] * Bcon1) / Ucon[1]
     Bcon3 = (Bcon2_interp + Ucon[3] * Bcon1) / Ucon[1]

@@ -166,28 +166,35 @@ Quadrilinearly interpolate the scalar field `data` at the position `X`.
 end
 
 """
-    interp_scalar_time(X, dataA, dataB, tfac, slow_light, model)
+    interp_scalar_time(zone, dataA, dataB, tfac, interp)
 
-Interpolate the scalar field spatially at `X`, and (if `slow_light` is
-set) linearly in time between the `dataA` and `dataB` snapshots.
+Interpolate the scalar field spatially within `zone`, and — when `interp` is
+set — linearly in time between the `dataA` and `dataB` snapshots as
+`tfac * vA + (1 - tfac) * vB`.
+
+`interp` comes from `Iharm.set_tinterp_ns` and says whether there is anything
+to interpolate between. For a `SnapshotSet` or a `Tuple` it is a compile-time
+constant, so this branch folds away and the second spatial interpolation is not
+emitted at all; only slow light's `Vector` path decides it at runtime. Passing
+`false` therefore costs nothing relative to a dedicated single-snapshot
+routine, which is why every light mode can share this one function.
 
 # Arguments
-- `X`: Position four-vector in internal coordinates.
-- `dataA`: Scalar field at the earlier time snapshot.
-- `dataB`: Scalar field at the later time snapshot.
-- `tfac`: Time interpolation factor.
-- `slow_light`: Whether slow-light (time-dependent) interpolation is
-  enabled.
-- `model`: Model parameters, providing the grid geometry.
+- `zone`: A [`ZoneLoc`](@ref) holding the zone indices and spatial weights.
+  Shared by both snapshots, since the spatial weights do not depend on time.
+- `dataA`: Scalar field at the earlier snapshot.
+- `dataB`: Scalar field at the later snapshot.
+- `tfac`: Weight on `dataA`.
+- `interp`: Whether to interpolate in time.
 
 # Returns
 - The interpolated scalar value.
 """
-function interp_scalar_time(zone::ZoneLoc, dataA, dataB, tfac, slow_light::Bool)
+@inline function interp_scalar_time(zone::ZoneLoc, dataA, dataB, tfac, interp::Bool)
     vA = interp_scalar(dataA, zone)
-    if slow_light
+    if interp
         vB = interp_scalar(dataB, zone)
-        return tfac * vA + (1.0 - tfac) * vB
+        return tfac * vA + (one(tfac) - tfac) * vB
     end
     return vA
 end

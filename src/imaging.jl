@@ -14,7 +14,7 @@ using ..Camera
 using ..Geodesics
 using ..Radiation
 
-export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image, calculate_gradients,  render_image_gpu!
+export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image, calculate_gradients,  render_image_gpu!, trace_all_geodesics
 
 """
     output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
@@ -166,5 +166,113 @@ function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pix
     return Image
 end
 
+
+"""
+    trace_all_geodesics(model, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy,
+                        maxnstep, Rh, xoff, yoff; progress = true)
+
+Trace every pixel's geodesic once and keep it.
+
+Returns `(all_geodesics, nsteps, midplane_crossings, Xcamera, bounds)` where
+`all_geodesics[i,j]` is that pixel's trajectory truncated to its own length,
+`midplane_crossings[i,j]` is its equatorial-crossing count (0 captured, 1
+direct, 2 first indirect, ...), and `bounds` is
+`(t_last, tgeoi, tgeof)` — the three observer-time limits the time-dependent
+modes schedule against, in geometric time (all negative):
+
+- `t_last`: the most negative time any ray reaches, i.e. the full depth of the
+  trajectory set.
+- `tgeoi`: the *newest* time any ray still needs, the latest entry into
+  `r < rmax_geo`.
+- `tgeof`: the *oldest* time any ray needs, the earliest exit through
+  `r > rmax_geo` on an outgoing leg.
+
+`Imaging.raytrace_image` fuses tracing with transfer and discards both the
+crossing count and the trajectory, which is right for fast light on a single
+snapshot. Every time-dependent mode instead needs the trajectories kept — they
+are reused for every frame, and for every `p` of a sweep — and brisk light needs
+the crossing count to assign lensing bands. This function is that shared step;
+it was previously duplicated inline in `scripts/main.jl`'s slow-light branch.
+
+Memory is the thing to watch: the returned set is roughly
+`pixels_x * pixels_y * mean(nsteps) * sizeof(OfTrajGeneric{T})` and dominates a
+time-dependent run's footprint.
+"""
+function trace_all_geodesics(model, ro, th, phi, freq, pixels_x::Int, pixels_y::Int,
+                             fovx, fovy, maxnstep::Int, Rh, xoff = 0.0, yoff = 0.0;
+                             progress::Bool = true)
+
+    T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a))
+    Xcamera = SVector{4,T}(Camera.camera_position(ro, th, phi, model.a, model))
+    freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
+
+    all_geodesics = Matrix{Vector{GeoTypes.OfTrajGeneric{T}}}(undef, pixels_x, pixels_y)
+    nsteps = zeros(Int, pixels_x, pixels_y)
+    midplane_crossings = zeros(Int, pixels_x, pixels_y)
+
+    # One scratch buffer per row, reused down the row; `:greedy` hands each row
+    # to exactly one task, which is what makes that safe.
+    task_trajs = [Vector{GeoTypes.OfTrajGeneric{T}}(undef, maxnstep) for _ in 1:pixels_x]
+
+    row_last = zeros(T, pixels_x)
+    row_tgeoi = fill(T(-Inf), pixels_x)
+    row_tgeof = zeros(T, pixels_x)
+    log_rmax = log(model.rmax_geo)
+
+    pbar = progress ? Progress(pixels_x; desc = "Tracing geodesics ", showspeed = true, barlen = 30) : nothing
+    plock = ReentrantLock()
+
+    Threads.@threads :greedy for i in 0:(pixels_x - 1)
+        my_traj = task_trajs[i + 1]
+
+        for j in 0:(pixels_y - 1)
+            nstep, crossings = Geodesics.get_pixel(
+                my_traj, i, j, Xcamera, fovx, fovy, freq_unitless,
+                pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
+
+            nsteps[i + 1, j + 1] = nstep
+            midplane_crossings[i + 1, j + 1] = crossings
+            all_geodesics[i + 1, j + 1] = my_traj[1:nstep]
+
+            final_t = my_traj[nstep].X[1]
+            final_t < row_last[i + 1] && (row_last[i + 1] = final_t)
+
+            # Latest entry into, and earliest outgoing exit from, the emitting
+            # radius. Scanning from the camera outward, the first step that
+            # satisfies each test is the extremal one, so both are latched on
+            # their first hit (the `> 0` sentinel marks "not yet set").
+            pixel_tgeoi = one(T)
+            pixel_tgeof = one(T)
+            for k in 1:nstep
+                X = my_traj[k].X
+                K = my_traj[k].Kcon
+                if pixel_tgeoi > 0 && X[2] < log_rmax
+                    pixel_tgeoi = X[1]
+                end
+                if pixel_tgeof > 0 && X[2] > log_rmax && K[2] < 0
+                    pixel_tgeof = X[1]
+                end
+            end
+            pixel_tgeoi < 0 && pixel_tgeoi > row_tgeoi[i + 1] && (row_tgeoi[i + 1] = pixel_tgeoi)
+            if pixel_tgeof < 0
+                pixel_tgeof < row_tgeof[i + 1] && (row_tgeof[i + 1] = pixel_tgeof)
+            elseif final_t < row_tgeof[i + 1]
+                row_tgeof[i + 1] = final_t
+            end
+        end
+
+        if pbar !== nothing
+            lock(plock) do
+                ProgressMeter.next!(pbar)
+            end
+        end
+    end
+    pbar === nothing || finish!(pbar)
+
+    bounds = (t_last = minimum(row_last),
+              tgeoi = maximum(row_tgeoi),
+              tgeof = minimum(row_tgeof))
+    return all_geodesics, nsteps, midplane_crossings, Xcamera, bounds
+end
 
 end

@@ -14,7 +14,7 @@ using ..Camera
 using ..Geodesics
 using ..Radiation
 
-export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image, calculate_gradients,  render_image_gpu!, trace_all_geodesics
+export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image, calculate_gradients,  render_image_gpu!, trace_all_geodesics, raytrace_image_at_time!
 
 """
     output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
@@ -166,6 +166,28 @@ function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pix
     return Image
 end
 
+
+"""
+    raytrace_image_at_time!(Image, model, snaps, all_geodesics, nsteps, freq, t_frame)
+
+Fast light at an arbitrary time `t_frame`, rather than at a dump's own time.
+
+Fast light ignores light-travel delay across the image, so the whole image is
+evaluated at one instant. When that instant falls between dumps the fluid has
+to be interpolated to it — which is what makes a single observer-time cadence
+meaningful across every light mode: fast, brisk and slow light can then be
+asked for the same frame times and compared directly.
+
+`snaps` is a `TimeInterp.SnapshotSet`, normally the two dumps bracketing
+`t_frame`; a one-element set reproduces ordinary fast light exactly.
+
+Declared here and implemented in `Brisklight`, which owns the shared transfer
+loop — the same split the GPU entry points above use.
+
+`Image` is left unscaled by `freq^3`; the caller applies it, as in
+[`raytrace_image`](@ref).
+"""
+function raytrace_image_at_time! end
 
 """
     trace_all_geodesics(model, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy,

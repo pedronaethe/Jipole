@@ -13,7 +13,9 @@ using StaticArrays
 using ..Constants
 using ..Radiation
 using ..Iharm
+using ..Kharma
 using ..Output
+using ..Utils
 using ..GeoTypes
 using ..Utils_GPU
 using Dates
@@ -77,18 +79,19 @@ fluid primitives.
 """
 function get_specific_dump_time(dump_idx::Int64, all_dumps_path::String)
     dump_path = Printf.format(Printf.Format(all_dumps_path), dump_idx)
-    t::Float64 = 0.0
-    h5open(dump_path, "r") do file
-        t = read(file, "t")
-    end
-    return t
+    # Delegate so that both dump layouts work: `Utils.dump_time` reads the
+    # Parthenon `Info/Time` attribute for native KHARMA `.phdf` files and the
+    # root `t` dataset for iharm3d files. Reading `t` directly, as this used to,
+    # made slow light silently unusable on a KHARMA directory.
+    return Utils.dump_time(dump_path)
 end
 
 """
     update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)
 
-Slide the 3-snapshot window `simulation_data` forward by one dump,
-loading the next dump into the (reused) oldest slot.
+Slide the 3-snapshot window `simulation_data` forward by one dump, loading the
+next dump into slot 3. The reader is chosen per file, so both KHARMA and
+iharm3d dumps work.
 
 # Arguments
 - `params_slowlight`: Slow-light run state, updated with the new time
@@ -99,14 +102,19 @@ loading the next dump into the (reused) oldest slot.
 - `all_dumps_path`: `Printf`-style format string for the dump sequence.
 """
 function update_data!(params_slowlight::OfSlowLight, simulation_data, Rhigh::Float64, model::Iharm.IharmParams, all_dumps_path::String)
-    oldest_data = simulation_data[1]
-
+    # Slide the window. The previous version also assigned the evicted snapshot
+    # into slot 3 first, which the `load_data` below overwrote immediately -- a
+    # dead store, so despite the old docstring no buffer was ever reused.
     simulation_data[1] = simulation_data[2]
     simulation_data[2] = simulation_data[3]
 
-    simulation_data[3] = oldest_data
-
-    simulation_data[3] = Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model;
+    # Dispatch on the dump itself so a KHARMA directory loads through `Kharma`
+    # and an iharm3d one through `Iharm`, matching the fast-light branch. Both
+    # readers return an `Iharm.IharmData`, so the window's element type is
+    # unchanged.
+    path = params_slowlight.current_dumps_path
+    reader = Kharma.is_kharma_dump(path) ? Kharma : Iharm
+    simulation_data[3] = reader.load_data(path, Rhigh, model;
         advance_path! = () -> (params_slowlight.current_dumps_path = update_dump_path(params_slowlight, all_dumps_path)))
 
     params_slowlight.tA = simulation_data[1].t

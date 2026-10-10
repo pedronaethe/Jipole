@@ -352,6 +352,9 @@ the black hole mass `MBH` and `M_unit`.
 - `Rlow`, `Rhigh`, `beta_crit`: Mixed electron-temperature-model parameters.
 - `sigma_cut`, `sigma_cut_high`: Magnetization cutoffs for the emitting
   region.
+- `rmin_geo`, `rmax_geo`: Radial bounds of the emitting region (ipole's
+  `rmin_geo`/`rmax_geo`); `nothing` keeps the defaults of 1 and 100. Both are
+  clamped to the grid's `Rin`/`Rout`.
 - `slow_light`: Whether slow-light (time-dependent) interpolation is
   enabled.
 - `M_unit`: Mass unit, in g. Sets the overall density/temperature scale for
@@ -363,7 +366,7 @@ the black hole mass `MBH` and `M_unit`.
 # Returns
 - The populated [`IharmParams`](@ref).
 """
-function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
+function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26, rmin_geo=nothing, rmax_geo=nothing)
     println("Initializing grid from: $filename")
 
     params = IharmParamsBuilder()
@@ -374,6 +377,13 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
     params.sigma_cut = sigma_cut
     params.sigma_cut_high = sigma_cut_high
     params.slow_light = slow_light
+    # Radial bounds of the emitting region, ipole's `rmin_geo`/`rmax_geo`. They
+    # default to 1 and 100 and are clamped to the grid below. Shrinking
+    # `rmax_geo` shrinks the span of emission times a ray samples, and hence how
+    # many snapshots a slow- or brisk-light frame has to hold -- which is what
+    # makes a slow-light comparison tractable on a short dump series.
+    rmin_geo === nothing || (params.rmin_geo = Float64(rmin_geo))
+    rmax_geo === nothing || (params.rmax_geo = Float64(rmax_geo))
 
     params.L_unit = Constants.GNEWT * MBH * Constants.MSUN / Constants.CL^2
     params.T_unit = params.L_unit / Constants.CL

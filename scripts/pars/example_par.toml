@@ -23,6 +23,44 @@ image_cadence = 10.0
 engine = "cpu"
 
 
+# Brisk light: slow-light geometry at reduced temporal fidelity. Only read when
+# [brisklight].on = true, and mutually exclusive with [physical].slow_light.
+#
+# p is the retained probability mass of each lensing band's emission-time
+# distribution. It is the only knob, and it controls how many dump files each
+# band uses *through the geometry*: p sets the width of the band's retained
+# interval, and the dumps needed are the ones bracketing it -- 1 if the band
+# lands on a dump time, 2 if it falls between dumps, about ceil(width/dT)+1 in
+# general. There is deliberately no "snapshots per band" parameter; it is
+# derived, and exposing it would let you contradict p.
+#   p = 0  -> each band evaluated at its modal emission time
+#   p = 1  -> clipping disabled; reduces to slow light
+#
+# Band times are synchronized at n = 0: a frame's time is the time of its n = 0
+# image, so with a cadence that is a multiple of the dump spacing the n = 0 band
+# reads exactly the dump fast light would. Bands n > 0 keep their physical delay
+# offset and interpolate between their two nearest snapshots.
+[brisklight]
+on = false
+p = 0.5
+n_bands = 2        # highest lensing band tracked (n = 0 .. n_bands)
+cadence = 10.0     # M between frames, in observer time
+# t_start = 11810.0  # optional: time of the first frame's n = 0 image
+# n_frames = 10      # optional: stop after this many frames
+sample_stride = 4  # screen subsampling for the emission-time distribution
+weighting = "emission"  # "emission" (j*dl), "steps" or "length"; see src/brisklight.jl
+engine = "cpu"
+
+# Fast light on an observer-time cadence. Optional: without it, fast light
+# renders one image per dump at that dump's own time, as before. With it, frames
+# are placed on a time grid and the fluid is interpolated between the two dumps
+# bracketing each one -- so a fast-light run can share a frame grid with a brisk
+# or slow-light run and be compared to it directly. Requires a dump directory.
+[fastlight]
+# cadence = 10.0
+# t_start = 11800.0
+# n_frames = 10
+
 [gradient]
 # here, we set up the kind of gradients we want to calculate. 
 # options: Rhigh, m_unit, 
@@ -37,6 +75,10 @@ beta_crit = 1.0
 th_beg = 1.74e-2
 sigma_cut = 1.0
 sigma_cut_high = -1.0
+# rmin_geo = 1.0     # optional: inner edge of the emitting region
+# rmax_geo = 100.0   # optional: outer edge. Smaller values shrink the span of
+                     # emission times a ray samples, and so how many snapshots a
+                     # slow- or brisk-light frame must hold.
 
 [camera]
 ro = 1000.0

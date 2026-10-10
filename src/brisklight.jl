@@ -56,12 +56,14 @@ using ..Utils
 using ..Iharm
 using ..Kharma
 using ..Output
+using ..Imaging
 
 export BandStats, BandSample, StepCache, DumpSeries,
     band_walk, analyze_bands, band_stats, modal_hdi, weighted_quantile,
     retained_support, band_interval, band_dump_range, frame_dump_indices,
-    build_timemap, clamped_fraction,
+    build_timemap, slowlight_reference_timemap, clamped_fraction,
     integrate_brisk!, render_brisk_frame!, process_brisklight_images!,
+    process_fastlight_images!,
     reader_for, dump_times_of
 
 # ---------------------------------------------------------------------------
@@ -610,6 +612,10 @@ Per-band emission-time statistics at a given `p`, all in *geometric* time
 - `p`: the retained probability mass these statistics were built at.
 - `t_ref`: `t̄_0`, the synchronization reference. Every band's time is measured
   relative to this, which is what pins `n = 0` to the fast-light snapshot.
+- `support`: the union of every band's sampled support. Band intervals are
+  intersected with this rather than with each band's own support, which is what
+  makes `p = 1` collapse to a single band-independent interval -- see
+  [`band_interval`](@ref).
 """
 struct BandStats{T}
     n_bands::Int
@@ -623,6 +629,7 @@ struct BandStats{T}
     bandwidth::Vector{T}
     p::T
     t_ref::T
+    support::NTuple{2,T}
 end
 
 nbands(s::BandStats) = s.n_bands
@@ -664,7 +671,8 @@ function band_stats(sample::BandSample{T}, p::Real;
             bw[b] = r.bandwidth
             valid[b] = true
         elseif !isempty(ts)
-            @warn "Brisk light: band n=$(b-1) has only $(length(ts)) samples; marked invalid"
+            @warn """
+                Brisk light: band n=$(b-1) has only $(length(ts)) weighted samples (need                 $min_samples), so it has no emission-time statistics and will be rendered                 *unclipped*, i.e. as slow light. That is the accurate choice, but it costs                 the band the full snapshot support, so one unresolved band can wipe out the                 I/O saving for the whole frame. Either lower n_bands to $(b-2), raise the                 image resolution, or lower sample_stride."""
         end
     end
 
@@ -674,12 +682,17 @@ function band_stats(sample::BandSample{T}, p::Real;
         that the camera actually sees the emitting region.""")
 
     t_ref = modal[1]
+    sup_lo = minimum(x for x in tmin if isfinite(x))
+    sup_hi = maximum(x for x in tmax if isfinite(x))
     stats = BandStats{T}(n_bands, modal, lo, hi, copy(tmin), copy(tmax),
-                         valid, nsamp, bw, T(p), t_ref)
+                         valid, nsamp, bw, T(p), t_ref, (T(sup_lo), T(sup_hi)))
 
     if verbose
         @info @sprintf("Brisk light: p = %.3f, %s weighting, synchronization reference t̄_0 = %.4f M",
                        p, sample.weighting, t_ref)
+        nbad = count(!, valid)
+        nbad > 0 && @info @sprintf("Brisk light: %d of %d band(s) unresolved and rendered unclipped; snapshots per image will not fall with p until they are resolved.",
+                                   nbad, nb)
         for b in 1:nb
             valid[b] || continue
             w = hi[b] - lo[b]
@@ -718,16 +731,30 @@ end
 """
     band_interval(stats, b) -> (lo, hi)
 
-Band `b`'s retained interval in geometric time, intersected with its own
-sampled support and falling back to band 0 for an invalid band. Intersecting
-with the support matters at large `p`, where the KDE's padded domain extends
-past any time a ray actually needs.
+Band `b`'s retained interval in geometric time.
+
+The interval is the band's HDI intersected with `stats.support`, the union of
+every band's sampled support. The intersection stops the KDE's padded domain
+from demanding dumps no ray needs; using the *union* rather than band `b`'s own
+support is what preserves the `p = 1` limit, and both details matter:
+
+- At `p = 1` the HDI is `(-Inf, Inf)`, so every band's interval becomes the same
+  `stats.support`. The map loses all band dependence and is exactly slow light's
+  rigid shift over that window — see [`slowlight_reference_timemap`](@ref).
+  Intersecting with each band's own support instead would leave a residual
+  band-dependent clip, and `p = 1` would never quite reach slow light.
+- A band with too few samples to have statistics is left unclipped for the same
+  reason. That renders it as slow light, which is the accurate choice; giving it
+  another band's interval would clip its steps to times they never occupy, and
+  since such a band is the faint high-`n` one, the error would land exactly
+  where the band structure is supposed to live.
 """
 @inline function band_interval(s::BandStats{T}, b::Int) where {T}
-    idx = s.valid[b] ? b : 1
-    lo = max(s.lo[idx], s.tmin[idx])
-    hi = min(s.hi[idx], s.tmax[idx])
-    return hi >= lo ? (lo, hi) : (s.modal[idx], s.modal[idx])
+    sup_lo, sup_hi = s.support
+    s.valid[b] || return (sup_lo, sup_hi)
+    lo = max(s.lo[b], sup_lo)
+    hi = min(s.hi[b], sup_hi)
+    return hi >= lo ? (lo, hi) : (s.modal[b], s.modal[b])
 end
 
 """
@@ -827,6 +854,29 @@ function build_timemap(s::BandStats{T}, t_frame::Real, tA::Real, tB::Real) where
     return TimeMap{nb,T}(T(t_frame), s.t_ref,
                          SVector{nb,T}(los), SVector{nb,T}(his),
                          T(tA), T(tB))
+end
+
+"""
+    slowlight_reference_timemap(stats, t_frame, tA, tB) -> TimeMap
+
+The slow-light map on brisk light's clock: one band, no clipping beyond
+`stats.support`, and the same `t_frame - t̄_0` shift the brisk map applies.
+
+This is the reference a `p = 1` run must reproduce *bitwise*. Rendering it
+through [`render_brisk_frame!`](@ref) with the same geodesics, the same band
+cache and the same [`TimeInterp.SnapshotSet`](@ref) as the brisk run leaves the
+time map as the only difference, which is what makes the `p -> 1` limit testable
+as an identity rather than as a tolerance.
+
+Note the clock: `t_frame` is brisk light's `n = 0` time, while upstream
+`Slowlight` schedules on the camera time. The two differ by `t̄_0`, so a frame
+here corresponds to slow light's target time `t_frame - stats.t_ref`.
+"""
+function slowlight_reference_timemap(s::BandStats{T}, t_frame::Real,
+                                     tA::Real, tB::Real) where {T}
+    sup_lo, sup_hi = s.support
+    return TimeMap{1,T}(T(t_frame), s.t_ref,
+                        SVector{1,T}(sup_lo), SVector{1,T}(sup_hi), T(tA), T(tB))
 end
 
 """
@@ -1134,6 +1184,134 @@ function render_brisk_frame!(Image::AbstractMatrix{T},
 
     bad_pixels[] > 0 && @warn "Brisk light: $(bad_pixels[]) pixel(s) gave a non-finite intensity and were set to NaN"
     return bad_pixels[]
+end
+
+"""
+    Imaging.raytrace_image_at_time!(Image, model, snaps, all_geodesics, nsteps,
+                                    freq, t_frame; progress, desc)
+
+Fast light at `t_frame`: a constant time map over `snaps`, so every pixel reads
+the fluid at the same instant, interpolated between the two dumps bracketing it.
+See the declaration in `Imaging` for why this lives here.
+"""
+function Imaging.raytrace_image_at_time!(Image::AbstractMatrix, model, snaps::SnapshotSet,
+                                         all_geodesics, nsteps::AbstractMatrix{Int},
+                                         freq, t_frame;
+                                         progress::Bool = true,
+                                         desc::AbstractString = "fast light ")
+    nx, ny = size(Image)
+    ts = snapshot_times(snaps)
+    tm = fastlight_timemap(float(t_frame), float(ts[1]), float(ts[end]))
+    return render_brisk_frame!(Image, all_geodesics, nsteps, model, nx, ny, freq,
+                               nothing, tm, snaps; progress = progress, desc = desc)
+end
+
+"""
+    process_fastlight_images!(series, all_geodesics, nsteps, model, nx, ny, freq,
+                              Rhigh; kw...)
+
+Render a fast-light movie on an observer-time cadence, interpolating the fluid
+to each frame time.
+
+This is the `n_bands = 0`, `p = 0` degenerate case of brisk light, and it exists
+so that a fast-light run can be put on exactly the same frame grid as a brisk or
+slow-light run. Each frame loads the one or two dumps bracketing its time, which
+is also the reference point every brisk-light speed-up is measured against.
+
+Keywords match [`process_brisklight_images!`](@ref) where they overlap.
+"""
+function process_fastlight_images!(series::DumpSeries,
+                                   all_geodesics, nsteps::AbstractMatrix{Int},
+                                   model, nx::Int, ny::Int, freq, Rhigh;
+                                   cadence::Real = 10.0,
+                                   t_start::Union{Nothing,Real} = nothing,
+                                   n_frames::Union{Nothing,Integer} = nothing,
+                                   snap_to_dump::Bool = true,
+                                   t_frames::Union{Nothing,AbstractVector} = nothing,
+                                   output_dir::Union{Nothing,AbstractString} = nothing,
+                                   output_prefix::AbstractString = "fast",
+                                   output_format::AbstractString = "ipole",
+                                   meta::Union{Nothing,Dict{String,Any}} = nothing,
+                                   progress::Bool = true,
+                                   verbose::Bool = true)
+
+    dt = series.times
+    sched = if t_frames !== nothing
+        Float64.(collect(t_frames))
+    else
+        t0 = t_start === nothing ? dt[1] : Float64(t_start)
+        if t_start === nothing && snap_to_dump
+            t0 = dt[1]
+        end
+        times = Float64[]
+        t = t0
+        while t <= dt[end] + 1e-9
+            push!(times, t)
+            n_frames !== nothing && length(times) >= n_frames && break
+            t += Float64(cadence)
+        end
+        times
+    end
+
+    outdir = output_dir === nothing ? nothing : String(output_dir)
+    outdir === nothing || mkpath(outdir)
+    manifest = outdir === nothing ? nothing : joinpath(outdir, "frames.csv")
+    if manifest !== nothing
+        open(manifest, "w") do io
+            println(io, "index,t_frame,t_camera,file,n_snapshots,dumps_per_band,",
+                        "n_loads,bytes_read,load_seconds,render_seconds,clamped_fraction,resident_bytes")
+        end
+    end
+
+    Image = zeros(Float64, nx, ny)
+    rows = NamedTuple[]
+    # Band-0-only statistics, so the manifest columns line up with a brisk run
+    # and the two can be diffed directly.
+    dummy = BandStats{Float64}(0, [0.0], [0.0], [0.0], [0.0], [0.0],
+                               [true], [0], [NaN], 0.0, 0.0, (0.0, 0.0))
+
+    for (k, t_frame) in enumerate(sched)
+        idx = collect(band_dump_range(t_frame, t_frame, dt))
+        loads0, bytes0, lt0 = series.n_loads, series.bytes_read, series.load_time
+        snaps = frame_snapshots!(series, idx, Rhigh, model)
+        n_loads = series.n_loads - loads0
+        bytes_read = series.bytes_read - bytes0
+        load_seconds = series.load_time - lt0
+
+        fill!(Image, 0.0)
+        render_seconds = @elapsed Imaging.raytrace_image_at_time!(
+            Image, model, snaps, all_geodesics, nsteps, freq, t_frame;
+            progress = progress, desc = @sprintf("fast t=%.1fM ", t_frame))
+        Image .*= freq^3
+
+        resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
+        file = ""
+        if outdir !== nothing
+            file = write_frame(outdir, output_prefix, output_format, k, t_frame,
+                               Image, snaps, dummy, meta)
+            open(manifest, "a") do io
+                @printf(io, "%d,%.10f,%.10f,%s,%d,%d,%d,%d,%.4f,%.4f,%.6f,%d\n",
+                        k, t_frame, t_frame, basename(file), length(idx), length(idx),
+                        n_loads, bytes_read, load_seconds, render_seconds, 0.0, resident)
+            end
+        end
+
+        push!(rows, (index = k, t_frame = t_frame, t_camera = t_frame, file = file,
+                     dump_indices = idx, n_snapshots = length(idx),
+                     dumps_per_band = [length(idx)], n_loads = n_loads,
+                     bytes_read = bytes_read, load_seconds = load_seconds,
+                     render_seconds = render_seconds, clamped_fraction = 0.0,
+                     resident_bytes = resident))
+
+        verbose && @info @sprintf("  fast frame %d/%d  t = %.3f M  %d snapshot(s)  render %.2f s",
+                                  k, length(sched), t_frame, length(idx), render_seconds)
+    end
+
+    verbose && !isempty(rows) && @info @sprintf("Fast light: %d frame(s), %.2f snapshots/image, %d load(s), %.2f GB read",
+        length(rows), sum(r.n_snapshots for r in rows) / length(rows),
+        series.n_loads, series.bytes_read / 2^30)
+
+    return (frames = length(rows), metrics = rows, schedule = sched)
 end
 
 # ---------------------------------------------------------------------------

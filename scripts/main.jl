@@ -53,6 +53,10 @@ const beta_crit = Jipole.Utils.get_config(config, "plasma", "beta_crit", 1.0)
 const th_beg = Jipole.Utils.get_config(config, "plasma", "th_beg", 1.74e-2)
 const sigma_cut = Jipole.Utils.get_config(config, "plasma", "sigma_cut", 1.0)
 const sigma_cut_high = Jipole.Utils.get_config(config, "plasma", "sigma_cut_high", -1.0)
+# Radial bounds of the emitting region (ipole's rmin_geo/rmax_geo). Optional:
+# omitting them keeps the defaults of 1 and 100, clamped to the grid.
+const rmin_geo = haskey(config, "plasma") ? get(config["plasma"], "rmin_geo", nothing) : nothing
+const rmax_geo = haskey(config, "plasma") ? get(config["plasma"], "rmax_geo", nothing) : nothing
 
 # Camera parameters
 const ro = Jipole.Utils.get_config(config, "camera", "ro", 1000.0)
@@ -76,11 +80,39 @@ const maxnstep = Jipole.Utils.get_config(config, "raytracing", "maxnstep", 25000
 const mode = Jipole.Utils.get_config(config, "raytracing", "mode", "cpu")
 
 
+# Brisk light: reduced temporal fidelity at slow-light geometry. `p` is the
+# retained probability mass of each lensing band's emission-time distribution,
+# and it controls how many dump files each band uses *through the geometry* --
+# there is no "snapshots per band" knob to set. See src/brisklight.jl.
+const brisklight = haskey(config, "brisklight") ?
+                   Jipole.Utils.get_config(config, "brisklight", "on", false) : false
+if brisklight
+    const brisk_p = Jipole.Utils.get_config(config, "brisklight", "p", 0.5)
+    const brisk_nbands = Jipole.Utils.get_config(config, "brisklight", "n_bands", 2)
+    const brisk_cadence = Jipole.Utils.get_config(config, "brisklight", "cadence", 10.0)
+    const brisk_t_start = get(get(config, "brisklight", Dict()), "t_start", nothing)
+    const brisk_nframes = get(get(config, "brisklight", Dict()), "n_frames", nothing)
+    const brisk_stride = Jipole.Utils.get_config(config, "brisklight", "sample_stride", 4)
+    const brisk_weighting = Symbol(Jipole.Utils.get_config(config, "brisklight", "weighting", "emission"))
+    slow_light && error("[physical].slow_light and [brisklight].on are mutually exclusive: pick one temporal mode.")
+    (0.0 <= brisk_p <= 1.0) || error("[brisklight].p must be in [0, 1], got $brisk_p")
+    brisk_nbands >= 0 || error("[brisklight].n_bands must be >= 0, got $brisk_nbands")
+    isdir(dump_filepath) || error("[brisklight].on requires [dump].dump_filepath to be a directory of dumps (got '$dump_filepath')")
+end
+
+# Fast light may also be put on an observer-time cadence, interpolating the
+# fluid to each frame time, so that every mode can share one frame grid.
+const fast_cadence = haskey(config, "fastlight") ?
+                     get(config["fastlight"], "cadence", nothing) : nothing
+const fast_t_start = haskey(config, "fastlight") ? get(config["fastlight"], "t_start", nothing) : nothing
+const fast_nframes = haskey(config, "fastlight") ? get(config["fastlight"], "n_frames", nothing) : nothing
+
 #check how to do gradients
 const do_gradients = Jipole.Utils.get_config(config, "gradient", "on", false)
 const gradient_wrt = Tuple(Symbol.(Jipole.Utils.get_config(config, "gradient", "wrt", String[])))
 if do_gradients
     slow_light && error("Gradients are not supported in slow light mode.")
+    brisklight && error("Gradients are not supported in brisk light mode yet.")
     mode == "gpu" && error("Gradients are only implemented for mode = \"cpu\".")
     isempty(gradient_wrt) && error("[gradient].wrt must list at least one parameter, e.g. wrt = [\"M_unit\"]")
     unknown = setdiff(gradient_wrt, Jipole.Iharm.GRADIENT_PARAM_NAMES)
@@ -89,7 +121,13 @@ end
 
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
-const use_gpu = slow_light ? Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" : mode == "gpu"
+const use_gpu = if slow_light
+    Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu"
+elseif brisklight
+    Jipole.Utils.get_config(config, "brisklight", "engine", "cpu") == "gpu"
+else
+    mode == "gpu"
+end
 
 if do_gradients && use_gpu
     println("Using GPU for gradient computations in this version has not been tested. This will land soon, for now, use CPU mode.")
@@ -134,8 +172,12 @@ else
     const M_unit = M_unit_guess
 end
 
-# Fast light branching
-if !slow_light
+# Temporal-mode branching: brisk light, then fast light, then slow light.
+if brisklight
+    include(joinpath(@__DIR__, "brisklight_run.jl"))
+elseif !slow_light && fast_cadence !== nothing
+    include(joinpath(@__DIR__, "fastlight_cadence_run.jl"))
+elseif !slow_light
     const batched = length(dump_files) > 1
 
     
@@ -158,7 +200,7 @@ if !slow_light
 
         # Read the header and load the data for this dump file.
         reader = Jipole.Kharma.is_kharma_dump(current_dump_filepath) ? Jipole.Kharma : Jipole.Iharm
-        model = reader.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
+        model = reader.read_header(current_dump_filepath, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, rmin_geo=rmin_geo, rmax_geo=rmax_geo, M_unit=M_unit)
 
         #This will read the primitives and the variables derived from them.
         simulation_data = [reader.load_data(current_dump_filepath, Rhigh, model)]
@@ -283,14 +325,18 @@ else
     params_slowlight = Jipole.Slowlight.OfSlowLight(dump_start, dump_max, image_cadence, 0.0, 0.0, 0.0, "")
     params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path)
 
-    model = Jipole.Iharm.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit, slow_light=true)
+    # Dispatch the reader on the dump itself, matching the fast-light branch, so a
+    # KHARMA directory loads through Jipole.Kharma. Both readers return the same
+    # IharmParams/IharmData types, so nothing downstream changes.
+    const sl_reader = Jipole.Kharma.is_kharma_dump(params_slowlight.current_dumps_path) ? Jipole.Kharma : Jipole.Iharm
+    model = sl_reader.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, rmin_geo=rmin_geo, rmax_geo=rmax_geo, M_unit=M_unit, slow_light=true)
 
     advance_dump_path! = () -> (params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path))
 
     simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 3)
-    simulation_data[1] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
-    simulation_data[2] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
-    simulation_data[3] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data[1] = sl_reader.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data[2] = sl_reader.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data[3] = sl_reader.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
 
     params_slowlight.tA = simulation_data[1].t
     params_slowlight.tB = simulation_data[2].t

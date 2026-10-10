@@ -1357,7 +1357,17 @@ function frame_schedule(s::BandStats{T}, dump_times::AbstractVector;
 
     if t_start === nothing && snap_to_dump
         k = searchsortedfirst(dump_times, t_first)
-        k <= length(dump_times) && (t0 = T(dump_times[k]))
+        # Only snap if the dump we land on is still inside the usable window.
+        # When the retained support nearly fills the series that window can be
+        # narrower than one dump spacing, and snapping forward would push the
+        # first frame past the end -- losing every frame rather than giving up
+        # the (cosmetic) alignment.
+        if k <= length(dump_times) && T(dump_times[k]) <= t_last
+            t0 = T(dump_times[k])
+        elseif k <= length(dump_times)
+            @info @sprintf("Brisk light: the usable frame window [%.3f, %.3f] M is narrower than the dump spacing, so the first frame is not aligned to a dump; the n = 0 band will interpolate between two snapshots instead of reading one.",
+                           t_first, t_last)
+        end
     end
 
     dt = T(cadence)

@@ -19,6 +19,7 @@ scripts/*
 !example_notebooks/generate_image_GRMHD.ipynb
 !example_notebooks/generate_images_analytics.ipynb
 !example_notebooks/slowlight_GRMHD.ipynb
+!example_notebooks/BriskLightGRMHD.ipynb
 !scripts/run_slowlight.jl
 # Generated figures
 *.png
@@ -28,6 +29,12 @@ scripts/*
 !scripts/generate_image.jl
 !scripts/pars/
 !scripts/pars/example_par.toml
+
+# Brisk light. The first two are `include`d by scripts/main.jl, so the blanket
+# `scripts/*` rule above would leave a clone with a CLI that cannot run.
+!scripts/brisklight_run.jl
+!scripts/fastlight_cadence_run.jl
+!scripts/benchmark_lightmodes.jl
 
 !scripts/Project.toml
 !scripts/Manifest.toml

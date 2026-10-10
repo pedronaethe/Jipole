@@ -91,7 +91,7 @@ ensure_ipole() {
     git -C "$IPOLE_DIR" checkout -q "$IPOLE_REF" || return 1
     log "Building ipole (MODEL=$model)"
     make -C "$IPOLE_DIR" clean > /dev/null 2>&1
-    if ! make -C "$IPOLE_DIR" -j "$NPROC" MODEL="$model" "${MAKE_ARGS[@]}" > "$IPOLE_DIR/build_$model.log" 2>&1; then
+    if ! make -C "$IPOLE_DIR" -j "$NPROC" MODEL="$model" CFLAGS_CUSTOM=-fcommon "${MAKE_ARGS[@]}" > "$IPOLE_DIR/build_$model.log" 2>&1; then
         tail -30 "$IPOLE_DIR/build_$model.log" >&2
         log "ipole build failed"
         return 1

@@ -337,10 +337,15 @@ function band_walk(midplane_crossings::AbstractMatrix{Int},
                             jf, _ = Radiation.get_jk(Xf, Kconf, Float64(freq), model.a, model, ref)
                             isfinite(jf) && jf > 0 ? T(jf) * T(dl) : zero(T)
                         end
-                        if wt > 0
-                            push!(my_samp[bi], t)
-                            push!(my_wght[bi], wt)
-                        end
+                        # Zero-weight samples are kept, not dropped: if a
+                        # band's emissivity underflows at every sampled step --
+                        # which happens for a faint band, or a strongly
+                        # suppressed one at large Rhigh -- the times are still
+                        # the only record of when that band is sampled, and the
+                        # merge below falls back to weighting them uniformly
+                        # rather than leaving the band with no statistics.
+                        push!(my_samp[bi], t)
+                        push!(my_wght[bi], wt)
                     end
                 end
             end
@@ -363,6 +368,15 @@ function band_walk(midplane_crossings::AbstractMatrix{Int},
             append!(sw[b], wsamp[i][b])
             tmin[b] = min(tmin[b], tlo[i][b])
             tmax[b] = max(tmax[b], thi[i][b])
+        end
+        if !isempty(sw[b]) && sum(sw[b]) <= 0
+            @warn """
+                Brisk light: band n=$(b-1) has $(length(st[b])) sampled steps but zero total
+                emissivity, so its modal time cannot be emission-weighted. Falling back to
+                uniform weighting for this band, which biases it toward wherever the geodesic
+                integrator took small steps. Usually this means the band is genuinely dark;
+                check Rhigh, sigma_cut and the rmin_geo/rmax_geo shell if it should not be."""
+            fill!(sw[b], one(T))
         end
     end
 

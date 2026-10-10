@@ -30,6 +30,14 @@ let
     DYsize = DXsize
     fovx = DXsize / ro
     fovy = DYsize / ro
+    # Report the field of view in M as well as microarcseconds: the conversion
+    # runs through both MBH and the source distance, so mixing a mass and a
+    # distance from different sources silently produces a pencil beam into the
+    # hole (or a field far wider than the grid), and the symptom otherwise shows
+    # up much later as a band with no emission-time samples.
+    @printf("Field of view: %.1f uas = %.2f M at ro = %.1f M (%.2f M per pixel)\n",
+            fov_size, DXsize, ro, DXsize / pixels_x)
+    DXsize < 1.0 && @warn "The field of view is under 1 M across: check that [physical].MBH and [observing].source_distance_pc describe the same source."
 
     geo_time = @elapsed begin
         all_geodesics, nsteps, midplane_crossings, Xcamera, bounds =

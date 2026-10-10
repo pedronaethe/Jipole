@@ -14,8 +14,11 @@ use_gpu && @warn "A GPU brisk-light kernel is not implemented yet; rendering on 
 let
     dump_times = Jipole.Brisklight.dump_times_of(dump_files)
     println("Dump series: $(length(dump_files)) file(s), t = $(round(dump_times[1], digits=3)) .. $(round(dump_times[end], digits=3)) M")
-    length(dump_times) >= 2 ||
-        error("Brisk light needs at least 2 dumps to interpolate between; found $(length(dump_times)).")
+    length(dump_times) >= 2 || error("""
+        Brisk light needs at least 2 dumps to interpolate between; found $(length(dump_times)) in
+        '$dump_filepath'. If the directory does hold more, check [dump].t_init/t_final -- they
+        filter the series by simulation time, and the defaults in example_par.toml
+        (t_init = $t_init, t_final = $t_final) will exclude a run at a different epoch.""")
 
     # Any dump serves as the header source: the grid is fixed across the series.
     reader = Jipole.Kharma.is_kharma_dump(dump_files[1]) ? Jipole.Kharma : Jipole.Iharm
@@ -29,6 +32,14 @@ let
     DYsize = DXsize
     fovx = DXsize / ro
     fovy = DYsize / ro
+    # Report the field of view in M as well as microarcseconds: the conversion
+    # runs through both MBH and the source distance, so mixing a mass and a
+    # distance from different sources silently produces a pencil beam into the
+    # hole (or a field far wider than the grid), and the symptom otherwise shows
+    # up much later as a band with no emission-time samples.
+    @printf("Field of view: %.1f uas = %.2f M at ro = %.1f M (%.2f M per pixel)\n",
+            fov_size, DXsize, ro, DXsize / pixels_x)
+    DXsize < 1.0 && @warn "The field of view is under 1 M across: check that [physical].MBH and [observing].source_distance_pc describe the same source."
 
     # Traced once and reused for every frame. This is the run's dominant memory
     # cost: pixels_x * pixels_y * mean(nsteps) trajectory records.

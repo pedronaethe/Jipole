@@ -8,50 +8,7 @@ using LinearAlgebra
 using ..Coordinates
 using ..Metrics
 
-export x_to_ijk_ghost, x_in_domain, ijk_to_x, interp_scalar, interp_scalar_time, gdet_zone, ZoneLoc, locate
-
-
-"""
-    ZoneLoc{T}
-
-A struct representing the location and interpolation weights for a position `X`
-within the GRMHD simulation grid. It contains the 1-based zone indices `(i, j, k)`,
-the fractional offsets `(del2, del3, del4)` within the zone, the interpolation
-weights `(b1, b2)`, and a boolean flag `in_domain` indicating whether `X` is
-within the grid bounds.
-"""
-struct ZoneLoc{T}
-    i::Int; j::Int; k::Int
-    del2::T; del3::T; del4::T
-    b1::T; b2::T
-    in_domain::Bool
-end
-
-
-"""
-    locate(X, model)
-
-Locate the grid zone and interpolation weights for the position `X` on
-`model`'s simulation grid.
-
-# Arguments
-- `X`: Position four-vector in internal coordinates.
-- `model`: Model parameters, providing the grid geometry.
-
-# Returns
-- A `ZoneLoc` struct containing the zone indices, interpolation weights, and a flag indicating if `X` is within the grid bounds.
-
-"""
-
-@inline function locate(X, model)
-    if x_in_domain(X, model) == 0
-        z = zero(eltype(X))
-        return ZoneLoc(0, 0, 0, z, z, z, z, z, false)
-    end
-    i, j, k, del2, del3, del4 = x_to_ijk_ghost(X, model)
-    return ZoneLoc(i, j, k, del2, del3, del4, 1.0 - del2, 1.0 - del3, true)
-end
-
+export x_to_ijk_ghost, x_in_domain, ijk_to_x, interp_scalar, interp_scalar_time, gdet_zone
 
 """
     x_to_ijk_ghost(X, model)
@@ -137,67 +94,76 @@ function ijk_to_x(i, j, k, X, model)
 end
 
 """
-    interp_scalar(data_arr, zone::ZoneLoc)
+    interp_scalar(X, data, model)
 
 Quadrilinearly interpolate the scalar field `data` at the position `X`.
 
 # Arguments
-- `data_arr`: Scalar field defined on `model`'s simulation grid.
-- `zone`: A `ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
+- `X`: Position four-vector in internal coordinates.
+- `data`: Scalar field defined on `model`'s simulation grid.
+- `model`: Model parameters, providing the grid geometry.
 
 # Returns
 - The interpolated scalar value.
 """
-@inline function interp_scalar(data_arr, zone::ZoneLoc)
-    N3_data = size(data_arr, 3)
-    ip1 = zone.i + 1; jp1 = zone.j + 1
-    kp1 = zone.k + 1 > N3_data ? 1 : zone.k + 1
-    @inbounds interp = data_arr[zone.i, zone.j, zone.k] * zone.b1 * zone.b2 +
-                        data_arr[ip1, zone.j, zone.k] * zone.del2 * zone.b2 +
-                        data_arr[zone.i, jp1, zone.k] * zone.b1 * zone.del3 +
-                        data_arr[ip1, jp1, zone.k] * zone.del2 * zone.del3
-    @inbounds interp = interp * (1.0 - zone.del4) + (
-        data_arr[zone.i, zone.j, kp1] * zone.b1 * zone.b2 +
-        data_arr[ip1, zone.j, kp1] * zone.del2 * zone.b2 +
-        data_arr[zone.i, jp1, kp1] * zone.b1 * zone.del3 +
-        data_arr[ip1, jp1, kp1] * zone.del2 * zone.del3
-    ) * zone.del4
+function interp_scalar(X, data, model)
+    i, j, k, del2, del3, del4 = x_to_ijk_ghost(X, model)
+
+    (N1_data, N2_data, N3_data) = size(data)
+
+    ip1 = i + 1
+    jp1 = j + 1
+
+    kp1 = k + 1
+    if kp1 > N3_data
+        kp1 = 1
+    end
+
+    b1 = 1.0 - del2
+    b2 = 1.0 - del3
+
+    interp = data[i, j, k] * b1 * b2 +
+             data[ip1, j, k] * del2 * b2 +
+             data[i, jp1, k] * b1 * del3 +
+             data[ip1, jp1, k] * del2 * del3
+
+    interp = interp * (1.0 - del4) + (
+                 data[i, j, kp1] * b1 * b2 +
+                 data[ip1, j, kp1] * del2 * b2 +
+                 data[i, jp1, kp1] * b1 * del3 +
+                 data[ip1, jp1, kp1] * del2 * del3
+             ) * del4
+
     return interp
 end
 
 """
-    interp_scalar_time(zone, dataA, dataB, tfac, interp)
+    interp_scalar_time(X, dataA, dataB, tfac, slow_light, model)
 
-Interpolate the scalar field spatially within `zone`, and — when `interp` is
-set — linearly in time between the `dataA` and `dataB` snapshots as
-`tfac * vA + (1 - tfac) * vB`.
-
-`interp` comes from `Iharm.set_tinterp_ns` and says whether there is anything
-to interpolate between. For a `SnapshotSet` or a `Tuple` it is a compile-time
-constant, so this branch folds away and the second spatial interpolation is not
-emitted at all; only slow light's `Vector` path decides it at runtime. Passing
-`false` therefore costs nothing relative to a dedicated single-snapshot
-routine, which is why every light mode can share this one function.
+Interpolate the scalar field spatially at `X`, and (if `slow_light` is
+set) linearly in time between the `dataA` and `dataB` snapshots.
 
 # Arguments
-- `zone`: A [`ZoneLoc`](@ref) holding the zone indices and spatial weights.
-  Shared by both snapshots, since the spatial weights do not depend on time.
-- `dataA`: Scalar field at the earlier snapshot.
-- `dataB`: Scalar field at the later snapshot.
-- `tfac`: Weight on `dataA`.
-- `interp`: Whether to interpolate in time.
+- `X`: Position four-vector in internal coordinates.
+- `dataA`: Scalar field at the earlier time snapshot.
+- `dataB`: Scalar field at the later time snapshot.
+- `tfac`: Time interpolation factor.
+- `slow_light`: Whether slow-light (time-dependent) interpolation is
+  enabled.
+- `model`: Model parameters, providing the grid geometry.
 
 # Returns
 - The interpolated scalar value.
 """
-@inline function interp_scalar_time(zone::ZoneLoc, dataA, dataB, tfac, interp::Bool)
-    vA = interp_scalar(dataA, zone)
-    if interp
-        vB = interp_scalar(dataB, zone)
-        return tfac * vA + (one(tfac) - tfac) * vB
+function interp_scalar_time(X, dataA, dataB, tfac, slow_light::Bool, model)
+    vA = interp_scalar(X, dataA, model)
+    if slow_light || model.brisk_light  
+        vB = interp_scalar(X, dataB, model)
+        return (tfac) * vA + (1.0 - tfac) * vB
     end
     return vA
 end
+
 
 """
     gdet_zone(i, j, k, model)

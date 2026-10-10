@@ -1,1154 +1,879 @@
 """
-Brisk-light rendering: slow-light geometry, reduced temporal fidelity.
+Brisk-light (reduced temporal fidelity, reduced I/O) rendering with p generalization.
 
-Brisk light (Rojas-Paternina & Cardenas-Avendano, arXiv:2605.12659) evaluates
-exactly the same geodesics, redshift factors and source positions as slow
-light, and approximates only the *temporal* argument of the source. For each
-lensing band `n` it builds the distribution of emission times over the band's
-integration steps, takes the modal highest-density interval `T_{n,p}` enclosing
-probability mass `p`, and clips the slow-light emission time into it (Eq. V.2).
+Brisk light evaluates the same geodesics, redshift factors and source positions as
+slow light, and approximates only the *temporal* argument of the source: for each
+lensing band n it builds the distribution of emission times, takes the modal
+highest-density interval T_{n,p} enclosing probability mass p, and clips the
+slow-light emission time to that interval (Eq. V.2 of Rojas-Paternina &
+Cardenas-Avendano). p = 0 evaluates the whole band at its modal time; p = 1
+bypasses the clipping map and reduces to slow light *provided* every band's
+retained support fits inside its loaded snapshot window (see
+`availability_clamp_report`).
 
-`p` is the one knob, and it controls the snapshot count *through the geometry*:
-it sets the width of `T_{n,p}`, that width is fixed by the Kerr delay structure
-and the extent of the emitting region, and the dump files band `n` needs are
-then simply the ones bracketing the interval — about `ceil(width/dT) + 1` of
-them. There is deliberately no "snapshots per band" parameter to set; see
-[`band_dump_range`](@ref).
+Usage
+    model  = Iharm.read_header(...; brisk_light=true, slow_light=false)
+    params = OfBriskLight(n_bands, p, ImageCadence)
+    process_brisklight_images!(params, all_geodesics, nsteps, midplane_crossings,
+                               model, pixels_x, pixels_y, freq, trat_large,
+                               dump_list, dump_times, tA, tB, tf;
+                               t_obs_start = tA - tgeof)
 
-    p = 0    every step of band n is evaluated at the modal time t̄_n
-    0 < p < 1  step times inside the interval are kept, the tails clip to its edges
-    p = 1    the clip is the identity and what remains is slow light
 
-# Synchronization
-
-Band times are measured relative to band 0. A frame is labelled `t_frame`, the
-absolute fluid time of its `n = 0` image — the time fast light would use — and
-band `n` is evaluated around `t_frame + (t̄_n - t̄_0)`. So at `p = 0` band 0 sits
-at exactly `t_frame`, and if `t_frame` is a dump time the interpolation weight
-is 1 and the band uses that one dump, bitwise identically to fast light. Bands
-`n > 0` generally land off the dump grid and interpolate between their two
-nearest snapshots, which is both unavoidable and correct.
-
-The consequence worth remembering when comparing runs: `t_frame` is the `n = 0`
-clock, while slow light's target time is the *camera* clock. The two differ by
-the constant `t̄_0`, so pair brisk frames with fast light by `t_frame` and with
-slow light by `t_frame - t̄_0`. Both are recorded in the manifest.
-
-# Usage
-
-    series = DumpSeries(dump_paths)
-    stats, cache = analyze_bands(midplane_crossings, all_geodesics, nsteps,
-                                 nx, ny, n_bands, model, p)
-    process_brisklight_images!(stats, cache, series, all_geodesics, nsteps, ...)
 """
 module Brisklight
 
+using HDF5
 using Printf
-using StaticArrays
+using DelimitedFiles
 using ProgressMeter
+using StaticArrays
+using Statistics
+using KernelDensity
 using ..Constants
-using ..Coordinates
-using ..GeoTypes
-using ..Grid
 using ..Radiation
-using ..TimeInterp
-using ..Utils
 using ..Iharm
-using ..Kharma
-using ..Output
-using ..Imaging
 
-export BandStats, BandSample, StepCache, DumpSeries,
-    band_walk, analyze_bands, band_stats, modal_hdi, weighted_quantile,
-    retained_support, band_interval, band_dump_range, frame_dump_indices,
-    build_timemap, slowlight_reference_timemap, clamped_fraction,
-    integrate_brisk!, render_brisk_frame!, process_brisklight_images!,
-    process_fastlight_images!,
-    reader_for, dump_times_of
+export OfBriskLight, BandWindowState,
+    compute_band_modal_times!, process_brisklight_images!,
+    collect_band_step_times, band_time_extrema,
+    precompute_step_info,
+    modal_hdi_kde,
+    update_band_window!, find_dump_window, brisk_step_times, get_dump_time,
+    retained_support, band_anchor, availability_clamp_report
 
-# ---------------------------------------------------------------------------
+# 
 # Band convention
-# ---------------------------------------------------------------------------
+# Two distinct quantities share the word "band" and must not be confused.
 #
-# `midplane_crossings[i,j]` is the per-pixel count of theta = pi/2 crossings
-# returned by `Geodesics.get_pixel`: 0 for a captured ray, 1 for the direct
-# image, 2 for the first indirect, and so on. It is offset by one from the
-# lensing-band index n.
+#   * `midplane_crossings[i,j]` is a PER-PIXEL count returned by
+#     `Geodesics.get_pixel`: the total number of times that ray crosses
+#     theta = pi/2 anywhere along its trajectory.
+#         0 -> captured / shadow, 1 -> direct image, 2 -> first indirect, ...
+#     i.e. it is offset by one relative to the AART index n.
 #
-# Bands are assigned per *segment*, not per ray: walking a ray from its far end
-# toward the camera, the segment bounded by crossings k+1 and k carries band k,
-# so one ray feeds several bands and its time map changes as it traverses the
-# plasma. The running counter is seeded at `midplane_crossings` and decremented
-# at each crossing.
+#   * `current_band` is a RUNNING counter used to label geodesic SEGMENTS. It is
+#     seeded at `midplane_crossings[i,j]` and decremented at each crossing while
+#     walking forward along the ray (from the far end toward the camera). The
+#     segment bounded by crossings n and n-1 therefore carries `current_band == n`,
+#     which does coincide with the AART band index.
 #
-# The far-end tail, before the first crossing is reached, is capped at
-# `midplane_crossings - 1` rather than being routed to a separate bin: that
-# tail is the approach to the crossing that produces subimage
-# `midplane_crossings - 1`, so it belongs to that band. Capping it is also what
-# makes a direct ray (`midplane_crossings <= 1`) lie entirely in band 0, and
-# hence reduce exactly to fast light at p = 0. Captured rays, which never
-# cross, fall in band 0 for the same reason.
+# One consequence has no AART counterpart: the segment traversed BEFORE the
+# first crossing (the inbound approach) keeps the seed value
+# `midplane_crossings[i,j]`. Set `approach_bin = true` to route those steps to a
+# dedicated bin at index `n_bands + 1` instead of polluting band
+# `midplane_crossings[i,j]`. Likewise `shadow_bin = true` routes every step of a
+# captured ray (`midplane_crossings == 0`) to index `n_bands + 2` instead of
+# mixing it into band 0.
 #
-# Arrays are indexed `n + 1` for band n, n = 0 .. n_bands.
+# Array layout used throughout: index `n + 1` holds band n for n = 0..n_bands,
+# index `n_bands + 2` holds the approach bin, index `n_bands + 3` the shadow bin.
+# `nbins(n_bands) == n_bands + 3`.
 
+@inline nbins(n_bands::Int) = n_bands + 3
+@inline approach_bin_index(n_bands::Int) = n_bands + 2
+@inline shadow_bin_index(n_bands::Int)   = n_bands + 3
 """
-    above_midplane(X)
+    get_dump_time(dump_idx, all_dumps_path)
 
-Whether `X` lies above the equatorial plane.
-
-Both the MKS and FMKS polar mappings send `X[3] = 1/2` to `theta = pi/2` and
-are monotonic in `X[3]` there, so the sign of `X[3] - 1/2` is exactly the sign
-of `theta - pi/2`. Testing `X[3]` directly therefore agrees with
-`Coordinates.bl_coord` crossing for crossing while skipping its `exp` and `sin`
-— which matters because this runs once per integration step per pixel.
+Read the coordinate time `t` from a dump without loading fluid primitives.
 """
-@inline above_midplane(X) = X[3] < 0.5
-
-# ---------------------------------------------------------------------------
-# Per-step cache
-# ---------------------------------------------------------------------------
-
-"""
-    StepCache
-
-Per-step band index and radiating flag for every pixel, in CSR layout.
-
-Both quantities are pure functions of a geodesic's *spatial* coordinates, which
-never change: only `X[1]` moves with the frame, and `p` changes the clip
-interval rather than the band walk. So this is built once and reused for every
-frame and every `p` of a sweep, which keeps the render loop down to two array
-lookups per step.
-
-The layout is flat on purpose. A `Matrix{Vector{Int8}}` is `nx*ny` separate
-heap allocations that cannot be handed to a GPU; `band` and `radiating` here
-are one allocation each and transfer as-is. Pixel `(i, j)`'s step `k` lives at
-`offsets[pixel_index(c, i, j)] + k`.
-
-# Fields
-- `band::Vector{Int8}`: 0-based lensing-band index of the segment ending at
-  `traj[k-1]`.
-- `radiating::Vector{Bool}`: whether that segment lies inside the emitting shell.
-- `offsets::Vector{Int32}`: CSR base offsets, length `nx*ny + 1`.
-- `nx`, `ny`: image dimensions.
-"""
-struct StepCache
-    band::Vector{Int8}
-    radiating::Vector{Bool}
-    offsets::Vector{Int32}
-    nx::Int
-    ny::Int
+function get_dump_time(dump_idx::Int, all_dumps_path::String)::Float64
+    dump_path = Printf.format(Printf.Format(all_dumps_path), dump_idx)
+    t::Float64 = 0.0
+    h5open(dump_path, "r") do file
+        t = read(file, "t")
+    end
+    return t
+end
+mutable struct OfBriskLight
+    n_bands::Int
+    modal_times::Vector{Float64}
+    hdi_intervals::Vector{NTuple{2,Float64}}
+    band_time_ranges::Vector{NTuple{2,Float64}}
+    band_valid::Vector{Bool}
+    p::Float64
+    image_cadence::Float64
+    t_obs::Float64
 end
 
-@inline pixel_index(c::StepCache, i::Integer, j::Integer) = (j - 1) * c.nx + i
-@inline step_offset(c::StepCache, i::Integer, j::Integer) =
-    @inbounds Int(c.offsets[pixel_index(c, i, j)])
-
 """
-    BandSample{T}
+    OfBriskLight(n_bands, p, image_cadence)
 
-The emission-time sample each band's statistics are built from: per band, the
-times of its radiating steps and the weight each carries, plus the full support.
-
-# Weighting
-
-The quantity brisk light needs is the distribution of *emission* times, so a
-sample has to be weighted by how much each step contributes to the image. Raw
-step counts do not: the geodesic integrator takes its smallest steps deepest in
-the potential, so counting steps measures where the integrator worked rather
-than where the plasma radiated. On a 48x48 test image at `a = 0.94` that bias
-puts band 1's modal time **1.8 M later** than band 0's, when the photon-ring
-delay requires it roughly 18 M *earlier* — the wrong sign, which erases the
-band separation brisk light exists to exploit.
-
-`:emission` (the default) weights each step by `j * dl`, the emissivity from a
-reference snapshot times the step length. It reproduces the offsets obtained
-from the equatorial-crossing times directly — the paper's definition — to
-within a couple of M, while staying step-level, which is what lets the `p = 1`
-limit converge to slow light (a crossing-level sample would be clipped at every
-step and so could never become the identity map).
-
-`:steps` and `:length` are kept for comparison. Both are biased:
-
-| weighting   | n=1 offset | n=2 offset | note                         |
-|:------------|:-----------|:-----------|:-----------------------------|
-| `:steps`    | +1.8 M     | -13.3 M    | wrong sign; integrator bias  |
-| `:length`   | -185.9 M   | -141.3 M   | `dl ~ r`, so the far field wins |
-| `:emission` | -17.9 M    | -33.1 M    | matches crossing times       |
-
-# Fields
-- `t[n+1]`, `w[n+1]`: sampled times and weights for band `n`.
-- `tmin[n+1]`, `tmax[n+1]`: support over *all* radiating steps, not just
-  weighted ones. The transfer loop reads a snapshot at every radiating step
-  whatever its emissivity, so this, not the weighted spread, is what decides
-  which dumps must be resident.
-- `weighting`: which scheme produced `w`.
+Convenience constructor; all per-band arrays are sized and zeroed.
 """
-struct BandSample{T}
-    t::Vector{Vector{T}}
-    w::Vector{Vector{T}}
-    tmin::Vector{T}
-    tmax::Vector{T}
-    weighting::Symbol
+function OfBriskLight(n_bands::Int, p::Real, image_cadence::Real)
+    nb = nbins(n_bands)
+    return OfBriskLight(n_bands,
+                        fill(NaN, nb),
+                        fill((NaN, NaN), nb),
+                        fill((NaN, NaN), nb),
+                        fill(false, nb),
+                        Float64(p),
+                        Float64(image_cadence),
+                        0.0)
 end
 
-Base.length(s::BandSample) = length(s.t)
-
 """
-    band_walk(midplane_crossings, all_geodesics, nsteps, nx, ny, n_bands, model, Rh;
-              sample_stride = 4)
+Per-band snapshot window: which contiguous run of dumps currently brackets the
+band's anchor time. `t_window_start` / `t_window_end` are the absolute simulation
+times of the first and last snapshot and are handed to the integrator as the
+availability clamp (tA, tB).
 
-Walk every geodesic once and return `(cache, sample::BandSample)`.
-
-One pass does all three jobs the prototype split across
-`collect_band_step_times`, `band_time_extrema` and `precompute_step_info`, each
-of which re-walked every ray: the per-step band and radiating flags, the
-emission-time sample the KDE is built from, and the exact support of that
-sample. Walking once matters because the non-radiating outbound leg
-(`r: rmax_geo .. ro`) is the bulk of most rays' steps.
-
-Crossings are counted *before* the radiating-region filter is applied, so the
-counter tracks `Geodesics.trace_geodesic` even where a ray crosses the midplane
-outside the emitting shell. Getting that wrong leaves bands unclosed.
-
-The emission-time sample and its support, however, cover only the steps that
-*do* radiate. Those are exactly the steps that read a snapshot, so they are the
-ones the statistics must describe: a band's modal time should say when its
-plasma was sampled, and its support should say which dumps have to be resident.
-Counting the vacuum steps as well would bias the mode toward wherever the
-integrator took its smallest steps and would demand dumps that no step ever
-reads.
-
-# Keywords
-- `sample_stride`: screen subsampling for the KDE sample. The mode converges
-  quickly, but `tmin`/`tmax` are collected at full resolution regardless, since
-  the support converges slowly and it is the support that sets how many dumps a
-  frame needs.
+Parametric in the snapshot type so that the inner transfer loop stays type
+stable; the concrete type is inferred from a probe load in
+`process_brisklight_images!`.
 """
-function band_walk(midplane_crossings::AbstractMatrix{Int},
-                   all_geodesics,
-                   nsteps::AbstractMatrix{Int},
-                   nx::Int, ny::Int,
-                   n_bands::Int,
-                   model,
-                   Rh;
-                   sample_stride::Int = 4,
-                   weighting::Symbol = :emission,
-                   ref_data = nothing,
-                   freq::Real = 230e9)
-
-    T = Float64
-    weighting in (:emission, :steps, :length) ||
-        error("band_walk: weighting must be :emission, :steps or :length, got :$weighting")
-    if weighting === :emission && ref_data === nothing
-        error("""
-            band_walk: weighting = :emission needs `ref_data`, one snapshot to take the
-            emissivity from. Pass any dump near the frames being rendered; it sets the
-            relative weight of each step, not the rendered values. Use weighting = :steps
-            to opt out, but note that it biases the band offsets (see `BandSample`).""")
-    end
-    # A one-snapshot set makes the emissivity lookup time-independent, so the
-    # weight depends only on where a step is, never on when.
-    ref = ref_data === nothing ? nothing : SnapshotSet([ref_data])
-    npix = nx * ny
-    nb = n_bands + 1
-
-    # CSR offsets first, so every thread knows where to write.
-    offsets = Vector{Int32}(undef, npix + 1)
-    offsets[1] = 0
-    total = 0
-    for j in 1:ny, i in 1:nx
-        total += max(nsteps[i, j], 1)
-        offsets[(j - 1) * nx + i + 1] = Int32(total)
-    end
-
-    band = Vector{Int8}(undef, total)
-    radiating = Vector{Bool}(undef, total)
-
-    # Per-row accumulators, merged after the loop: no locks in the walk, and no
-    # reliance on `threadid()`, which under `:greedy` scheduling can exceed
-    # `nthreads()` (the interactive pool has its own ids) and is not a stable
-    # identity for a task anyway. The row index is unique per iteration, so it is
-    # the safe thing to key on.
-    tsamp = [[T[] for _ in 1:nb] for _ in 1:nx]
-    wsamp = [[T[] for _ in 1:nb] for _ in 1:nx]
-    tlo = [fill(T(Inf), nb) for _ in 1:nx]
-    thi = [fill(T(-Inf), nb) for _ in 1:nx]
-
-    Threads.@threads :greedy for i in 1:nx
-        my_samp = tsamp[i]
-        my_wght = wsamp[i]
-        my_lo = tlo[i]
-        my_hi = thi[i]
-        sample_col = (i - 1) % sample_stride == 0
-
-        for j in 1:ny
-            n = nsteps[i, j]
-            base = Int(offsets[(j - 1) * nx + i])
-
-            if n < 2
-                @inbounds band[base + 1] = Int8(0)
-                @inbounds radiating[base + 1] = false
-                continue
-            end
-
-            traj = all_geodesics[i, j]
-            seed = midplane_crossings[i, j]
-            # Cap for the far-end tail: the band its first crossing produces.
-            bmax = min(max(seed - 1, 0), n_bands)
-            current = seed
-            above_prev = above_midplane(traj[n].X)
-            take_sample = sample_col && (j - 1) % sample_stride == 0
-
-            for nstep in n:-1:2
-                @inbounds Xf = traj[nstep - 1].X
-
-                above_curr = above_midplane(Xf)
-                if above_curr != above_prev
-                    current = max(current - 1, 0)
-                    above_prev = above_curr
-                end
-
-                b = min(current, bmax)
-                rad = Radiation.radiating_region(Xf, model, Rh)
-                @inbounds band[base + nstep] = Int8(b)
-                @inbounds radiating[base + nstep] = rad
-
-                # Sample only steps that actually emit. A step outside the
-                # emitting shell is skipped by the transfer loop and never
-                # touches a snapshot, so including it would corrupt both halves
-                # of the statistics: the long vacuum leg from `rmax_geo` out to
-                # the camera holds most of a ray's steps, so it would drag the
-                # mode toward wherever the integrator happened to take small
-                # steps, and it would inflate the support into demanding dumps
-                # that are never read.
-                if rad
-                    t = Xf[1]
-                    bi = b + 1
-                    @inbounds t < my_lo[bi] && (my_lo[bi] = t)
-                    @inbounds t > my_hi[bi] && (my_hi[bi] = t)
-                    if take_sample
-                        @inbounds dl = traj[nstep - 1].dl
-                        wt = if weighting === :steps
-                            one(T)
-                        elseif weighting === :length
-                            T(dl)
-                        else
-                            @inbounds Kconf = traj[nstep - 1].Kcon
-                            jf, _ = Radiation.get_jk(Xf, Kconf, Float64(freq), model.a, model, ref)
-                            isfinite(jf) && jf > 0 ? T(jf) * T(dl) : zero(T)
-                        end
-                        # Zero-weight samples are kept, not dropped: if a
-                        # band's emissivity underflows at every sampled step --
-                        # which happens for a faint band, or a strongly
-                        # suppressed one at large Rhigh -- the times are still
-                        # the only record of when that band is sampled, and the
-                        # merge below falls back to weighting them uniformly
-                        # rather than leaving the band with no statistics.
-                        push!(my_samp[bi], t)
-                        push!(my_wght[bi], wt)
-                    end
-                end
-            end
-            # Step 1 is the camera endpoint; it seeds nothing but must be defined.
-            @inbounds band[base + 1] = band[base + 2]
-            @inbounds radiating[base + 1] = false
-        end
-    end
-
-    st = [T[] for _ in 1:nb]
-    sw = [T[] for _ in 1:nb]
-    tmin = fill(T(Inf), nb)
-    tmax = fill(T(-Inf), nb)
-    for b in 1:nb
-        total_b = sum(length(tsamp[i][b]) for i in 1:nx)
-        sizehint!(st[b], total_b)
-        sizehint!(sw[b], total_b)
-        for i in 1:nx
-            append!(st[b], tsamp[i][b])
-            append!(sw[b], wsamp[i][b])
-            tmin[b] = min(tmin[b], tlo[i][b])
-            tmax[b] = max(tmax[b], thi[i][b])
-        end
-        if !isempty(sw[b]) && sum(sw[b]) <= 0
-            @warn """
-                Brisk light: band n=$(b-1) has $(length(st[b])) sampled steps but zero total
-                emissivity, so its modal time cannot be emission-weighted. Falling back to
-                uniform weighting for this band, which biases it toward wherever the geodesic
-                integrator took small steps. Usually this means the band is genuinely dark;
-                check Rhigh, sigma_cut and the rmin_geo/rmax_geo shell if it should not be."""
-            fill!(sw[b], one(T))
-        end
-    end
-
-    cache = StepCache(band, radiating, offsets, nx, ny)
-    return cache, BandSample{T}(st, sw, tmin, tmax, weighting)
+mutable struct BandWindowState{D}
+    indices::UnitRange{Int}
+    snapshots::Vector{D}
+    t_window_start::Float64
+    t_window_end::Float64
 end
 
-# ---------------------------------------------------------------------------
+BandWindowState{D}() where {D} =
+    BandWindowState{D}(1:0, Vector{D}(), Inf, -Inf)
+
+# Dump metadata
+
+"""
+    get_dump_time(dump_idx, all_dumps_path)
+
+Read the coordinate time `t` from a dump without loading fluid primitives.
+"""
+function get_dump_time(dump_idx::Int, all_dumps_path::String)::Float64
+    dump_path = Printf.format(Printf.Format(all_dumps_path), dump_idx)
+    t::Float64 = 0.0
+    h5open(dump_path, "r") do file
+        t = read(file, "t")
+    end
+    return t
+end
+
 # Modal highest-density interval
-# ---------------------------------------------------------------------------
 
 """
-    quantile_sorted(xs, q)
+    modal_hdi_kde(ts, p; trim_quantiles, gridsize, bandwidth)
 
-Linearly interpolated quantile of an already-sorted vector. Written out rather
-than pulled from a statistics package so this module adds no dependency to
-Jipole and stays generic in the element type.
+KDE-based modal HDI, valid for any p in [0, 1]. Returns
+`(mode, interval, mass, bandwidth, x_grid, density)`. `x_grid`/`density` are the
+full KDE curve on the trimmed domain (post-trim, pre-clip), handy for plotting
+the same density the HDI was computed from without recomputing it.
+
+`trim_quantiles` defaults to the central fraction q = 0.995 used in the paper,
+i.e. quantiles (0.0025, 0.9975). Trimming defines the smooth density only; no
+sample is removed from the image.
+
+p = 0 returns only the mode. p = 1 returns `(-Inf, Inf)`: the clipping map is
+bypassed entirely, since `clamp(t, -Inf, Inf) == t`. Returning the trimmed
+quantiles instead would still clip the tails and prevent convergence to slow
+light.
 """
-function quantile_sorted(xs::AbstractVector{T}, q::Real) where {T}
-    n = length(xs)
-    n == 0 && return T(NaN)
-    n == 1 && return xs[1]
-    h = (n - 1) * clamp(float(q), 0.0, 1.0) + 1
-    lo = floor(Int, h)
-    hi = min(lo + 1, n)
-    frac = h - lo
-    return xs[lo] + T(frac) * (xs[hi] - xs[lo])
-end
+function modal_hdi_kde(ts::AbstractVector{Float64}, p::Real;
+                       trim_quantiles::Tuple{Float64,Float64} = (0.0025, 0.9975),
+                       gridsize::Int = 4096,
+                       bandwidth::Union{Nothing,Float64} = nothing)
 
-"""
-    weighted_quantile(xs_sorted, ws, q)
+    p = Float64(p)
+    0.0 <= p <= 1.0 || error("modal_hdi_kde: p must be in [0, 1], got p = $p")
 
-Quantile of a weighted sample whose times are already sorted ascending, by
-linear interpolation of the cumulative weight. Used to trim the KDE's domain on
-the weighted distribution rather than the raw one, so a long tail of
-near-zero-emissivity steps cannot stretch the grid.
-"""
-function weighted_quantile(xs::AbstractVector{T}, ws::AbstractVector{T}, q::Real) where {T}
-    n = length(xs)
-    n == 0 && return T(NaN)
-    n == 1 && return xs[1]
-    total = sum(ws)
-    total > 0 || return xs[1]
-    target = T(clamp(float(q), 0.0, 1.0)) * total
-    acc = zero(T)
-    @inbounds for i in 1:n
-        prev = acc
-        acc += ws[i]
-        if acc >= target
-            span = acc - prev
-            frac = span > 0 ? (target - prev) / span : zero(T)
-            return i == 1 ? xs[1] : xs[i - 1] + frac * (xs[i] - xs[i - 1])
-        end
-    end
-    return xs[n]
-end
+    x = filter(isfinite, ts)
+    length(x) >= 2 || error("modal_hdi_kde: need at least 2 finite samples.")
 
-"""
-    silverman_bandwidth(xs, ws = nothing)
+    q_low, q_high = trim_quantiles
+    lo = quantile(x, q_low)
+    hi = quantile(x, q_high)
+    lo < hi || error("modal_hdi_kde: degenerate trim bounds (lo = $lo, hi = $hi).")
 
-Silverman's rule-of-thumb kernel width, using the smaller of the standard
-deviation and the interquartile range so a heavy tail does not oversmooth the
-mode.
-"""
-function silverman_bandwidth(xs::AbstractVector{T}, ws::Union{Nothing,AbstractVector{T}} = nothing) where {T}
-    n = length(xs)
-    n < 2 && return one(T)
-    if ws === nothing
-        m = sum(xs) / n
-        s = sqrt(max(sum(x -> (x - m)^2, xs) / (n - 1), zero(T)))
-        neff = T(n)
-    else
-        sw = sum(ws)
-        sw > 0 || return one(T)
-        m = sum(xs[i] * ws[i] for i in eachindex(xs)) / sw
-        s = sqrt(max(sum(ws[i] * (xs[i] - m)^2 for i in eachindex(xs)) / sw, zero(T)))
-        # Kish effective sample size, so a few dominant weights do not pretend
-        # to the resolution of the full sample.
-        neff = sw * sw / max(sum(w -> w * w, ws), eps(T))
-    end
-    iqr = quantile_sorted(sort(xs), 0.75) - quantile_sorted(sort(xs), 0.25)
-    a = iqr > 0 ? min(s, iqr / T(1.349)) : s
-    a <= 0 && return one(T)
-    return T(0.9) * a * max(neff, T(2))^T(-0.2)
-end
+    x_trim = filter(v -> lo <= v <= hi, x)
+    length(x_trim) >= 2 || error("modal_hdi_kde: too few samples after trimming.")
 
-"""
-    modal_hdi(ts, p; gridsize, trim, bandwidth)
+    h_used = bandwidth === nothing ? _default_bandwidth(x_trim) : bandwidth
+    k = kde(x_trim; boundary = (lo, hi), npoints = gridsize, bandwidth = h_used)
 
-Modal highest-density interval of `ts` at probability mass `p`.
-
-Returns `(mode, lo, hi, mass, bandwidth)`. `p = 0` returns the mode as a
-degenerate interval; `p = 1` returns `(-Inf, Inf)`, bypassing the clip entirely
-rather than returning the trimmed quantiles — clipping the tails at `p = 1`
-would stop brisk light converging to slow light, which is the whole point of
-that limit.
-
-The density is a *binned* Gaussian KDE: the samples are histogrammed onto the
-grid and convolved with a kernel truncated at four bandwidths. Direct
-evaluation would be `O(gridsize x length(ts))`, and `ts` here holds one entry
-per integration step per sampled pixel — millions. Binning makes it
-`O(length(ts) + gridsize x kernel_width)` with no practical loss, and keeps the
-module free of an FFT dependency.
-
-The interval is the connected component of `{density >= threshold}` containing
-the global mode, with `threshold` bisected until the component encloses mass
-`p`. Anchoring on the mode rather than on a central interval matters because
-delay distributions are strongly asymmetric.
-"""
-function modal_hdi(ts::AbstractVector{T}, p::Real;
-                   weights::Union{Nothing,AbstractVector{T}} = nothing,
-                   gridsize::Int = 2048,
-                   trim::Tuple{Float64,Float64} = (0.0025, 0.9975),
-                   bandwidth::Union{Nothing,T} = nothing) where {T<:AbstractFloat}
-
-    pp = T(p)
-    (zero(T) <= pp <= one(T)) || error("modal_hdi: p must be in [0, 1], got $p")
-
-    # Keep times and weights together while filtering, then sort by time so the
-    # quantiles below are meaningful.
-    keep = weights === nothing ?
-           [i for i in eachindex(ts) if isfinite(ts[i])] :
-           [i for i in eachindex(ts) if isfinite(ts[i]) && isfinite(weights[i]) && weights[i] > 0]
-    length(keep) >= 2 || error("modal_hdi: need at least 2 usable samples, got $(length(keep))")
-    ord = sortperm(view(ts, keep))
-    idx = keep[ord]
-    xs = T[ts[i] for i in idx]
-    ws = weights === nothing ? nothing : T[weights[i] for i in idx]
-
-    # Trim on the *weighted* distribution, so a long tail of near-zero-weight
-    # steps cannot set the KDE's domain.
-    lo_t, hi_t = if ws === nothing
-        quantile_sorted(xs, trim[1]), quantile_sorted(xs, trim[2])
-    else
-        weighted_quantile(xs, ws, trim[1]), weighted_quantile(xs, ws, trim[2])
-    end
-    if !(lo_t < hi_t)
-        lo_t, hi_t = xs[1], xs[end]
-    end
-    lo_t < hi_t || error("modal_hdi: degenerate sample (all values equal $(xs[1]))")
-
-    h = bandwidth === nothing ? silverman_bandwidth(xs, ws) : bandwidth
-
-    # Pad the domain so the kernel does not pile mass up against the edges.
-    pad = 3 * h
-    gmin = lo_t - pad
-    gmax = hi_t + pad
-    ng = max(gridsize, 16)
-    dx = (gmax - gmin) / (ng - 1)
-
-    counts = zeros(T, ng)
-    wtot = zero(T)
-    nin = 0
-    for (k, x) in pairs(xs)
-        (lo_t <= x <= hi_t) || continue
-        bin = round(Int, (x - gmin) / dx) + 1
-        (1 <= bin <= ng) || continue
-        wk = ws === nothing ? one(T) : ws[k]
-        @inbounds counts[bin] += wk
-        wtot += wk
-        nin += 1
-    end
-    (nin >= 2 && wtot > 0) || error("modal_hdi: too little weight after trimming ($nin samples, total weight $wtot)")
-
-    half = max(1, ceil(Int, 4 * h / dx))
-    kern = Vector{T}(undef, 2 * half + 1)
-    inv2h2 = one(T) / (2 * h * h)
-    ksum = zero(T)
-    for k in -half:half
-        v = exp(-(k * dx)^2 * inv2h2)
-        kern[k + half + 1] = v
-        ksum += v
-    end
-    kern ./= ksum
-
-    density = zeros(T, ng)
-    for i in 1:ng
-        @inbounds ci = counts[i]
-        ci == 0 && continue
-        for k in max(1, i - half):min(ng, i + half)
-            @inbounds density[k] += ci * kern[k - i + half + 1]
-        end
-    end
-    density ./= (wtot * dx)
+    density = k.density
+    x_grid  = collect(k.x)
+    dx      = step(k.x)
+    ng      = length(density)
 
     mode_idx = argmax(density)
-    t_mode = gmin + (mode_idx - 1) * dx
+    t_modal  = x_grid[mode_idx]
 
-    pp == zero(T) && return (mode = t_mode, lo = t_mode, hi = t_mode,
-                             mass = zero(T), bandwidth = h)
-    pp == one(T) && return (mode = t_mode, lo = T(-Inf), hi = T(Inf),
-                            mass = one(T), bandwidth = h)
+    p == 0.0 && return (mode = t_modal, interval = (t_modal, t_modal),
+                        mass = 0.0, bandwidth = h_used, x_grid = x_grid, density = density)
+    p == 1.0 && return (mode = t_modal, interval = (-Inf, Inf),
+                        mass = 1.0, bandwidth = h_used, x_grid = x_grid, density = density)
 
+    # Cumulative mass, so the enclosed mass of a component is O(1) instead of a
+    # fresh sum (and no BitVector is allocated per bisection step).
     cmass = cumsum(density) .* dx
-    @inline component_mass(l, r) = cmass[r] - (l > 1 ? cmass[l - 1] : zero(T))
 
-    function modal_component(thresh)
+    component_mass(l::Int, r::Int) = cmass[r] - (l > 1 ? cmass[l - 1] : 0.0)
+
+    # Connected component of {density >= threshold} containing the global mode.
+    function modal_component(threshold::Float64)
         l = mode_idx
         r = mode_idx
-        @inbounds while l > 1 && density[l - 1] >= thresh
-            l -= 1
-        end
-        @inbounds while r < ng && density[r + 1] >= thresh
-            r += 1
-        end
+        while l > 1  && density[l - 1] >= threshold; l -= 1; end
+        while r < ng && density[r + 1] >= threshold; r += 1; end
         return l, r
     end
 
-    low = zero(T)
-    high = density[mode_idx]
+    low_thresh  = 0.0
+    high_thresh = density[mode_idx]
+
     for _ in 1:60
-        mid = (low + high) / 2
+        mid  = 0.5 * (low_thresh + high_thresh)
         l, r = modal_component(mid)
-        if component_mass(l, r) >= pp
-            low = mid
+        if component_mass(l, r) >= p
+            low_thresh = mid
         else
-            high = mid
+            high_thresh = mid
         end
     end
-    l, r = modal_component(low)
 
-    return (mode = t_mode,
-            lo = gmin + (l - 1) * dx,
-            hi = gmin + (r - 1) * dx,
-            mass = component_mass(l, r),
-            bandwidth = h)
+    l_f, r_f = modal_component(low_thresh)
+    return (mode      = t_modal,
+            interval  = (x_grid[l_f], x_grid[r_f]),
+            mass      = component_mass(l_f, r_f),
+            bandwidth = h_used,
+            x_grid    = x_grid,
+            density   = density)
 end
 
-# ---------------------------------------------------------------------------
+"""
+Default kernel bandwidth. Uses KernelDensity's own rule when available so that
+the unscanned default matches the library, and falls back to Silverman's rule
+otherwise.
+"""
+function _default_bandwidth(x::AbstractVector{Float64})
+    try
+        return KernelDensity.default_bandwidth(x)
+    catch
+        n = length(x)
+        s = std(x)
+        iqr = quantile(x, 0.75) - quantile(x, 0.25)
+        a = iqr > 0 ? min(s, iqr / 1.349) : s
+        return 0.9 * a * n^(-0.2)
+    end
+end
+
+# Delay sampling
+
+"""
+Resolve the array bin for a running band counter.
+
+`seed` is `midplane_crossings[i,j]`; `band` is the running counter. Steps taken
+before the first crossing still carry `band == seed` and are routed to the
+approach bin when `approach_bin` is set. Rays with `seed == 0` never cross and
+are routed to the shadow bin when `shadow_bin` is set.
+"""
+@inline function _bin_index(band::Int, seed::Int, n_bands::Int,
+                            approach_bin::Bool, shadow_bin::Bool)
+    if shadow_bin && seed == 0
+        return shadow_bin_index(n_bands)
+    end
+    if approach_bin && band == seed && seed > 0
+        return approach_bin_index(n_bands)
+    end
+    return clamp(band, 0, n_bands) + 1
+end
+
+"""
+    collect_band_step_times(midplane_crossings, all_geodesics, nsteps, pixels_x,
+                            pixels_y, n_bands, model, Rh; kwargs...)
+
+Sample the emission-time distribution at the *integration-step* level, bin by
+bin. Returns `times`, a `Vector{Vector{Float64}}` of length
+`nbins(n_bands)`.
+
+The walk mirrors `integrate_brisklight_emission!` exactly, so the HDI of a bin
+describes precisely the set of steps that will later be clipped to it. Crossings
+are detected *before* the radiating-region filter is applied, so the counter
+tracks `trace_geodesic` even when a ray crosses the midplane outside
+`rmin_geo < r < rmax_geo`.
+
+Step-level rather than crossing-level sampling is what makes p = 1 meaningful:
+building the KDE from one crossing time per pixel while clipping at every step
+compares two different domains, and the map could never become the identity. The
+price is that the resulting widths are set jointly by the Kerr delay structure
+and by the geometric extent of the emitting region, so they are NOT directly
+comparable to the equatorial widths quoted in the paper.
+
+# Keywords
+- `pixel_stride`: screen subsampling for the KDE (the mode converges fast).
+- `approach_bin`, `shadow_bin`: see the band-convention note at the top.
+"""
+function collect_band_step_times(midplane_crossings::Matrix{Int},
+                                 all_geodesics,
+                                 nsteps::Matrix{Int},
+                                 pixels_x::Int,
+                                 pixels_y::Int,
+                                 n_bands::Int,
+                                 model,
+                                 Rh::Float64;
+                                 pixel_stride::Int = 4,
+                                 approach_bin::Bool = true,
+                                 shadow_bin::Bool = true)
+
+    nb      = nbins(n_bands)
+    band_ts = [Float64[] for _ in 1:nb]
+
+    for i in 1:pixel_stride:pixels_x, j in 1:pixel_stride:pixels_y
+        n = nsteps[i, j]
+        n < 2 && continue
+        traj = all_geodesics[i, j]
+
+        seed         = midplane_crossings[i, j]
+        current_band = seed
+        _, th_prev   = Iharm.bl_coord(traj[n].X, model)
+        above_prev   = th_prev < pi / 2.0
+
+        for nstep in n:-1:2
+            Xf = traj[nstep - 1].X
+
+            # Crossing bookkeeping first, so that crossings outside the emitting
+            # shell still advance the counter (matches trace_geodesic).
+            _, th_curr = Iharm.bl_coord(Xf, model)
+            above_curr = th_curr < pi / 2.0
+            if above_curr != above_prev
+                current_band = max(current_band - 1, 0)
+                above_prev   = above_curr
+            end
+
+            b = _bin_index(current_band, seed, n_bands, approach_bin, shadow_bin)
+            push!(band_ts[b], Xf[1])
+        end
+    end
+    return band_ts
+end
+
+"""
+    band_time_extrema(...)
+
+Per-bin `(t_min, t_max)` of the sampled step times, computed without building
+the sample vectors. Cheap enough to run at `pixel_stride = 1`, which matters
+because the extrema converge far more slowly than the mode and they are what set
+the frame schedule.
+"""
+function band_time_extrema(midplane_crossings::Matrix{Int},
+                           all_geodesics,
+                           nsteps::Matrix{Int},
+                           pixels_x::Int,
+                           pixels_y::Int,
+                           n_bands::Int,
+                           model,
+                           Rh::Float64;
+                           pixel_stride::Int = 1,
+                           approach_bin::Bool = true,
+                           shadow_bin::Bool = true)
+
+    nb   = nbins(n_bands)
+    tmin = fill(Inf, nb)
+    tmax = fill(-Inf, nb)
+
+    for i in 1:pixel_stride:pixels_x, j in 1:pixel_stride:pixels_y
+        n = nsteps[i, j]
+        n < 2 && continue
+        traj = all_geodesics[i, j]
+
+        seed         = midplane_crossings[i, j]
+        current_band = seed
+        _, th_prev   = Iharm.bl_coord(traj[n].X, model)
+        above_prev   = th_prev < pi / 2.0
+
+        for nstep in n:-1:2
+            Xf = traj[nstep - 1].X
+
+            _, th_curr = Iharm.bl_coord(Xf, model)
+            above_curr = th_curr < pi / 2.0
+            if above_curr != above_prev
+                current_band = max(current_band - 1, 0)
+                above_prev   = above_curr
+            end
+
+            b = _bin_index(current_band, seed, n_bands, approach_bin, shadow_bin)
+            t = Xf[1]
+            t < tmin[b] && (tmin[b] = t)
+            t > tmax[b] && (tmax[b] = t)
+        end
+    end
+    return [(tmin[b], tmax[b]) for b in 1:nb]
+end
+
 # Band statistics
-# ---------------------------------------------------------------------------
 
 """
-    BandStats{T}
+    compute_band_modal_times!(params, band_ts, ranges, p)
 
-Per-band emission-time statistics at a given `p`, all in *geometric* time
-(negative, with the camera at 0).
-
-# Fields
-- `n_bands`: highest band index tracked.
-- `modal[n+1]`: `t̄_n`, the band's modal emission time.
-- `lo[n+1]`, `hi[n+1]`: the retained interval `T_{n,p}`.
-- `tmin[n+1]`, `tmax[n+1]`: the full sampled support, independent of `p`.
-- `valid[n+1]`: false for bands with too few samples to have statistics; they
-  inherit band 0's interval and contribute negligibly by construction.
-- `nsamples[n+1]`, `bandwidth[n+1]`: diagnostics.
-- `p`: the retained probability mass these statistics were built at.
-- `t_ref`: `t̄_0`, the synchronization reference. Every band's time is measured
-  relative to this, which is what pins `n = 0` to the fast-light snapshot.
-- `support`: the union of every band's sampled support. Band intervals are
-  intersected with this rather than with each band's own support, which is what
-  makes `p = 1` collapse to a single band-independent interval -- see
-  [`band_interval`](@ref).
+Fill `modal_times`, `hdi_intervals`, `band_time_ranges` and `band_valid` from a
+sample that has already been collected. Use this form when sweeping p, so that
+the geodesics are walked once instead of once per p.
 """
-struct BandStats{T}
-    n_bands::Int
-    modal::Vector{T}
-    lo::Vector{T}
-    hi::Vector{T}
-    tmin::Vector{T}
-    tmax::Vector{T}
-    valid::Vector{Bool}
-    nsamples::Vector{Int}
-    bandwidth::Vector{T}
-    p::T
-    t_ref::T
-    support::NTuple{2,T}
-end
+function compute_band_modal_times!(params_brisklight::OfBriskLight,
+                                   band_ts::Vector{Vector{Float64}},
+                                   ranges::Vector{NTuple{2,Float64}},
+                                   p::Real;
+                                   min_samples::Int = 32,
+                                   kde_kwargs...)
 
-nbands(s::BandStats) = s.n_bands
-nbins(s::BandStats) = s.n_bands + 1
+    nb = nbins(params_brisklight.n_bands)
+    length(band_ts) == nb || error("compute_band_modal_times!: expected $nb bins.")
 
-"""
-    band_stats(sample::BandSample, p; min_samples = 32, verbose = true, kw...)
-
-Build a [`BandStats`](@ref) from a sample collected by [`band_walk`](@ref).
-
-Separated from the walk so a `p` sweep pays for the geodesics once: pass the
-same `sample` back in for every `p`.
-"""
-function band_stats(sample::BandSample{T}, p::Real;
-                    min_samples::Int = 32,
-                    verbose::Bool = true,
-                    kw...) where {T<:AbstractFloat}
-
-    nb = length(sample)
-    n_bands = nb - 1
-    tmin = sample.tmin
-    tmax = sample.tmax
-    modal = fill(T(NaN), nb)
-    lo = fill(T(NaN), nb)
-    hi = fill(T(NaN), nb)
-    valid = fill(false, nb)
-    nsamp = zeros(Int, nb)
-    bw = fill(T(NaN), nb)
+    params_brisklight.p = Float64(p)
 
     for b in 1:nb
-        ts = sample.t[b]
-        wsb = sample.w[b]
-        nsamp[b] = length(ts)
-        if length(ts) >= min_samples && maximum(ts) > minimum(ts)
-            r = modal_hdi(ts, p; weights = wsb, kw...)
-            modal[b] = r.mode
-            lo[b] = r.lo
-            hi[b] = r.hi
-            bw[b] = r.bandwidth
-            valid[b] = true
-        elseif !isempty(ts)
-            @warn """
-                Brisk light: band n=$(b-1) has only $(length(ts)) weighted samples (need                 $min_samples), so it has no emission-time statistics and will be rendered                 *unclipped*, i.e. as slow light. That is the accurate choice, but it costs                 the band the full snapshot support, so one unresolved band can wipe out the                 I/O saving for the whole frame. Either lower n_bands to $(b-2), raise the                 image resolution, or lower sample_stride."""
+        ts = band_ts[b]
+        if length(ts) >= min_samples && (maximum(ts) > minimum(ts))
+            res = modal_hdi_kde(ts, p; kde_kwargs...)
+            params_brisklight.modal_times[b]      = res.mode
+            params_brisklight.hdi_intervals[b]    = res.interval
+            params_brisklight.band_time_ranges[b] = ranges[b]
+            params_brisklight.band_valid[b]       = true
+        else
+            params_brisklight.modal_times[b]      = NaN
+            params_brisklight.hdi_intervals[b]    = (NaN, NaN)
+            params_brisklight.band_time_ranges[b] = (NaN, NaN)
+            params_brisklight.band_valid[b]       = false
+            length(ts) > 0 && @warn "Brisk-light: bin $b has only $(length(ts)) samples - marked invalid"
         end
     end
+    return params_brisklight
+end
 
-    valid[1] || error("""
-        Brisk light: band n=0 has no statistics ($(nsamp[1]) samples), so there is no
-        synchronization reference. Lower `sample_stride`, raise the resolution, or check
-        that the camera actually sees the emitting region.""")
+"""
+    compute_band_modal_times!(midplane_crossings, all_geodesics, nsteps, pixels_x,
+                              pixels_y, params, model, p; kwargs...)
 
-    t_ref = modal[1]
-    sup_lo = minimum(x for x in tmin if isfinite(x))
-    sup_hi = maximum(x for x in tmax if isfinite(x))
-    stats = BandStats{T}(n_bands, modal, lo, hi, copy(tmin), copy(tmax),
-                         valid, nsamp, bw, T(p), t_ref, (T(sup_lo), T(sup_hi)))
+Collect the sample and fill the band statistics in one call. Returns
+`(band_ts, ranges)` so the caller can cache them across a p sweep.
+"""
+function compute_band_modal_times!(midplane_crossings::Matrix{Int},
+                                   all_geodesics,
+                                   nsteps::Matrix{Int},
+                                   pixels_x::Int,
+                                   pixels_y::Int,
+                                   params_brisklight::OfBriskLight,
+                                   model,
+                                   p::Real;
+                                   pixel_stride::Int = 4,
+                                   extrema_stride::Int = 1,
+                                   approach_bin::Bool = true,
+                                   shadow_bin::Bool = true,
+                                   min_samples::Int = 32,
+                                   verbose::Bool = true,
+                                   kde_kwargs...)
+
+    Rh = 1.0 + sqrt(1.0 - model.a * model.a)
+    nb = params_brisklight.n_bands
+
+    band_ts = collect_band_step_times(midplane_crossings, all_geodesics, nsteps,
+                                      pixels_x, pixels_y, nb, model, Rh;
+                                      pixel_stride = pixel_stride,
+                                      approach_bin = approach_bin,
+                                      shadow_bin   = shadow_bin)
+
+    ranges = band_time_extrema(midplane_crossings, all_geodesics, nsteps,
+                               pixels_x, pixels_y, nb, model, Rh;
+                               pixel_stride = extrema_stride,
+                               approach_bin = approach_bin,
+                               shadow_bin   = shadow_bin)
+
+    compute_band_modal_times!(params_brisklight, band_ts, ranges, p;
+                              min_samples = min_samples,
+                              kde_kwargs...)
 
     if verbose
-        @info @sprintf("Brisk light: p = %.3f, %s weighting, synchronization reference t̄_0 = %.4f M",
-                       p, sample.weighting, t_ref)
-        nbad = count(!, valid)
-        nbad > 0 && @info @sprintf("Brisk light: %d of %d band(s) unresolved and rendered unclipped; snapshots per image will not fall with p until they are resolved.",
-                                   nbad, nb)
-        for b in 1:nb
-            valid[b] || continue
-            w = hi[b] - lo[b]
-            @info @sprintf("  n=%d: t̄ = %10.4f M  (offset %+9.4f)  T_p = [%.4f, %.4f]  width %s  support [%.4f, %.4f]  (%d samples)",
-                           b - 1, modal[b], modal[b] - t_ref, lo[b], hi[b],
-                           isfinite(w) ? @sprintf("%.4f M", w) : "inf",
-                           tmin[b], tmax[b], nsamp[b])
+        for b in 1:nbins(nb)
+            params_brisklight.band_valid[b] || continue
+            lo, hi = params_brisklight.hdi_intervals[b]
+            rl, rh = params_brisklight.band_time_ranges[b]
+            @info @sprintf("Brisk-light bin %s (p=%.3f): t_modal = %10.3f M  HDI = [%.3f, %.3f]  range = [%.3f, %.3f]  (%d samples)",
+                           _bin_name(b, nb), params_brisklight.p,
+                           params_brisklight.modal_times[b], lo, hi, rl, rh,
+                           length(band_ts[b]))
         end
     end
-    return stats
+
+    return band_ts, ranges
+end
+
+function _bin_name(b::Int, n_bands::Int)
+    b == approach_bin_index(n_bands) && return "approach"
+    b == shadow_bin_index(n_bands)   && return "shadow"
+    return "n=$(b - 1)"
 end
 
 """
-    analyze_bands(midplane_crossings, all_geodesics, nsteps, nx, ny, n_bands,
-                  model, p; kw...)
+    retained_support(params) -> (t_lo, t_hi)
 
-Convenience wrapper: walk the geodesics and build the statistics in one call.
-Returns `(stats, cache, sample)`; keep `cache` and `sample` to sweep `p`
-without re-walking the geodesics — call [`band_stats`](@ref) again on the same
-`sample` at the new `p`.
+Earliest and latest *geometric* source time a frame actually needs at the
+current p, reduced over valid bins:
+
+    t_lo = min_n max(HDI_lo_n, range_lo_n)
+    t_hi = max_n min(HDI_hi_n, range_hi_n)
+
+At p = 0 this collapses onto the modal times; at p = 1 it is the full sampled
+support. Both limits are correct, which is why the frame schedule keys off this
+rather than off the modes.
+
+Note that the retained support shrinks with p, so a low-p run can render a
+*longer* observer window from the same dumps than slow light can. Report it.
 """
-function analyze_bands(midplane_crossings, all_geodesics, nsteps,
-                       nx::Int, ny::Int, n_bands::Int, model, p::Real;
-                       sample_stride::Int = 4, min_samples::Int = 32,
-                       weighting::Symbol = :emission, ref_data = nothing,
-                       freq::Real = 230e9, verbose::Bool = true, kw...)
-    Rh = 1 + sqrt(1.0 - model.a * model.a)
-    cache, sample = band_walk(midplane_crossings, all_geodesics, nsteps,
-                              nx, ny, n_bands, model, Rh;
-                              sample_stride = sample_stride, weighting = weighting,
-                              ref_data = ref_data, freq = freq)
-    stats = band_stats(sample, p; min_samples = min_samples, verbose = verbose, kw...)
-    return stats, cache, sample
-end
-
-"""
-    band_interval(stats, b) -> (lo, hi)
-
-Band `b`'s retained interval in geometric time.
-
-The interval is the band's HDI intersected with `stats.support`, the union of
-every band's sampled support. The intersection stops the KDE's padded domain
-from demanding dumps no ray needs; using the *union* rather than band `b`'s own
-support is what preserves the `p = 1` limit, and both details matter:
-
-- At `p = 1` the HDI is `(-Inf, Inf)`, so every band's interval becomes the same
-  `stats.support`. The map loses all band dependence and is exactly slow light's
-  rigid shift over that window — see [`slowlight_reference_timemap`](@ref).
-  Intersecting with each band's own support instead would leave a residual
-  band-dependent clip, and `p = 1` would never quite reach slow light.
-- A band with too few samples to have statistics is left unclipped for the same
-  reason. That renders it as slow light, which is the accurate choice; giving it
-  another band's interval would clip its steps to times they never occupy, and
-  since such a band is the faint high-`n` one, the error would land exactly
-  where the band structure is supposed to live.
-"""
-@inline function band_interval(s::BandStats{T}, b::Int) where {T}
-    sup_lo, sup_hi = s.support
-    s.valid[b] || return (sup_lo, sup_hi)
-    lo = max(s.lo[b], sup_lo)
-    hi = min(s.hi[b], sup_hi)
-    return hi >= lo ? (lo, hi) : (s.modal[b], s.modal[b])
-end
-
-"""
-    retained_support(stats) -> (t_lo, t_hi)
-
-Earliest and latest geometric source time any frame needs at this `p`, reduced
-over valid bands. At `p = 0` it collapses onto the modal times; at `p = 1` it is
-the full sampled support. This, not the modal times, is what bounds the
-observer-time schedule and how many dumps must be resident — and it shrinks
-with `p`, so a low-`p` run can cover a longer observer window from the same
-dumps than slow light can.
-"""
-function retained_support(s::BandStats{T}) where {T}
-    t_lo = T(Inf)
-    t_hi = T(-Inf)
-    for b in 1:nbins(s)
-        s.valid[b] || continue
-        lo, hi = band_interval(s, b)
-        isfinite(lo) && (t_lo = min(t_lo, lo))
-        isfinite(hi) && (t_hi = max(t_hi, hi))
+function retained_support(params_brisklight::OfBriskLight)
+    t_lo =  Inf
+    t_hi = -Inf
+    for b in 1:nbins(params_brisklight.n_bands)
+        params_brisklight.band_valid[b] || continue
+        hlo, hhi = params_brisklight.hdi_intervals[b]
+        rlo, rhi = params_brisklight.band_time_ranges[b]
+        lo = max(hlo, rlo)
+        hi = min(hhi, rhi)
+        isfinite(lo) && lo < t_lo && (t_lo = lo)
+        isfinite(hi) && hi > t_hi && (t_hi = hi)
     end
-    (isfinite(t_lo) && isfinite(t_hi)) || error("retained_support: no valid band")
+    (isfinite(t_lo) && isfinite(t_hi)) ||
+        error("retained_support: no valid band. Run compute_band_modal_times! first.")
     return t_lo, t_hi
 end
 
-# ---------------------------------------------------------------------------
-# Snapshot selection: p -> dumps, through the geometry
-# ---------------------------------------------------------------------------
+"""
+    band_anchor(params, b) -> Float64
+
+Geometric time on which band `b`'s snapshot window is centred. Defaults to the
+mode, clamped into the retained support. Delay distributions are strongly
+asymmetric about their mode, so anchoring on the midpoint of the interval places
+the window off-centre relative to where the mass sits and maximises the clamped
+fraction.
+"""
+function band_anchor(params_brisklight::OfBriskLight, b::Int; anchor::Symbol = :mode)
+    hlo, hhi = params_brisklight.hdi_intervals[b]
+    rlo, rhi = params_brisklight.band_time_ranges[b]
+    lo = max(hlo, rlo)
+    hi = min(hhi, rhi)
+    anchor === :midpoint && return 0.5 * (lo + hi)
+    anchor === :mode     && return clamp(params_brisklight.modal_times[b], lo, hi)
+    error("band_anchor: anchor must be :mode or :midpoint.")
+end
+
+# Snapshot windows
 
 """
-    band_dump_range(lo_abs, hi_abs, dump_times) -> UnitRange{Int}
+    find_dump_window(t_target, dump_times; n_window = 3)
 
-The dumps needed to interpolate over the absolute time interval
-`[lo_abs, hi_abs]`: those bracketing it.
+Return a contiguous run of `n_window` dump indices bracketing `t_target`, chosen
+so that the target sits as close as possible to the centre of the run.
 
-This is where `p` turns into I/O, and nothing else decides it:
+Three is the minimum: the generic `set_tinterp_ns` in `iharm.jl` does
 
-| interval                      | dumps                        |
-|:------------------------------|:-----------------------------|
-| a point, on a dump time       | 1 — no interpolation at all  |
-| a point, between dumps        | 2 — the two nearest          |
-| width `w`                     | about `ceil(w/dT) + 1`       |
+    nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
 
-An interval running past either end of the series clamps to the terminal dump,
-which freezes the plasma there rather than extrapolating it; the fraction of
-steps that happens to is reported by [`clamped_fraction`](@ref).
+so it indexes `data[3]` whenever the query sits in the upper half of the window,
+and a 2-element vector is a latent `BoundsError`. The valid domain of a run is
+`[dump_times[first], dump_times[last]]`, i.e. `(n_window - 1)` dump spacings of
+temporal support per band per frame.
+
+`n_window > 3` requires the generalised `set_tinterp_ns` that bracket-searches
+over N ordered snapshots. Without that patch, keep `n_window = 3`.
 """
-function band_dump_range(lo_abs::Real, hi_abs::Real, dump_times::AbstractVector)
-    n = length(dump_times)
-    iA = clamp(searchsortedlast(dump_times, lo_abs), 1, n)
-    iB = clamp(searchsortedfirst(dump_times, hi_abs), 1, n)
-    iB < iA && (iB = iA)
-    return iA:iB
+function find_dump_window(t_target::Float64, dump_times::Vector{Float64};
+                          n_window::Int = 3)::UnitRange{Int}
+    N = length(dump_times)
+    n_window >= 3 || error("find_dump_window: n_window must be at least 3.")
+    N >= n_window || error("find_dump_window: need at least $n_window dumps, got $N.")
+
+    k = clamp(searchsortedlast(dump_times, t_target), 1, N)
+
+    # Centre the run on t_target: the middle element should be the nearest dump.
+    half = (n_window - 1) ÷ 2
+    i    = clamp(k - half, 1, N - n_window + 1)
+
+    # One-step refinement so the target is not systematically in the upper half.
+    if i + 1 <= N - n_window + 1
+        c_now  = abs(dump_times[i + half]     - t_target)
+        c_next = abs(dump_times[i + half + 1] - t_target)
+        c_next < c_now && (i += 1)
+    end
+    return i:(i + n_window - 1)
 end
 
 """
-    frame_dump_indices(stats, t_frame, dump_times) -> (indices, per_band)
+    update_band_window!(band_state, t_target, dump_times, dump_list, trat_large,
+                        model, dump_cache; n_window)
 
-Dump indices a frame at `t_frame` needs, as the sorted union over bands, plus
-the per-band ranges for diagnostics.
-
-Band `n`'s interval is shifted by `t_frame - t̄_0`, which is the
-synchronization: band 0 lands on `t_frame`, every other band keeps its physical
-offset from band 0.
+Slide a band's snapshot run when `t_target` leaves the current bracket.
+Snapshots are reused across bands and frames through `dump_cache`, so bands
+whose anchors fall within the same spacing cost a single load.
 """
-function frame_dump_indices(s::BandStats{T}, t_frame::Real,
-                            dump_times::AbstractVector) where {T}
-    shift = T(t_frame) - s.t_ref
-    per_band = Vector{UnitRange{Int}}(undef, nbins(s))
-    idx = Int[]
-    for b in 1:nbins(s)
-        lo, hi = band_interval(s, b)
-        r = band_dump_range(lo + shift, hi + shift, dump_times)
-        per_band[b] = r
-        for k in r
-            k in idx || push!(idx, k)
+function update_band_window!(band_state::BandWindowState{D},
+                             t_target::Float64,
+                             dump_times::Vector{Float64},
+                             dump_list::Vector{String},
+                             trat_large::Float64,
+                             model,
+                             dump_cache::Dict{Int,D};
+                             n_window::Int = 3,
+                             verbose::Bool = false) where {D}
+
+    margin = length(dump_times) > 1 ? 2.0 * (dump_times[2] - dump_times[1]) : 0.0
+
+    if band_state.t_window_start + margin <= t_target <= band_state.t_window_end - margin &&
+       length(band_state.snapshots) == n_window
+        return 0
+    end
+
+    new_indices   = find_dump_window(t_target, dump_times; n_window = n_window)
+    new_snapshots = Vector{D}(undef, length(new_indices))
+    n_loaded      = 0
+
+    for (pos, idx) in enumerate(new_indices)
+        if haskey(dump_cache, idx)
+            new_snapshots[pos] = dump_cache[idx]
+        else
+            new_snapshots[pos] = Iharm.load_data(dump_list[idx], trat_large, model)
+            dump_cache[idx]    = new_snapshots[pos]
+            n_loaded          += 1
         end
     end
-    sort!(idx)
-    return idx, per_band
+
+    band_state.indices        = new_indices
+    band_state.snapshots      = new_snapshots
+    band_state.t_window_start = dump_times[first(new_indices)]
+    band_state.t_window_end   = dump_times[last(new_indices)]
+
+    verbose && @info @sprintf("  window -> dumps[%d:%d]  t = [%.3f, %.3f] M  (%d loads)",
+                              first(new_indices), last(new_indices),
+                              band_state.t_window_start, band_state.t_window_end, n_loaded)
+    return n_loaded
 end
 
-"""
-    build_timemap(stats, t_frame, tA, tB) -> TimeMap
+# The time map
 
-The frame's time map: per-band clip bounds in geometric time, the
-synchronization reference `t̄_0`, and the availability clamp `[tA, tB]` set by
-the first and last snapshot actually loaded.
 """
-function build_timemap(s::BandStats{T}, t_frame::Real, tA::Real, tB::Real) where {T}
-    # Promote rather than taking the element type from the statistics: the frame
-    # time is a legitimate differentiation variable (fitting a light curve's
-    # phase, say), and the statistics are always Float64 because they come from a
-    # KDE over sampled times. Pinning the map to the statistics' type would make
-    # a Dual frame time a MethodError.
-    R = promote_type(T, typeof(float(t_frame)), typeof(float(tA)), typeof(float(tB)))
-    nb = nbins(s)
-    los = Vector{R}(undef, nb)
-    his = Vector{R}(undef, nb)
-    for b in 1:nb
-        lo, hi = band_interval(s, b)
-        los[b] = lo
-        his[b] = hi
-    end
-    return TimeMap{nb,R}(R(t_frame), R(s.t_ref),
-                         SVector{nb,R}(los), SVector{nb,R}(his),
-                         R(tA), R(tB))
+    brisk_step_times(t_i_geo, t_f_geo, t_obs, t_left, t_right, tA, tB)
+
+Map a geodesic step pair from geometric to absolute simulation time, applying
+the brisk-light clipping map and then the snapshot-availability clamp.
+
+Each endpoint is clipped independently, which is exactly Eq. V.2. The transfer
+integral is taken over the affine step length `dl` (see
+`Radiation.approximate_solve`), not over `t_f - t_i`, so collapsing a pair onto a
+single time costs nothing: it simply evaluates the plasma at the same instant at
+two different spatial points, which is precisely what p = 0 prescribes.
+
+The availability clamp keeps the interpolation weight computed in
+`set_tinterp_ns` inside [0, 1] instead of extrapolating the plasma. Unlike slow
+light, which defers an out-of-window step to a later round, brisk light must
+evaluate it now, so a clamped step is a locally frozen plasma. Monitor the
+clamped fraction with `availability_clamp_report`; a brisk run whose clamped
+fraction is not negligible is not testing brisk light.
+
+With p = 1 the HDI is `(-Inf, Inf)`, the first clamp is the identity, and what
+remains is slow light's mapping restricted to the loaded window.
+"""
+@inline function brisk_step_times(t_i_geo::Float64, t_f_geo::Float64,
+                                  t_obs::Float64,
+                                  t_left::Float64, t_right::Float64,
+                                  tA::Float64, tB::Float64)
+    tL = t_left  + t_obs
+    tR = t_right + t_obs
+    ti = clamp(clamp(t_i_geo + t_obs, tL, tR), tA, tB)
+    tf = clamp(clamp(t_f_geo + t_obs, tL, tR), tA, tB)
+    return ti, tf
 end
 
+# Per-pixel transfer
 """
-    slowlight_reference_timemap(stats, t_frame, tA, tB) -> TimeMap
+    precompute_step_info(midplane_crossings, all_geodesics, nsteps, pixels_x,
+                         pixels_y, n_bands, model, Rh; approach_bin, shadow_bin)
 
-The slow-light map on brisk light's clock: one band, no clipping beyond
-`stats.support`, and the same `t_frame - t̄_0` shift the brisk map applies.
+Precompute, once per pixel, the two per-step quantities the render loop used to
+recompute on every call: whether a step lies inside the emitting shell
+(`Radiation.radiating_region`), and which bin (band / approach / shadow) it
+belongs to. Both are pure functions of the traced geodesic's SPATIAL coordinates
+`(r, theta)`, which never change; only the time coordinate `X[1]` varies with
+`t_obs`, and `p` only changes the HDI, not the band walk.
 
-This is the reference a `p = 1` run must reproduce *bitwise*. Rendering it
-through [`render_brisk_frame!`](@ref) with the same geodesics, the same band
-cache and the same [`TimeInterp.SnapshotSet`](@ref) as the brisk run leaves the
-time map as the only difference, which is what makes the `p -> 1` limit testable
-as an identity rather than as a tolerance.
+This exists because `integrate_brisklight_emission!` is called once per pixel,
+per frame, per p in a sweep. Before this cache, every one of those calls redid
+the crossing walk from scratch with `Iharm.bl_coord`, including over the long
+non-radiating outbound leg `r: rmax_geo .. ro` (equatorial-crossing detection was
+moved ahead of the radiating-region filter to fix the band-closure bug, F10, so
+it can no longer be skipped by a `continue`). Across a full p sweep that is easily
+billions of redundant coordinate transforms. Precomputing removes it entirely
+from the hot loop, leaving a single array lookup per step.
 
-Note the clock: `t_frame` is brisk light's `n = 0` time, while upstream
-`Slowlight` schedules on the camera time. The two differ by `t̄_0`, so a frame
-here corresponds to slow light's target time `t_frame - stats.t_ref`.
+Returns `(radiating, bin)`, each `Matrix{Vector}` indexed `[i,j][nstep]` exactly
+the way the render loop is: entry `nstep` describes the segment ending at
+`traj[nstep - 1]`. `radiating` is `Vector{Bool}`, `bin` is `Vector{Int8}` holding
+the 1-based index into `hdi_intervals` / `data_bins`.
 """
-function slowlight_reference_timemap(s::BandStats{T}, t_frame::Real,
-                                     tA::Real, tB::Real) where {T}
-    R = promote_type(T, typeof(float(t_frame)), typeof(float(tA)), typeof(float(tB)))
-    sup_lo, sup_hi = s.support
-    return TimeMap{1,R}(R(t_frame), R(s.t_ref),
-                        SVector{1,R}(sup_lo), SVector{1,R}(sup_hi), R(tA), R(tB))
-end
+function precompute_step_info(midplane_crossings::Matrix{Int},
+                              all_geodesics,
+                              nsteps::Matrix{Int},
+                              pixels_x::Int,
+                              pixels_y::Int,
+                              n_bands::Int,
+                              model,
+                              Rh::Float64;
+                              approach_bin::Bool = true,
+                              shadow_bin::Bool = true)
 
-"""
-    clamped_fraction(stats, sample, t_frame, tA, tB) -> (total, per_band)
+    radiating = Matrix{Vector{Bool}}(undef, pixels_x, pixels_y)
+    bin       = Matrix{Vector{Int8}}(undef, pixels_x, pixels_y)
 
-Fraction of sampled steps whose clipped time falls outside `[tA, tB]` and is
-therefore evaluated against a frozen plasma.
+    Threads.@threads :greedy for i in 1:pixels_x
+        for j in 1:pixels_y
+            n = nsteps[i, j]
+            n_alloc = max(n, 1)
+            rad = Vector{Bool}(undef, n_alloc)
+            bn  = Vector{Int8}(undef, n_alloc)
+            seed = midplane_crossings[i, j]
 
-This is the correctness gate on a brisk run, not a performance number: a run
-whose clamped fraction is not negligible is not testing brisk light, and must
-not be compared against slow light.
-"""
-function clamped_fraction(s::BandStats{T}, sample::BandSample{T},
-                          t_frame::Real, tA::Real, tB::Real) where {T}
-    nb = nbins(s)
-    per_band = fill(T(NaN), nb)
-    ntot = 0
-    nclamp = 0
-    shift = T(t_frame) - s.t_ref
-    for b in 1:nb
-        s.valid[b] || continue
-        ts = sample.t[b]
-        isempty(ts) && continue
-        lo, hi = band_interval(s, b)
-        c = 0
-        for t in ts
-            ta = clamp(t + shift, lo + shift, hi + shift)
-            (ta < tA || ta > tB) && (c += 1)
+            if n == 1
+                # Degenerate geodesic (camera point only). The render loop's
+                # seed line reads index `nsteps == 1` before the main loop ever
+                # runs, so it must be defined even though it is never really
+                # exercised as a transfer step.
+                bn[1]  = Int8(clamp(seed, 0, n_bands) + 1)
+                rad[1] = false
+            elseif n >= 2
+                traj = all_geodesics[i, j]
+                current_band = seed
+                _, th_prev   = Iharm.bl_coord(traj[n].X, model)
+                above_prev   = th_prev < pi / 2.0
+
+                for nstep in n:-1:2
+                    Xf = traj[nstep - 1].X
+
+                    _, th_curr = Iharm.bl_coord(Xf, model)
+                    above_curr = th_curr < pi / 2.0
+                    if above_curr != above_prev
+                        current_band = max(current_band - 1, 0)
+                        above_prev   = above_curr
+                    end
+
+                    rad[nstep] = Radiation.radiating_region(Xf, model, Rh)
+                    bn[nstep]  = Int8(_bin_index(current_band, seed, n_bands,
+                                                 approach_bin, shadow_bin))
+                end
+            end
+
+            radiating[i, j] = rad
+            bin[i, j]       = bn
         end
-        per_band[b] = c / length(ts)
-        ntot += length(ts)
-        nclamp += c
     end
-    return (ntot == 0 ? T(NaN) : T(nclamp / ntot)), per_band
-end
-
-# ---------------------------------------------------------------------------
-# Dump series
-# ---------------------------------------------------------------------------
-
-"""
-    reader_for(path)
-
-The reader module for a dump: `Kharma` for native Parthenon `.phdf` files,
-`Iharm` otherwise. Dispatching per file rather than per run means a KHARMA
-directory and an iharm3d directory both work, and KHARMA's iharm3d-format
-output is correctly read by `Iharm`.
-"""
-reader_for(path::AbstractString) = Kharma.is_kharma_dump(String(path)) ? Kharma : Iharm
-
-"""
-    dump_times_of(paths)
-
-Simulation time of each dump, read without loading any fluid primitives.
-Delegates to `Utils.dump_time`, which already handles both the Parthenon `Info`
-attribute and the iharm3d root `t` dataset.
-"""
-dump_times_of(paths::AbstractVector{<:AbstractString}) =
-    Float64[Utils.dump_time(String(p)) for p in paths]
-
-"""
-    DumpSeries(paths; times = dump_times_of(paths))
-
-A time-ordered dump series with a load cache.
-
-The cache is keyed by dump index and is pruned to exactly the set a frame
-needs, so the resident snapshot count is the brisk-light figure of merit rather
-than an unbounded leak: bands whose intervals fall within the same dump spacing
-share a single load, and frames that overlap in time pay nothing to re-enter a
-dump they already hold.
-"""
-mutable struct DumpSeries{D}
-    paths::Vector{String}
-    times::Vector{Float64}
-    cache::Dict{Int,D}
-    n_loads::Int
-    bytes_read::Int
-    load_time::Float64
-end
-
-function DumpSeries(paths::AbstractVector{<:AbstractString};
-                    times::AbstractVector{<:Real} = dump_times_of(paths),
-                    snapshot_type = nothing)
-    ps = String.(collect(paths))
-    ts = Float64.(collect(times))
-    length(ps) == length(ts) ||
-        error("DumpSeries: $(length(ps)) paths but $(length(ts)) times")
-    issorted(ts) || error("DumpSeries: dump times must be ascending")
-    D = snapshot_type === nothing ? Any : snapshot_type
-    return DumpSeries{D}(ps, ts, Dict{Int,D}(), 0, 0, 0.0)
-end
-
-Base.length(s::DumpSeries) = length(s.paths)
-
-"""
-    snapshot_bytes(data)
-
-Approximate resident size of one snapshot: the sum of its array fields. Used
-for the memory-footprint metric.
-"""
-function snapshot_bytes(data)
-    total = 0
-    for f in fieldnames(typeof(data))
-        v = getfield(data, f)
-        v isa AbstractArray && (total += sizeof(v))
-    end
-    return total
+    return radiating, bin
 end
 
 """
-    load_dump!(series, idx, Rhigh, model)
+    integrate_brisklight_emission!(...)
 
-Load dump `idx`, reusing the cache when possible. Accounts the load so a run
-can report dumps read, bytes read and time spent in I/O.
+Per-pixel radiative transfer. `step_bin[nstep]` selects both the active snapshot
+run and the HDI used to clip the step times; `step_radiating[nstep]` gates
+whether the step contributes. Both come from `precompute_step_info` and encode
+the equatorial-crossing walk (band decremented at each crossing while walking
+forward toward the camera, detected before the radiating-region filter, so the
+band counter matches `collect_band_step_times` and `trace_geodesic`) - none of
+that bookkeeping happens in this function any more; it is pure array lookups,
+which is what keeps this loop cheap across a p sweep.
+
+One detail differs from a naive port of `Radiation.integrate_emission!`: when
+the bin changes, the leading emissivity `(ji, ki)` is re-evaluated against the
+new snapshot run. Otherwise a single transfer step would average `j` and
+`alpha` taken from two different epochs, at the equatorial plane, where the
+emission is brightest.
 """
-function load_dump!(series::DumpSeries{D}, idx::Int, Rhigh, model) where {D}
-    haskey(series.cache, idx) && return series.cache[idx]
-    path = series.paths[idx]
-    reader = reader_for(path)
-    t0 = time()
-    data = reader.load_data(path, Rhigh, model)
-    series.load_time += time() - t0
-    series.n_loads += 1
-    series.bytes_read += snapshot_bytes(data)
-    series.cache[idx] = data
-    return data
-end
+function integrate_brisklight_emission!(traj,
+                                        nsteps::Int,
+                                        Image::Matrix{Float64},
+                                        I::Int,
+                                        J::Int,
+                                        freq::Float64,
+                                        bhspin::Float64,
+                                        step_radiating::Vector{Bool},
+                                        step_bin::Vector{Int8},
+                                        data_bins::Vector{Vector{D}},
+                                        hdi_intervals::Vector{NTuple{2,Float64}},
+                                        bin_window_times::Vector{NTuple{2,Float64}},
+                                        t_obs::Float64,
+                                        model,
+                                        bad_pixels::Threads.Atomic{Int}) where {D}
 
-"""
-    prune_cache!(series, keep)
+    NDIM = 4
+    Xi    = MVector{4,Float64}(undef)
+    Kconi = MVector{4,Float64}(undef)
+    Xf    = MVector{4,Float64}(undef)
+    Kconf = MVector{4,Float64}(undef)
+    Xabs  = MVector{4,Float64}(undef)
 
-Drop every cached snapshot whose index is not in `keep`.
-"""
-function prune_cache!(series::DumpSeries, keep)
-    for k in collect(keys(series.cache))
-        k in keep || delete!(series.cache, k)
-    end
-    return series
-end
+    b = Int(step_bin[nsteps])
+    t_left, t_right  = hdi_intervals[b]
+    tA_band, tB_band = bin_window_times[b]
+    data_current     = data_bins[b]
 
-"""
-    frame_snapshots!(series, indices, Rhigh, model) -> SnapshotSet
-
-Load the frame's dumps and pack them into a [`TimeInterp.SnapshotSet`](@ref),
-pruning anything the frame does not need. The returned set's length is part of
-its type, so the caller must cross a function barrier before the render loop —
-see [`render_brisk_frame!`](@ref).
-"""
-function frame_snapshots!(series::DumpSeries, indices::Vector{Int}, Rhigh, model)
-    snaps = [load_dump!(series, k, Rhigh, model) for k in indices]
-    prune_cache!(series, indices)
-    return SnapshotSet(snaps, [series.times[k] for k in indices])
-end
-
-
-# ---------------------------------------------------------------------------
-# Radiative transfer
-# ---------------------------------------------------------------------------
-#
-# The band index and radiating flag are reached through these two accessors so
-# that one transfer loop serves every mode. Passing `nothing` for the cache
-# selects band 0 everywhere and computes the radiating test on the fly, which
-# is what fast light and slow light need; passing a `StepCache` turns both into
-# array lookups. The choice is resolved by dispatch, so neither variant pays a
-# runtime branch.
-
-@inline step_band(::Nothing, off::Int, k::Int) = 0
-@inline step_band(c::StepCache, off::Int, k::Int) = @inbounds Int(c.band[off + k])
-
-@inline step_radiating(::Nothing, off::Int, k::Int, Xf, model, Rh) =
-    Radiation.radiating_region(Xf, model, Rh)
-@inline step_radiating(c::StepCache, off::Int, k::Int, Xf, model, Rh) =
-    @inbounds c.radiating[off + k]
-
-"""
-    integrate_brisk!(traj, nsteps, Image, I, J, freq, bhspin, model, Rh,
-                     cache, off, tm, snaps, bad_pixels)
-
-Radiative transfer along one geodesic under a [`TimeInterp.TimeMap`](@ref).
-
-Structurally this is `Radiation.integrate_emission!` with one change: before
-each emissivity evaluation the step's coordinate time is replaced by the
-absolute fluid time `map_time` gives it. Everything else — the far-end seed,
-the `continue` on non-radiating steps that deliberately does *not* roll
-`(ji, ki)` forward, the trapezoid in `approximate_solve`, the `dl` taken from
-`traj[nstep-1]` — matches the fast-light path exactly, which is what lets the
-`p = 0` run be compared to it bitwise.
-
-The one addition is `pending`: when the band changes, the *leading* emissivity
-is re-evaluated against the new band's time before the step is integrated.
-Without it a single transfer step would average `j` and `alpha` drawn from two
-different epochs, and it would do so at the equatorial plane, where the
-emission is brightest. `pending` is cleared only once the re-evaluation has
-actually happened, so a band change that falls inside a non-radiating gap does
-not leave `(ji, ki)` stranded on the previous band.
-
-Nothing is allocated: `traj[k].X` is an `SVector`, and the time-shifted
-position is rebuilt as another `SVector` on the stack.
-"""
-function integrate_brisk!(traj, nsteps::Int, Image::AbstractMatrix{T},
-                          I::Int, J::Int, freq, bhspin, model, Rh,
-                          cache, off::Int,
-                          tm::TimeMap, snaps::SnapshotSet,
-                          bad_pixels::Threads.Atomic{Int}) where {T}
-
-    if nsteps < 2
-        @inbounds Image[I, J] = zero(T)
-        return
+    for k in 1:NDIM
+        Xi[k]    = traj[nsteps].X[k]
+        Kconi[k] = traj[nsteps].Kcon[k]
     end
 
-    b = step_band(cache, off, nsteps)
-    @inbounds Xi = traj[nsteps].X
-    @inbounds Kconi = traj[nsteps].Kcon
-    Xi_abs = SVector{4,T}(map_time(tm, Xi[1], b), Xi[2], Xi[3], Xi[4])
-    ji, ki = Radiation.get_jk(Xi_abs, Kconi, freq, bhspin, model, snaps)
+    # Seed point: the same map applied to a degenerate pair.
+    ti_abs, _ = brisk_step_times(Xi[1], Xi[1], t_obs, t_left, t_right, tA_band, tB_band)
+    for k in 1:NDIM
+        Xabs[k] = Xi[k]
+    end
+    Xabs[1] = ti_abs
 
-    Intensity = zero(T)
-    pending = false
+    ji, ki = Radiation.get_jk(Xabs, Kconi, freq, bhspin, model, data_current)
+    Intensity = 0.0
+
+    # Set when the active bin changes; cleared only once the leading emissivity
+    # has actually been re-evaluated, so a crossing that falls in a non-radiating
+    # gap does not leave (ji, ki) stranded on the previous bin's snapshots.
+    pending_reeval = false
 
     for nstep in nsteps:-1:2
-        @inbounds Xf = traj[nstep - 1].X
-
-        bn = step_band(cache, off, nstep)
-        if bn != b
-            b = bn
-            pending = true
+        for k in 1:NDIM
+            Xi[k]    = traj[nstep].X[k]
+            Xf[k]    = traj[nstep - 1].X[k]
+            Kconi[k] = traj[nstep].Kcon[k]
+            Kconf[k] = traj[nstep - 1].Kcon[k]
         end
 
-        step_radiating(cache, off, nstep, Xf, model, Rh) || continue
-
-        @inbounds Xi = traj[nstep].X
-        @inbounds Kconi = traj[nstep].Kcon
-        @inbounds Kconf = traj[nstep - 1].Kcon
-
-        if pending
-            Xi_abs = SVector{4,T}(map_time(tm, Xi[1], b), Xi[2], Xi[3], Xi[4])
-            ji, ki = Radiation.get_jk(Xi_abs, Kconi, freq, bhspin, model, snaps)
-            pending = false
+        b_new = Int(step_bin[nstep])
+        if b_new != b
+            b = b_new
+            t_left, t_right  = hdi_intervals[b]
+            tA_band, tB_band = bin_window_times[b]
+            data_current     = data_bins[b]
+            pending_reeval   = true
         end
 
-        Xf_abs = SVector{4,T}(map_time(tm, Xf[1], b), Xf[2], Xf[3], Xf[4])
-        jf, kf = Radiation.get_jk(Xf_abs, Kconf, freq, bhspin, model, snaps)
+        # Re-evaluate the leading endpoint against the new bin, so that a single
+        # transfer step never mixes two epochs.
+        if pending_reeval
+            ti_new, _ = brisk_step_times(Xi[1], Xi[1], t_obs, t_left, t_right, tA_band, tB_band)
+            for k in 1:NDIM
+                Xabs[k] = Xi[k]
+            end
+            Xabs[1] = ti_new
+            ji, ki = Radiation.get_jk(Xabs, Kconi, freq, bhspin, model, data_current)
+            pending_reeval = false
+        end
 
-        @inbounds Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf,
-                                                          traj[nstep - 1].dl)
+        _, tf_abs = brisk_step_times(Xi[1], Xf[1], t_obs, t_left, t_right, tA_band, tB_band)
+        for k in 1:NDIM
+            Xabs[k] = Xf[k]
+        end
+        Xabs[1] = tf_abs
+
+        jf, kf = Radiation.get_jk(Xabs, Kconf, freq, bhspin, model, data_current)
+
+        Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep - 1].dl)
 
         if !isfinite(Intensity)
             Threads.atomic_add!(bad_pixels, 1)
-            @inbounds Image[I, J] = T(NaN)
+            Image[I, J] = NaN
             return
         end
 
@@ -1156,450 +881,355 @@ function integrate_brisk!(traj, nsteps::Int, Image::AbstractMatrix{T},
         ki = kf
     end
 
-    @inbounds Image[I, J] = Intensity
+    Image[I, J] = Intensity
     return
 end
 
-"""
-    render_brisk_frame!(Image, all_geodesics, nsteps, model, nx, ny, freq,
-                        cache, tm, snaps; progress, desc)
-
-Render one frame into `Image`, in place.
-
-This exists as its own function to act as a type barrier: a `SnapshotSet`'s
-length is part of its type and changes from frame to frame as `p` and the
-geometry decide how many dumps a frame needs, so the dynamic dispatch is paid
-once per frame here rather than once per pixel inside the loop. Julia then
-specializes the whole transfer loop on both the snapshot count and the band
-cache, which is what keeps `nearest_pair`'s bracket search unrolled.
-
-`Image` is *not* scaled by `freq^3`; the caller does that, matching
-`Imaging.raytrace_image`.
-"""
-function render_brisk_frame!(Image::AbstractMatrix{T},
-                             all_geodesics, nsteps::AbstractMatrix{Int},
-                             model, nx::Int, ny::Int, freq,
-                             cache, tm::TimeMap, snaps::SnapshotSet;
-                             progress::Bool = true,
-                             desc::AbstractString = "brisk ") where {T}
-
-    Rh = 1 + sqrt(1.0 - model.a * model.a)
-    bad_pixels = Threads.Atomic{Int}(0)
-    offsets = cache === nothing ? nothing : cache.offsets
-
-    pbar = progress ? Progress(nx; desc = String(desc), showspeed = true, barlen = 30) : nothing
-    plock = ReentrantLock()
-
-    Threads.@threads :greedy for i in 1:nx
-        for j in 1:ny
-            off = offsets === nothing ? 0 : Int(@inbounds offsets[(j - 1) * nx + i])
-            integrate_brisk!(all_geodesics[i, j], nsteps[i, j], Image, i, j,
-                             freq, model.a, model, Rh, cache, off, tm, snaps,
-                             bad_pixels)
-        end
-        if pbar !== nothing
-            lock(plock) do
-                ProgressMeter.next!(pbar)
-            end
-        end
-    end
-    pbar === nothing || finish!(pbar)
-
-    bad_pixels[] > 0 && @warn "Brisk light: $(bad_pixels[]) pixel(s) gave a non-finite intensity and were set to NaN"
-    return bad_pixels[]
-end
-
-"""
-    Imaging.raytrace_image_at_time!(Image, model, snaps, all_geodesics, nsteps,
-                                    freq, t_frame; progress, desc)
-
-Fast light at `t_frame`: a constant time map over `snaps`, so every pixel reads
-the fluid at the same instant, interpolated between the two dumps bracketing it.
-See the declaration in `Imaging` for why this lives here.
-"""
-function Imaging.raytrace_image_at_time!(Image::AbstractMatrix, model, snaps::SnapshotSet,
-                                         all_geodesics, nsteps::AbstractMatrix{Int},
-                                         freq, t_frame;
-                                         progress::Bool = true,
-                                         desc::AbstractString = "fast light ")
-    nx, ny = size(Image)
-    ts = snapshot_times(snaps)
-    tm = fastlight_timemap(float(t_frame), float(ts[1]), float(ts[end]))
-    return render_brisk_frame!(Image, all_geodesics, nsteps, model, nx, ny, freq,
-                               nothing, tm, snaps; progress = progress, desc = desc)
-end
-
-"""
-    process_fastlight_images!(series, all_geodesics, nsteps, model, nx, ny, freq,
-                              Rhigh; kw...)
-
-Render a fast-light movie on an observer-time cadence, interpolating the fluid
-to each frame time.
-
-This is the `n_bands = 0`, `p = 0` degenerate case of brisk light, and it exists
-so that a fast-light run can be put on exactly the same frame grid as a brisk or
-slow-light run. Each frame loads the one or two dumps bracketing its time, which
-is also the reference point every brisk-light speed-up is measured against.
-
-Keywords match [`process_brisklight_images!`](@ref) where they overlap.
-"""
-function process_fastlight_images!(series::DumpSeries,
-                                   all_geodesics, nsteps::AbstractMatrix{Int},
-                                   model, nx::Int, ny::Int, freq, Rhigh;
-                                   cadence::Real = 10.0,
-                                   t_start::Union{Nothing,Real} = nothing,
-                                   n_frames::Union{Nothing,Integer} = nothing,
-                                   snap_to_dump::Bool = true,
-                                   t_frames::Union{Nothing,AbstractVector} = nothing,
-                                   output_dir::Union{Nothing,AbstractString} = nothing,
-                                   output_prefix::AbstractString = "fast",
-                                   output_format::AbstractString = "ipole",
-                                   meta::Union{Nothing,Dict{String,Any}} = nothing,
-                                   progress::Bool = true,
-                                   verbose::Bool = true)
-
-    dt = series.times
-    sched = if t_frames !== nothing
-        Float64.(collect(t_frames))
-    else
-        t0 = t_start === nothing ? dt[1] : Float64(t_start)
-        if t_start === nothing && snap_to_dump
-            t0 = dt[1]
-        end
-        times = Float64[]
-        t = t0
-        while t <= dt[end] + 1e-9
-            push!(times, t)
-            n_frames !== nothing && length(times) >= n_frames && break
-            t += Float64(cadence)
-        end
-        times
-    end
-
-    outdir = output_dir === nothing ? nothing : String(output_dir)
-    outdir === nothing || mkpath(outdir)
-    manifest = outdir === nothing ? nothing : joinpath(outdir, "frames.csv")
-    if manifest !== nothing
-        open(manifest, "w") do io
-            println(io, "index,t_frame,t_camera,file,n_snapshots,dumps_per_band,",
-                        "n_loads,bytes_read,load_seconds,render_seconds,clamped_fraction,resident_bytes")
-        end
-    end
-
-    Image = zeros(Float64, nx, ny)
-    rows = NamedTuple[]
-    # Band-0-only statistics, so the manifest columns line up with a brisk run
-    # and the two can be diffed directly.
-    dummy = BandStats{Float64}(0, [0.0], [0.0], [0.0], [0.0], [0.0],
-                               [true], [0], [NaN], 0.0, 0.0, (0.0, 0.0))
-
-    for (k, t_frame) in enumerate(sched)
-        idx = collect(band_dump_range(t_frame, t_frame, dt))
-        loads0, bytes0, lt0 = series.n_loads, series.bytes_read, series.load_time
-        snaps = frame_snapshots!(series, idx, Rhigh, model)
-        n_loads = series.n_loads - loads0
-        bytes_read = series.bytes_read - bytes0
-        load_seconds = series.load_time - lt0
-
-        fill!(Image, 0.0)
-        render_seconds = @elapsed Imaging.raytrace_image_at_time!(
-            Image, model, snaps, all_geodesics, nsteps, freq, t_frame;
-            progress = progress, desc = @sprintf("fast t=%.1fM ", t_frame))
-        Image .*= freq^3
-
-        resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
-        file = ""
-        if outdir !== nothing
-            file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, dummy, meta)
-            open(manifest, "a") do io
-                @printf(io, "%d,%.10f,%.10f,%s,%d,%d,%d,%d,%.4f,%.4f,%.6f,%d\n",
-                        k, t_frame, t_frame, basename(file), length(idx), length(idx),
-                        n_loads, bytes_read, load_seconds, render_seconds, 0.0, resident)
-            end
-        end
-
-        push!(rows, (index = k, t_frame = t_frame, t_camera = t_frame, file = file,
-                     dump_indices = idx, n_snapshots = length(idx),
-                     dumps_per_band = [length(idx)], n_loads = n_loads,
-                     bytes_read = bytes_read, load_seconds = load_seconds,
-                     render_seconds = render_seconds, clamped_fraction = 0.0,
-                     resident_bytes = resident))
-
-        verbose && @info @sprintf("  fast frame %d/%d  t = %.3f M  %d snapshot(s)  render %.2f s",
-                                  k, length(sched), t_frame, length(idx), render_seconds)
-    end
-
-    verbose && !isempty(rows) && @info @sprintf("Fast light: %d frame(s), %.2f snapshots/image, %d load(s), %.2f GB read",
-        length(rows), sum(r.n_snapshots for r in rows) / length(rows),
-        series.n_loads, series.bytes_read / 2^30)
-
-    return (frames = length(rows), metrics = rows, schedule = sched)
-end
-
 # ---------------------------------------------------------------------------
-# Frame schedule
+# Availability-clamp accounting (used internally by process_brisklight_images!)
 # ---------------------------------------------------------------------------
 
 """
-    frame_window(stats, dump_times) -> (t_first, t_last)
+    availability_clamp_report(params, band_ts, bin_window_times, t_obs)
+        -> (frac_total, frac_per_bin)
 
-Range of frame times the loaded series can serve without freezing the plasma:
-the earliest and latest `t_frame` for which every time the retained support
-needs still falls inside `[dump_times[1], dump_times[end]]`.
-
-Because the support shrinks with `p`, this window *widens* as `p` falls — a
-low-`p` run covers a longer observer baseline from the same dumps than slow
-light can, which is a result worth reporting rather than a coincidence.
+Fraction of sampled steps whose clipped time falls outside the loaded snapshot
+run and is therefore evaluated against a frozen plasma. Called once per frame
+by `process_brisklight_images!` to decide whether to warn that the loaded
+snapshot window is too narrow for the current p (frozen-plasma contamination
+above ~1% means results should not be compared to slow light).
 """
-function frame_window(s::BandStats{T}, dump_times::AbstractVector) where {T}
-    t_lo, t_hi = retained_support(s)
-    return (T(dump_times[1]) - t_lo + s.t_ref, T(dump_times[end]) - t_hi + s.t_ref)
-end
+function availability_clamp_report(params_brisklight::OfBriskLight,
+                                   band_ts::Vector{Vector{Float64}},
+                                   bin_window_times::Vector{NTuple{2,Float64}},
+                                   t_obs::Float64)
+    nb        = nbins(params_brisklight.n_bands)
+    per_bin   = fill(NaN, nb)
+    n_total   = 0
+    n_clamped = 0
 
-"""
-    frame_schedule(stats, dump_times; cadence, t_start, n_frames, snap_to_dump)
-
-Vector of frame times.
-
-With `snap_to_dump` (the default) the first frame is moved forward onto the
-nearest dump time at or after the start of the available window. Advancing from
-there by a cadence that is a multiple of the dump spacing keeps every frame's
-`n = 0` band exactly on a dump, so each frame has a fast-light counterpart that
-uses precisely the same file. A cadence finer than the dump spacing is allowed
-and simply interpolates, for `n = 0` as for every other band.
-"""
-function frame_schedule(s::BandStats{T}, dump_times::AbstractVector;
-                        cadence::Real = 10.0,
-                        t_start::Union{Nothing,Real} = nothing,
-                        n_frames::Union{Nothing,Integer} = nothing,
-                        snap_to_dump::Bool = true) where {T}
-
-    t_first, t_last = frame_window(s, dump_times)
-    t0 = t_start === nothing ? t_first : T(t_start)
-
-    if t_start === nothing && snap_to_dump
-        k = searchsortedfirst(dump_times, t_first)
-        # Only snap if the dump we land on is still inside the usable window.
-        # When the retained support nearly fills the series that window can be
-        # narrower than one dump spacing, and snapping forward would push the
-        # first frame past the end -- losing every frame rather than giving up
-        # the (cosmetic) alignment.
-        if k <= length(dump_times) && T(dump_times[k]) <= t_last
-            t0 = T(dump_times[k])
-        elseif k <= length(dump_times)
-            @info @sprintf("Brisk light: the usable frame window [%.3f, %.3f] M is narrower than the dump spacing, so the first frame is not aligned to a dump; the n = 0 band will interpolate between two snapshots instead of reading one.",
-                           t_first, t_last)
+    for b in 1:nb
+        params_brisklight.band_valid[b] || continue
+        ts = band_ts[b]
+        isempty(ts) && continue
+        tL, tR = params_brisklight.hdi_intervals[b]
+        tA, tB = bin_window_times[b]
+        c = 0
+        for t in ts
+            ta = clamp(t + t_obs, tL + t_obs, tR + t_obs)
+            (ta < tA || ta > tB) && (c += 1)
         end
+        per_bin[b] = c / length(ts)
+        n_total   += length(ts)
+        n_clamped += c
     end
-
-    dt = T(cadence)
-    dt > 0 || error("frame_schedule: cadence must be positive, got $cadence")
-
-    times = T[]
-    t = t0
-    while t <= t_last + eps(T(1)) * max(one(T), abs(t_last)) * 8
-        push!(times, t)
-        n_frames !== nothing && length(times) >= n_frames && break
-        t += dt
-    end
-
-    if isempty(times)
-        @warn @sprintf("Brisk light: no frame fits. Available window for p = %.3f is [%.3f, %.3f] M and t_start = %.3f.",
-                       s.p, t_first, t_last, t0)
-    end
-    return times
+    return (n_total == 0 ? NaN : n_clamped / n_total), per_bin
 end
 
-# ---------------------------------------------------------------------------
 # Driver
-# ---------------------------------------------------------------------------
 
 """
-    process_brisklight_images!(stats, cache, series, all_geodesics, nsteps, model,
-                               nx, ny, freq, Rhigh; kw...)
+    process_brisklight_images!(params, all_geodesics, nsteps, midplane_crossings,
+        model, pixels_x, pixels_y, freq, trat_large, dump_list, dump_times,
+        tA, tB, tf; kwargs...)
 
-Render a brisk-light movie and return a metrics table.
+Main brisk-light driver.
 
-Geodesics, the band walk and the delay sample are all inputs, so a `p` sweep
-pays for them once: rebuild `stats` with [`band_stats`](@ref) at the new `p`
-and call this again with the same `cache`.
+Frame scheduling keys off the retained support (`retained_support`), not off the
+band modes: the earliest source time a frame needs is `t_lo`, the latest is
+`t_hi`, and the schedule runs over
 
-Each frame loads only the dumps its bands' retained intervals bracket, prunes
-everything else, and records what it cost. The returned table is what the
-performance assessment is built from.
+    t_obs in [tA - t_lo,  min(tB, tf - tf_buffer) - t_hi]
+
+which mirrors slow light's `tA - tgeof` ... `tf - rmax_geo - tgeoi`. Pass
+`t_obs_start` (and optionally `t_obs_stop`) to place a brisk run on exactly the
+same observer-time grid as a slow-light run, or to keep the grid fixed across a
+p sweep. Note that the default schedule is p-dependent, because a low-p run
+needs less delay support and can therefore cover a longer observer window from
+the same dumps; that is a result worth reporting, but it makes frames from
+different p values non-comparable unless the grid is pinned.
+
+A manifest `frames.csv` recording `(index, t_obs, file, clamped_fraction,
+n_loads)` is written next to the images. Pair runs by `t_obs`, never by list
+position: slow light silently drops frames whose integration never completes,
+so the two file lists can desynchronise halfway through.
+
+Two things are independent of `t_obs` and of `p`, so they are computed once and
+reused for every frame of this call: the delay sample (`band_ts`) and the
+per-step radiating flag / bin index (`step_radiating`/`step_bin`, see
+`precompute_step_info`). The latter is what keeps the render loop free of
+`Iharm.bl_coord` calls, which otherwise dominate the CPU cost of a p sweep -
+every pixel's long non-radiating outbound leg (`r: rmax_geo .. ro`) used to be
+re-walked from scratch on every single frame of every single `p`. Pass all four
+(`band_ts`, `ranges`, `step_radiating`, `step_bin`) back in on subsequent calls
+of a sweep - the return value includes them for exactly this purpose - to pay
+for both only once.
 
 # Keywords
-- `cadence`, `t_start`, `n_frames`, `snap_to_dump`, `t_frames`: the schedule
-  (see [`frame_schedule`](@ref)). `t_frames` overrides the rest.
-- `sample`: the [`BandSample`](@ref) from [`band_walk`](@ref). Supply it to get
-  the clamped-fraction diagnostic, which is the gate on whether a run is a
-  valid brisk-light run at all.
-- `output_dir`, `output_prefix`, `output_format`, `meta`: output. `meta` is the
-  camera/observer dictionary `Output.generate_output_file` needs; when it is
-  `nothing` only the raw image and the manifest are written.
-- `clamp_warn`: warn above this clamped fraction.
+- `t_obs_start`, `t_obs_stop`: pin the observer-time grid.
+- `output_dir`, `output_prefix`, `frame_index_mode` (`:time` or `:sequential`).
+- `pixel_stride`, `extrema_stride`: KDE subsampling and extrema subsampling.
+- `n_window`: snapshots per band (3 unless `set_tinterp_ns` is generalised).
+- `anchor`: `:mode` (default) or `:midpoint`.
+- `approach_bin`, `shadow_bin`: separate the inbound segment and captured rays.
+  Also shrinks the resident-snapshot ceiling from `3*(n_bands+3)` back to
+  `3*(n_bands+1)` when disabled, at the cost of folding those two auxiliary
+  populations back into bands 0 and `n_bands`.
+- `band_ts`, `ranges`: pass a cached delay sample to skip re-walking the
+  geodesics during a p sweep.
+- `step_radiating`, `step_bin`: pass a cached per-step cache (from a prior call,
+  or from `precompute_step_info` directly) to skip re-deriving it; this is the
+  expensive one to recompute, not the delay sample.
+- `tf_buffer`: safety margin subtracted from `tf` (defaults to `model.rmax_geo`,
+  matching slow light).
+- `clamp_warn`: warn when the clamped fraction of a frame exceeds this.
 """
-function process_brisklight_images!(stats::BandStats{T},
-                                    cache,
-                                    series::DumpSeries,
-                                    all_geodesics,
-                                    nsteps::AbstractMatrix{Int},
-                                    model,
-                                    nx::Int, ny::Int,
-                                    freq, Rhigh;
-                                    cadence::Real = 10.0,
-                                    t_start::Union{Nothing,Real} = nothing,
-                                    n_frames::Union{Nothing,Integer} = nothing,
-                                    snap_to_dump::Bool = true,
-                                    t_frames::Union{Nothing,AbstractVector} = nothing,
-                                    sample::Union{Nothing,BandSample{T}} = nothing,
-                                    output_dir::Union{Nothing,AbstractString} = nothing,
-                                    output_prefix::AbstractString = "brisk",
-                                    output_format::AbstractString = "ipole",
-                                    meta::Union{Nothing,Dict{String,Any}} = nothing,
-                                    clamp_warn::Real = 0.01,
-                                    progress::Bool = true,
-                                    verbose::Bool = true) where {T}
+function process_brisklight_images!(
+    params_brisklight::OfBriskLight,
+    all_geodesics,
+    nsteps::Matrix{Int},
+    midplane_crossings::Matrix{Int},
+    model,
+    pixels_x::Int,
+    pixels_y::Int,
+    freq::Float64,
+    trat_large::Float64,
+    dump_list::Vector{String},
+    dump_times::Vector{Float64},
+    tA::Float64,
+    tB::Float64,
+    tf::Float64;
+    t_obs_start::Union{Nothing,Float64} = nothing,
+    t_obs_stop::Union{Nothing,Float64}  = nothing,
+    output_dir::Union{Nothing,String}   = nothing,
+    output_prefix::String               = "BriskImage",
+    frame_index_mode::Symbol            = :time,
+    pixel_stride::Int                   = 4,
+    extrema_stride::Int                 = 1,
+    n_window::Int                       = 3,
+    anchor::Symbol                      = :mode,
+    approach_bin::Bool                  = true,
+    shadow_bin::Bool                    = true,
+    band_ts::Union{Nothing,Vector{Vector{Float64}}} = nothing,
+    ranges::Union{Nothing,Vector{NTuple{2,Float64}}} = nothing,
+    step_radiating::Union{Nothing,Matrix{Vector{Bool}}} = nothing,
+    step_bin::Union{Nothing,Matrix{Vector{Int8}}}       = nothing,
+    tf_buffer::Union{Nothing,Float64}   = nothing,
+    clamp_warn::Float64                 = 0.01,
+    progress_every::Int                 = 512,
+    verbose_windows::Bool               = false
+)
+    # ---- sanity -----------------------------------------------------------
+    issorted(dump_times) || error("process_brisklight_images!: dump_times must be ascending.")
+    length(dump_times) == length(dump_list) ||
+        error("process_brisklight_images!: dump_times and dump_list length mismatch.")
+    length(dump_times) >= n_window ||
+        error("process_brisklight_images!: need at least n_window = $n_window dumps.")
 
-    dump_times = series.times
-    length(dump_times) >= 1 || error("process_brisklight_images!: empty dump series")
-
-    sched = t_frames === nothing ?
-            frame_schedule(stats, dump_times; cadence = cadence, t_start = t_start,
-                           n_frames = n_frames, snap_to_dump = snap_to_dump) :
-            T.(collect(t_frames))
-
-    t_lo, t_hi = retained_support(stats)
-    t_first, t_last = frame_window(stats, dump_times)
-    if verbose
-        @info @sprintf("Brisk light: p = %.3f  retained support = [%.4f, %.4f] M (width %.4f M)",
-                       stats.p, t_lo, t_hi, t_hi - t_lo)
-        @info @sprintf("Brisk light: usable frame window = [%.4f, %.4f] M; rendering %d frame(s)",
-                       t_first, t_last, length(sched))
+    if hasproperty(model, :brisk_light)
+        model.brisk_light ||
+            @warn "model.brisk_light is false: time interpolation may be disabled for brisk light."
+    else
+        @warn "model has no `brisk_light` field: the local iharm.jl patch may be missing."
     end
-    isempty(sched) && return (frames = 0, metrics = NamedTuple[], stats = stats)
+    if hasproperty(model, :slow_light) && model.slow_light
+        @warn "model.slow_light is true while rendering brisk light; flags are ambiguous."
+    end
 
-    outdir = output_dir === nothing ? nothing : String(output_dir)
-    outdir === nothing || mkpath(outdir)
-    manifest = outdir === nothing ? nothing : joinpath(outdir, "frames.csv")
-    if manifest !== nothing
-        open(manifest, "w") do io
-            println(io, "index,t_frame,t_camera,file,n_snapshots,dumps_per_band,",
-                        "n_loads,bytes_read,load_seconds,render_seconds,clamped_fraction,resident_bytes")
+    dTs = diff(dump_times)
+    dT  = length(dTs) > 0 ? dTs[1] : NaN
+    if length(dTs) > 0 && !all(x -> isapprox(x, dT; rtol = 1e-6), dTs)
+        @warn "dump_times are not uniformly spaced; W/dT diagnostics lose their meaning."
+    end
+
+    #### band statistics
+    if band_ts === nothing || ranges === nothing
+        band_ts, ranges = compute_band_modal_times!(
+            midplane_crossings, all_geodesics, nsteps, pixels_x, pixels_y,
+            params_brisklight, model, params_brisklight.p;
+            pixel_stride = pixel_stride, extrema_stride = extrema_stride,
+            approach_bin = approach_bin, shadow_bin = shadow_bin)
+    else
+        compute_band_modal_times!(params_brisklight, band_ts, ranges, params_brisklight.p)
+    end
+
+    # Per-step radiating flag and bin index: pure functions of geodesic geometry,
+    # independent of t_obs and p, so they are computed once and reused for every
+    # frame of this call and, if the caller passes them back in, for every p of
+    # a sweep. This is what keeps the render loop free of `Iharm.bl_coord` calls;
+    # see `precompute_step_info` for why that used to dominate the cost of a
+    # sweep.
+    if step_radiating === nothing || step_bin === nothing
+        Rh_pc = 1.0 + sqrt(1.0 - model.a * model.a)
+        step_radiating, step_bin = precompute_step_info(
+            midplane_crossings, all_geodesics, nsteps, pixels_x, pixels_y,
+            params_brisklight.n_bands, model, Rh_pc;
+            approach_bin = approach_bin, shadow_bin = shadow_bin)
+    end
+
+    t_need_lo, t_need_hi = retained_support(params_brisklight)
+
+    #### output
+    outdir = output_dir === nothing ?
+             joinpath("..", "..", "data", "Images", "BriskLight_p$(params_brisklight.p)") :
+             output_dir
+    mkpath(outdir)
+    output_fmt   = joinpath(outdir, "$(output_prefix).%05d.txt")
+    manifest_path = joinpath(outdir, "frames.csv")
+    open(manifest_path, "w") do io
+        println(io, "index,t_obs,file,clamped_fraction,n_loads")
+    end
+
+    # ---- schedule ---------------------------------------------------------
+    buf     = tf_buffer === nothing ? model.rmax_geo : tf_buffer
+    t_start = t_obs_start === nothing ? (tA - t_need_lo) : t_obs_start
+    t_stop  = t_obs_stop  === nothing ? (min(tB, tf - buf) - t_need_hi) : t_obs_stop
+
+    @info @sprintf("Brisk-light: p = %.3f  retained support = [%.3f, %.3f] M (width %.3f M, %.2f dT)",
+                   params_brisklight.p, t_need_lo, t_need_hi,
+                   t_need_hi - t_need_lo, (t_need_hi - t_need_lo) / dT)
+    @info @sprintf("Brisk-light: observer grid t_obs = %.3f : %.3f : %.3f M",
+                   t_start, params_brisklight.image_cadence, t_stop)
+
+    if t_start > t_stop
+        @warn "Brisk-light: empty observer window (t_start = $t_start > t_stop = $t_stop). Nothing to render."
+        return (frames = 0, t_obs = Float64[], clamped = Float64[], loads = Int[],
+                retained_support = (t_need_lo, t_need_hi),
+                band_ts = band_ts, ranges = ranges,
+                step_radiating = step_radiating, step_bin = step_bin)
+    end
+
+    ##### snapshot windows 
+    # Probe-load one snapshot to fix the concrete element type, and keep it in
+    # the cache so nothing is wasted.
+    probe_idx  = first(find_dump_window(clamp(t_start + t_need_lo, dump_times[1], dump_times[end]),
+                                        dump_times; n_window = n_window))
+    probe_data = Iharm.load_data(dump_list[probe_idx], trat_large, model)
+    D          = typeof(probe_data)
+    dump_cache = Dict{Int,D}(probe_idx => probe_data)
+
+    nb           = nbins(params_brisklight.n_bands)
+    bin_windows  = [BandWindowState{D}() for _ in 1:nb]
+    data_bins    = Vector{Vector{D}}(undef, nb)
+    window_times = Vector{NTuple{2,Float64}}(undef, nb)
+    for b in 1:nb
+        data_bins[b]    = Vector{D}()
+        window_times[b] = (Inf, -Inf)
+    end
+
+    Image      = zeros(Float64, pixels_x, pixels_y)
+    bad_pixels = Threads.Atomic{Int}(0)
+    prog_lock  = ReentrantLock()
+
+    t_obs_log   = Float64[]
+    clamp_log   = Float64[]
+    load_log    = Int[]
+    nimg        = 0
+    last_img_target = t_start
+
+    while last_img_target <= t_stop + 1e-9
+        params_brisklight.t_obs = last_img_target
+        n_loads = 0
+
+        for b in 1:nb
+            params_brisklight.band_valid[b] || continue
+            t_anchor = band_anchor(params_brisklight, b; anchor = anchor) + last_img_target
+            n_loads += update_band_window!(bin_windows[b], t_anchor, dump_times, dump_list,
+                                           trat_large, model, dump_cache;
+                                           n_window = n_window, verbose = verbose_windows)
+            data_bins[b]    = bin_windows[b].snapshots
+            window_times[b] = (bin_windows[b].t_window_start, bin_windows[b].t_window_end)
         end
-    end
 
-    Image = zeros(T, nx, ny)
-    rows = NamedTuple[]
-
-    for (k, t_frame) in enumerate(sched)
-        idx, per_band = frame_dump_indices(stats, t_frame, dump_times)
-
-        loads0 = series.n_loads
-        bytes0 = series.bytes_read
-        ltime0 = series.load_time
-        snaps = frame_snapshots!(series, idx, Rhigh, model)
-        n_loads = series.n_loads - loads0
-        bytes_read = series.bytes_read - bytes0
-        load_seconds = series.load_time - ltime0
-
-        tA = dump_times[first(idx)]
-        tB = dump_times[last(idx)]
-        tm = build_timemap(stats, t_frame, tA, tB)
-
-        clamped = T(NaN)
-        if sample !== nothing
-            clamped, per_bin = clamped_fraction(stats, sample, t_frame, tA, tB)
-            if isfinite(clamped) && clamped > clamp_warn
-                @warn @sprintf("Brisk light: frame t_frame = %.4f M has %.2f%% of steps on the availability clamp (frozen plasma); this run is not comparable to slow light. Per band: %s",
-                               t_frame, 100 * clamped,
-                               join([@sprintf("n=%d:%.1f%%", b - 1, 100 * per_bin[b])
-                                     for b in eachindex(per_bin) if isfinite(per_bin[b])], " "))
+        # Bins with too few samples have no statistics of their own; point them at
+        # the first valid bin so that a stray pixel never meets an empty snapshot
+        # vector. Their contribution is negligible by construction.
+        fallback = findfirst(params_brisklight.band_valid)
+        if fallback !== nothing
+            for b in 1:nb
+                params_brisklight.band_valid[b] && continue
+                data_bins[b]    = data_bins[fallback]
+                window_times[b] = window_times[fallback]
+                params_brisklight.hdi_intervals[b] = params_brisklight.hdi_intervals[fallback]
             end
         end
 
-        fill!(Image, zero(T))
-        render_seconds = @elapsed render_brisk_frame!(
-            Image, all_geodesics, nsteps, model, nx, ny, freq, cache, tm, snaps;
-            progress = progress,
-            desc = @sprintf("brisk p=%.2f t=%.1fM ", stats.p, t_frame))
-        Image .*= freq^3
-
-        resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
-        dumps_per_band = [length(r) for r in per_band]
-
-        file = ""
-        if outdir !== nothing
-            file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, stats, meta)
-            open(manifest, "a") do io
-                @printf(io, "%d,%.10f,%.10f,%s,%d,%s,%d,%d,%.4f,%.4f,%.6f,%d\n",
-                        k, t_frame, t_frame - stats.t_ref, basename(file),
-                        length(idx), join(dumps_per_band, "|"),
-                        n_loads, bytes_read, load_seconds, render_seconds,
-                        isfinite(clamped) ? clamped : NaN, resident)
-            end
+        clamped, clamped_per_bin =
+            availability_clamp_report(params_brisklight, band_ts, window_times, last_img_target)
+        if isfinite(clamped) && clamped > clamp_warn
+            @warn @sprintf("Brisk-light: frame t_obs = %.3f M has %.2f %% of steps hitting the availability clamp (frozen plasma). Per bin: %s",
+                           last_img_target, 100 * clamped,
+                           join([@sprintf("%s=%.1f%%", _bin_name(b, params_brisklight.n_bands),
+                                          100 * clamped_per_bin[b])
+                                 for b in 1:nb if isfinite(clamped_per_bin[b])], " "))
         end
 
-        push!(rows, (index = k, t_frame = t_frame, t_camera = t_frame - stats.t_ref,
-                     file = file, dump_indices = idx, n_snapshots = length(idx),
-                     dumps_per_band = dumps_per_band, n_loads = n_loads,
-                     bytes_read = bytes_read, load_seconds = load_seconds,
-                     render_seconds = render_seconds, clamped_fraction = clamped,
-                     resident_bytes = resident))
+        fill!(Image, 0.0)
+        Threads.atomic_xchg!(bad_pixels, 0)
 
-        verbose && @info @sprintf("  frame %d/%d  t_frame = %.3f M  %d snapshot(s) [%s]  %d load(s)  render %.2f s  clamped %.3f%%",
-                                  k, length(sched), t_frame, length(idx),
-                                  join(dumps_per_band, "|"), n_loads, render_seconds,
-                                  isfinite(clamped) ? 100 * clamped : NaN)
-    end
+        p_bar = Progress(pixels_x * pixels_y;
+                         desc = @sprintf("brisk p=%.2f t_obs=%.1f M ", params_brisklight.p, last_img_target),
+                         showspeed = true, barlen = 30)
+        done = Threads.Atomic{Int}(0)
 
-    if verbose && !isempty(rows)
-        tot_render = sum(r.render_seconds for r in rows)
-        tot_load = sum(r.load_seconds for r in rows)
-        mean_snaps = sum(r.n_snapshots for r in rows) / length(rows)
-        @info @sprintf("Brisk light: %d frame(s), p = %.3f, %.2f snapshots/image, %d total load(s), %.2f GB read, render %.2f s, I/O %.2f s",
-                       length(rows), stats.p, mean_snaps, series.n_loads,
-                       series.bytes_read / 2^30, tot_render, tot_load)
-        manifest === nothing || @info "Brisk light: manifest -> $manifest"
-    end
-
-    return (frames = length(rows), metrics = rows, stats = stats,
-            schedule = sched, retained_support = (t_lo, t_hi),
-            frame_window = (t_first, t_last))
-end
-
-"""
-    write_frame(dir, prefix, format, index, t_frame, Image, snaps, stats, meta)
-
-Write one frame. With `meta` supplied the frame goes out through
-`Output.generate_output_file` in ipole's HDF5 layout, stamped with
-`img_time = t_frame` (the `n = 0` clock) so downstream tools can pair frames by
-time; otherwise it is written as plain text, which is enough for the
-comparison tests.
-"""
-function write_frame(dir::AbstractString, prefix::AbstractString,
-                     format::AbstractString, index::Int, t_frame,
-                     Image, snaps::SnapshotSet, stats::BandStats,
-                     meta::Union{Nothing,Dict{String,Any}})
-    if meta === nothing
-        path = joinpath(dir, @sprintf("%s.%05d.txt", prefix, index))
-        open(path, "w") do io
-            for i in axes(Image, 1)
-                println(io, join(view(Image, i, :), '\t'))
+        Threads.@threads :greedy for i in 1:pixels_x
+            for j in 1:pixels_y
+                integrate_brisklight_emission!(
+                    all_geodesics[i, j], nsteps[i, j], Image, i, j,
+                    freq, model.a, step_radiating[i, j], step_bin[i, j],
+                    data_bins, params_brisklight.hdi_intervals, window_times,
+                    last_img_target, model, bad_pixels)
+            end
+            d = Threads.atomic_add!(done, pixels_y) + pixels_y
+            if d % progress_every < pixels_y
+                lock(prog_lock) do
+                    ProgressMeter.update!(p_bar, d)
+                end
             end
         end
-        return path
+        finish!(p_bar)
+
+        bad_pixels[] > 0 &&
+            @warn "Brisk-light: $(bad_pixels[]) pixel(s) produced a non-finite intensity and were set to NaN."
+
+        Image_out   = Image .* freq^3
+        frame_index = frame_index_mode === :time ? round(Int, last_img_target) : nimg
+        file_name   = Printf.format(Printf.Format(output_fmt), frame_index)
+        writedlm(file_name, Image_out)
+
+        open(manifest_path, "a") do io
+            @printf(io, "%d,%.10f,%s,%.6f,%d\n",
+                    frame_index, last_img_target, basename(file_name),
+                    isfinite(clamped) ? clamped : NaN, n_loads)
+        end
+
+        push!(t_obs_log, last_img_target)
+        push!(clamp_log, clamped)
+        push!(load_log, n_loads)
+        nimg += 1
+
+        # Evict snapshots no longer referenced by any window.
+        keep = Set{Int}()
+        for b in 1:nb
+            union!(keep, bin_windows[b].indices)
+        end
+        for k in collect(keys(dump_cache))
+            k in keep || delete!(dump_cache, k)
+        end
+
+        last_img_target += params_brisklight.image_cadence
     end
 
-    path = joinpath(dir, @sprintf("%s.%05d.h5", prefix, index))
-    data = copy(meta)
-    data["image"] = Image
-    data["img_time"] = t_frame
-    data["data"] = snaps.snaps[1]
-    Output.generate_output_file(path, data; format = String(format))
-    return path
+    @info @sprintf("Brisk-light: %d frames, p = %.3f, mean clamped fraction = %.4f, total loads = %d, resident snapshots = %d",
+                   nimg, params_brisklight.p,
+                   isempty(clamp_log) ? NaN : mean(filter(isfinite, clamp_log)),
+                   sum(load_log), length(dump_cache))
+    @info "Brisk-light: manifest -> $manifest_path"
+
+    return (frames = nimg, t_obs = t_obs_log, clamped = clamp_log, loads = load_log,
+            retained_support = (t_need_lo, t_need_hi),
+            band_ts = band_ts, ranges = ranges,
+            step_radiating = step_radiating, step_bin = step_bin)
 end
 
 end # module Brisklight

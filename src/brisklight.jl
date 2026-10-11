@@ -57,6 +57,7 @@ using ..Iharm
 using ..Kharma
 using ..Output
 using ..Imaging
+import ..Polarization
 
 export BandStats, BandSample, StepCache, DumpSeries,
     band_walk, analyze_bands, band_stats, modal_hdi, weighted_quantile,
@@ -1161,6 +1162,58 @@ function integrate_brisk!(traj, nsteps::Int, Image::AbstractMatrix{T},
 end
 
 """
+    integrate_brisk_pol!(traj, nsteps, pol, I, J, freq, bhspin, model, Rh,
+                         cache, off, tm, snaps, dl_unit, bad_pixels)
+
+Polarized counterpart of [`integrate_brisk!`](@ref): the coherency tensor is
+carried along the same geodesic with `Polarization.polarized_step`, exactly as
+`Polarization.integrate_emission_pol` does for a single snapshot, and the one
+change is the same as for Stokes I: each step's end point `Xf`, where the
+transfer coefficients are evaluated, is moved to the absolute fluid time
+`map_time` gives it for the step's band. Parallel transport uses the step's
+start and half-step points, whose time coordinate does not enter (the Kerr
+connection is stationary), so they are passed unshifted. The camera-frame
+Stokes parameters and the Faraday depth go to `pol[:, I, J]` through
+`Polarization.save_pixel!` (so they include `freq^3`, unlike `Image`).
+
+As in ipole and `Polarization.PolSink`, this is a separate calculation from the
+unpolarized `Image`: it uses the Dexter (2016) coefficients at the end of each
+step, so its Stokes I differs slightly from `Image` by design.
+"""
+function integrate_brisk_pol!(traj, nsteps::Int, pol::AbstractArray{T,3},
+                              I::Int, J::Int, freq, bhspin, model, Rh,
+                              cache, off::Int,
+                              tm::TimeMap, snaps::SnapshotSet, dl_unit,
+                              bad_pixels::Threads.Atomic{Int}) where {T}
+    if nsteps < 2
+        Polarization.save_pixel!(pol, I, J, zero(T), zero(T), zero(T), zero(T), zero(T), freq, 0)
+        return
+    end
+
+    N = Polarization.zero_tensor(T)
+    tauF = zero(T)
+    for nstep in nsteps:-1:2
+        @inbounds ti = traj[nstep]
+        @inbounds tf = traj[nstep - 1]
+        b = step_band(cache, off, nstep)
+        Xf = tf.X
+        Xf_abs = SVector{4,T}(map_time(tm, Xf[1], b), Xf[2], Xf[3], Xf[4])
+        N, tauF = Polarization.polarized_step(N, tauF, ti.X, ti.Kcon, ti.Xhalf, ti.Kconhalf,
+                                              Xf_abs, tf.Kcon, tf.dl, dl_unit, Rh, freq,
+                                              bhspin, model, snaps)
+    end
+
+    SI, SQ, SU, SV = Polarization.project_n(N, traj[1].X, bhspin, model)
+    if !(isfinite(SI) && isfinite(SQ) && isfinite(SU) && isfinite(SV))
+        Threads.atomic_add!(bad_pixels, 1)
+        Polarization.save_pixel!(pol, I, J, T(NaN), T(NaN), T(NaN), T(NaN), tauF, freq, 0)
+        return
+    end
+    Polarization.save_pixel!(pol, I, J, SI, SQ, SU, SV, tauF, freq, 0)
+    return
+end
+
+"""
     render_brisk_frame!(Image, all_geodesics, nsteps, model, nx, ny, freq,
                         cache, tm, snaps; progress, desc)
 
@@ -1181,10 +1234,13 @@ function render_brisk_frame!(Image::AbstractMatrix{T},
                              model, nx::Int, ny::Int, freq,
                              cache, tm::TimeMap, snaps::SnapshotSet;
                              progress::Bool = true,
-                             desc::AbstractString = "brisk ") where {T}
+                             desc::AbstractString = "brisk ",
+                             pol::Union{Nothing,AbstractArray} = nothing) where {T}
 
     Rh = 1 + sqrt(1.0 - model.a * model.a)
     bad_pixels = Threads.Atomic{Int}(0)
+    bad_pol = Threads.Atomic{Int}(0)
+    dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
     offsets = cache === nothing ? nothing : cache.offsets
 
     pbar = progress ? Progress(nx; desc = String(desc), showspeed = true, barlen = 30) : nothing
@@ -1196,6 +1252,10 @@ function render_brisk_frame!(Image::AbstractMatrix{T},
             integrate_brisk!(all_geodesics[i, j], nsteps[i, j], Image, i, j,
                              freq, model.a, model, Rh, cache, off, tm, snaps,
                              bad_pixels)
+            pol === nothing ||
+                integrate_brisk_pol!(all_geodesics[i, j], nsteps[i, j], pol, i, j,
+                                     freq, model.a, model, Rh, cache, off, tm, snaps,
+                                     dl_unit, bad_pol)
         end
         if pbar !== nothing
             lock(plock) do
@@ -1206,6 +1266,7 @@ function render_brisk_frame!(Image::AbstractMatrix{T},
     pbar === nothing || finish!(pbar)
 
     bad_pixels[] > 0 && @warn "Brisk light: $(bad_pixels[]) pixel(s) gave a non-finite intensity and were set to NaN"
+    bad_pol[] > 0 && @warn "Brisk light: $(bad_pol[]) pixel(s) gave non-finite Stokes parameters and were set to NaN"
     return bad_pixels[]
 end
 
@@ -1221,12 +1282,13 @@ function Imaging.raytrace_image_at_time!(Image::AbstractMatrix, model, snaps::Sn
                                          all_geodesics, nsteps::AbstractMatrix{Int},
                                          freq, t_frame;
                                          progress::Bool = true,
-                                         desc::AbstractString = "fast light ")
+                                         desc::AbstractString = "fast light ",
+                                         pol::Union{Nothing,AbstractArray} = nothing)
     nx, ny = size(Image)
     ts = snapshot_times(snaps)
     tm = fastlight_timemap(float(t_frame), float(ts[1]), float(ts[end]))
     return render_brisk_frame!(Image, all_geodesics, nsteps, model, nx, ny, freq,
-                               nothing, tm, snaps; progress = progress, desc = desc)
+                               nothing, tm, snaps; progress = progress, desc = desc, pol = pol)
 end
 
 """
@@ -1256,7 +1318,8 @@ function process_fastlight_images!(series::DumpSeries,
                                    output_format::AbstractString = "ipole",
                                    meta::Union{Nothing,Dict{String,Any}} = nothing,
                                    progress::Bool = true,
-                                   verbose::Bool = true)
+                                   verbose::Bool = true,
+                                   polarized::Bool = false)
 
     dt = series.times
     sched = if t_frames !== nothing
@@ -1287,6 +1350,7 @@ function process_fastlight_images!(series::DumpSeries,
     end
 
     Image = zeros(Float64, nx, ny)
+    pol = polarized ? zeros(Float64, Polarization.NIMG, nx, ny) : nothing
     rows = NamedTuple[]
     # Band-0-only statistics, so the manifest columns line up with a brisk run
     # and the two can be diffed directly.
@@ -1302,16 +1366,17 @@ function process_fastlight_images!(series::DumpSeries,
         load_seconds = series.load_time - lt0
 
         fill!(Image, 0.0)
+        pol === nothing || fill!(pol, 0.0)
         render_seconds = @elapsed Imaging.raytrace_image_at_time!(
             Image, model, snaps, all_geodesics, nsteps, freq, t_frame;
-            progress = progress, desc = @sprintf("fast t=%.1fM ", t_frame))
+            progress = progress, desc = @sprintf("fast t=%.1fM ", t_frame), pol = pol)
         Image .*= freq^3
 
         resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
         file = ""
         if outdir !== nothing
             file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, dummy, meta)
+                               Image, snaps, dummy, meta; pol = pol)
             open(manifest, "a") do io
                 @printf(io, "%d,%.10f,%.10f,%s,%d,%d,%d,%d,%.4f,%.4f,%.6f,%d\n",
                         k, t_frame, t_frame, basename(file), length(idx), length(idx),
@@ -1460,7 +1525,8 @@ function process_brisklight_images!(stats::BandStats{T},
                                     meta::Union{Nothing,Dict{String,Any}} = nothing,
                                     clamp_warn::Real = 0.01,
                                     progress::Bool = true,
-                                    verbose::Bool = true) where {T}
+                                    verbose::Bool = true,
+                                    polarized::Bool = false) where {T}
 
     dump_times = series.times
     length(dump_times) >= 1 || error("process_brisklight_images!: empty dump series")
@@ -1491,6 +1557,7 @@ function process_brisklight_images!(stats::BandStats{T},
     end
 
     Image = zeros(T, nx, ny)
+    pol = polarized ? zeros(T, Polarization.NIMG, nx, ny) : nothing
     rows = NamedTuple[]
 
     for (k, t_frame) in enumerate(sched)
@@ -1520,10 +1587,11 @@ function process_brisklight_images!(stats::BandStats{T},
         end
 
         fill!(Image, zero(T))
+        pol === nothing || fill!(pol, zero(T))
         render_seconds = @elapsed render_brisk_frame!(
             Image, all_geodesics, nsteps, model, nx, ny, freq, cache, tm, snaps;
             progress = progress,
-            desc = @sprintf("brisk p=%.2f t=%.1fM ", stats.p, t_frame))
+            desc = @sprintf("brisk p=%.2f t=%.1fM ", stats.p, t_frame), pol = pol)
         Image .*= freq^3
 
         resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
@@ -1532,7 +1600,7 @@ function process_brisklight_images!(stats::BandStats{T},
         file = ""
         if outdir !== nothing
             file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, stats, meta)
+                               Image, snaps, stats, meta; pol = pol)
             open(manifest, "a") do io
                 @printf(io, "%d,%.10f,%.10f,%s,%d,%s,%d,%d,%.4f,%.4f,%.6f,%d\n",
                         k, t_frame, t_frame - stats.t_ref, basename(file),
@@ -1582,7 +1650,8 @@ comparison tests.
 function write_frame(dir::AbstractString, prefix::AbstractString,
                      format::AbstractString, index::Int, t_frame,
                      Image, snaps::SnapshotSet, stats::BandStats,
-                     meta::Union{Nothing,Dict{String,Any}})
+                     meta::Union{Nothing,Dict{String,Any}};
+                     pol::Union{Nothing,AbstractArray} = nothing)
     if meta === nothing
         path = joinpath(dir, @sprintf("%s.%05d.txt", prefix, index))
         open(path, "w") do io
@@ -1598,6 +1667,7 @@ function write_frame(dir::AbstractString, prefix::AbstractString,
     data["image"] = Image
     data["img_time"] = t_frame
     data["data"] = snaps.snaps[1]
+    pol === nothing || (data["pol"] = pol)
     Output.generate_output_file(path, data; format = String(format))
     return path
 end

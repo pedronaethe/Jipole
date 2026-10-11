@@ -18,6 +18,7 @@ using ..Output
 using ..Utils
 using ..GeoTypes
 using ..Utils_GPU
+import ..Polarization
 using Dates
 export OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
     process_slowlight_images!
@@ -123,6 +124,49 @@ function update_data!(params_slowlight::OfSlowLight, simulation_data, Rhigh::Flo
     @info "Loaded data" dump_path = params_slowlight.current_dumps_path tA = params_slowlight.tA tB = params_slowlight.tB
 end
 
+# ---------------------------------------------------------------------------
+# Polarized state of an open frame
+# ---------------------------------------------------------------------------
+#
+# A polarized slow-light frame carries, per pixel, the coherency tensor N (a
+# Hermitian 4x4 complex matrix) and the Faraday depth from one round to the
+# next. They are stored packed as POL_STATE_LEN Float64s, `movie_pol[:, i, j, k]`:
+# the four (real) diagonal entries, then the real and imaginary parts of the six
+# entries above the diagonal, then tauF. 136 bytes per pixel and frame instead of
+# 264 for the full complex matrix; N is Hermitian, so nothing is lost.
+
+const POL_STATE_LEN = 17
+const POL_UPPER = ((1, 2), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4))
+
+@inline function load_pol_state(movie_pol, i, j, k)
+    @inbounds begin
+        v(n) = movie_pol[n, i, j, k]
+        c(m) = complex(v(4 + 2m - 1), v(4 + 2m))
+        d1, d2, d3, d4 = complex(v(1)), complex(v(2)), complex(v(3)), complex(v(4))
+        c12, c13, c14, c23, c24, c34 = c(1), c(2), c(3), c(4), c(5), c(6)
+        # column-major
+        N = SMatrix{4,4,ComplexF64,16}(d1, conj(c12), conj(c13), conj(c14),
+                                       c12, d2, conj(c23), conj(c24),
+                                       c13, c23, d3, conj(c34),
+                                       c14, c24, c34, d4)
+        return N, v(17)
+    end
+end
+
+@inline function store_pol_state!(movie_pol, i, j, k, N, tauF)
+    @inbounds begin
+        for a in 1:4
+            movie_pol[a, i, j, k] = real(N[a, a])
+        end
+        for (m, (a, b)) in enumerate(POL_UPPER)
+            movie_pol[4 + 2m - 1, i, j, k] = real(N[a, b])
+            movie_pol[4 + 2m, i, j, k] = imag(N[a, b])
+        end
+        movie_pol[17, i, j, k] = tauF
+    end
+    return nothing
+end
+
 """
     render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times,
         pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
@@ -150,8 +194,11 @@ trajectory, threaded over pixels. Called from
 """
 function render_round_cpu!(
     movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-    params_slowlight::OfSlowLight, freq, model, simulation_data
+    params_slowlight::OfSlowLight, freq, model, simulation_data;
+    movie_pol = nothing
 )
+    Rh = 1 + sqrt(1.0 - model.a * model.a)
+    dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
     p = Progress(length(valid_ks) * pixels_x * pixels_y;
         desc = "Rendering $(length(valid_ks)) frame(s) this round on CPU...", showspeed = true, barlen = 30)
     progress_lock = ReentrantLock()
@@ -163,6 +210,10 @@ function render_round_cpu!(
                 nstep = movie_nstep[i, j, k]
                 Intensity = movie_intensity[i, j, k]
                 dt = target_times[k] + 1e-5
+                # Polarized frames carry N and tauF through the same steps, with the
+                # coefficients taken at the same (shifted) Xf as Stokes I's jf, kf.
+                N, tauF = movie_pol === nothing ? (Polarization.zero_tensor(Float64), 0.0) :
+                          load_pol_state(movie_pol, i, j, k)
 
                 while (nstep > 2)
                     Xi = traj[nstep].X
@@ -192,10 +243,17 @@ function render_round_cpu!(
 
                     Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
 
+                    if movie_pol !== nothing
+                        ti = traj[nstep]
+                        N, tauF = Polarization.polarized_step(N, tauF, ti.X, Kconi, ti.Xhalf, ti.Kconhalf,
+                            Xf, Kconf, traj[nstep-1].dl, dl_unit, Rh, freq, model.a, model, simulation_data)
+                    end
+
                     nstep -= 1
                 end
                 movie_nstep[i, j, k] = nstep
                 movie_intensity[i, j, k] = Intensity
+                movie_pol === nothing || store_pol_state!(movie_pol, i, j, k, N, tauF)
             end
         end
         lock(progress_lock) do
@@ -339,21 +397,20 @@ allows, until every requested frame has been produced.
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
     model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
-    engine::Symbol = :CPU
+    engine::Symbol = :CPU,
+    polarized::Bool = false,
+    output_dir::Union{Nothing,AbstractString} = nothing
 )
     if engine === :GPU && isnothing(Base.get_extension(parentmodule(@__MODULE__), :JipoleCUDAExt))
         error("engine = :GPU needs CUDA.jl loaded: run `using CUDA` first")
     end
-    base_dir = joinpath("..", "slow_sims")
-    
-    if !isdir(base_dir)
-        mkpath(base_dir)
+    polarized && engine === :GPU && error("Polarized slow light is implemented for engine = :CPU only.")
+    # Without an explicit output_dir, the original layout: ../slow_sims/<timestamp>.
+    if output_dir === nothing
+        base_dir = joinpath("..", "slow_sims")
+        timestamp = Dates.format(now(), "yyyy-mm-dd-HH:MM:SS")
+        output_dir = joinpath(base_dir, timestamp)
     end
-    
-
-    timestamp = Dates.format(now(), "yyyy-mm-dd-HH:MM:SS")
-    
-    output_dir = joinpath(base_dir, timestamp)
     mkpath(output_dir)
     println("Outputs will be saved to: $output_dir")
 
@@ -362,6 +419,9 @@ function process_slowlight_images!(
 
     movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
     movie_intensity = zeros(Float64, pixels_x, pixels_y, nimgs_concurrently)
+    movie_pol = polarized ? zeros(Float64, POL_STATE_LEN, pixels_x, pixels_y, nimgs_concurrently) : nothing
+    polarized && @printf("Polarized slow light: %d frames open at once, %.2f GB of polarization state\n",
+        nimgs_concurrently, sizeof(movie_pol) / 1e9)
     target_times = zeros(Float64, nimgs_concurrently)
     valid_images = zeros(Float64, nimgs_concurrently)
 
@@ -391,6 +451,9 @@ function process_slowlight_images!(
                     for j in 1:pixels_y
                         movie_nstep[i, j, nimg] = nsteps[i, j]
                         movie_intensity[i, j, nimg] = 0.0
+                        if movie_pol !== nothing
+                            @views movie_pol[:, i, j, nimg] .= 0.0
+                        end
                     end
                 end
                 nimg += 1
@@ -405,7 +468,7 @@ function process_slowlight_images!(
 
         elapsed = @elapsed if engine === :CPU
             render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-                params_slowlight, freq, model, simulation_data)
+                params_slowlight, freq, model, simulation_data; movie_pol = movie_pol)
         else
             render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks,
                 nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
@@ -442,6 +505,17 @@ function process_slowlight_images!(
                     "Xcamera"    => Xcamera,        
                     "Rhigh" => Rhigh            
                 )
+                if movie_pol !== nothing
+                    pol = zeros(Float64, Polarization.NIMG, pixels_x, pixels_y)
+                    Threads.@threads for i in 1:pixels_x
+                        for j in 1:pixels_y
+                            N, tauF = load_pol_state(movie_pol, i, j, k)
+                            SI, SQ, SU, SV = Polarization.project_n(N, all_geodesics[i, j][1].X, model.a, model)
+                            Polarization.save_pixel!(pol, i, j, SI, SQ, SU, SV, tauF, freq, 0)
+                        end
+                    end
+                    out_data["pol"] = pol
+                end
                 Output.generate_output_file(file_name, out_data; format="ipole")
                 println("Saving image $(file_name)")
 

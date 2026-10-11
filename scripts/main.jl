@@ -122,9 +122,8 @@ end
 # Polarized transfer (Stokes Q, U, V and Faraday depth). The [polarization] section is optional:
 # without it the run is unpolarized, exactly as before.
 const do_polarization = get(get(config, "polarization", Dict{String,Any}()), "on", false)
-if do_polarization
-    slow_light && error("Polarization is not supported in slow light mode.")
-end
+# Polarization is available in every temporal mode; slow light supports it on the CPU engine only
+# (checked below, once the engine is known).
 
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
@@ -134,6 +133,10 @@ elseif brisklight
     Jipole.Utils.get_config(config, "brisklight", "engine", "cpu") == "gpu"
 else
     mode == "gpu"
+end
+
+if do_polarization && slow_light && use_gpu
+    error("Polarized slow light is implemented for [slowlight].engine = \"cpu\" only.")
 end
 
 if do_gradients && use_gpu
@@ -268,7 +271,8 @@ if brisklight
             output_dir = outdir,
             output_prefix = prefix,
             output_format = output_format,
-            meta = meta)
+            meta = meta,
+            polarized = do_polarization)
 
         if result.frames > 0
             @printf("\nWrote %d frame(s) to %s\n", result.frames, outdir)
@@ -342,7 +346,8 @@ elseif !slow_light && fast_cadence !== nothing
             t_start = fast_t_start,
             n_frames = fast_nframes,
             output_dir = outdir, output_prefix = prefix,
-            output_format = output_format, meta = meta)
+            output_format = output_format, meta = meta,
+            polarized = do_polarization)
 
         result.frames > 0 && @printf("\nWrote %d frame(s) to %s; render %.2f s, peak RSS %.2f GB\n",
             result.frames, outdir, sum(r.render_seconds for r in result.metrics),
@@ -630,7 +635,12 @@ else
         params_slowlight, simulation_data, all_geodesics, nsteps,
         model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path,
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
-        engine=slowlight_engine
+        engine=slowlight_engine,
+        polarized=do_polarization,
+        # Optional [slowlight].output_dir; without it frames go to ../slow_sims/<timestamp> as before.
+        output_dir=let d = get(get(config, "slowlight", Dict{String,Any}()), "output_dir", nothing)
+            d === nothing ? nothing : expanduser(d)
+        end
     )
     println("Done!")
 end

@@ -94,6 +94,10 @@ if brisklight
     const brisk_nframes = get(get(config, "brisklight", Dict()), "n_frames", nothing)
     const brisk_stride = Jipole.Utils.get_config(config, "brisklight", "sample_stride", 4)
     const brisk_weighting = Symbol(Jipole.Utils.get_config(config, "brisklight", "weighting", "emission"))
+    # Optional [brisklight].ref_dump: the dump the emission weighting takes j from (default: the middle of the
+    # series). It sets t_ref, so runs that must share a frame grid (e.g. with a fast-light run given that t_ref)
+    # should name the same dump.
+    const brisk_ref_dump = get(get(config, "brisklight", Dict()), "ref_dump", "")
     slow_light && error("[physical].slow_light and [brisklight].on are mutually exclusive: pick one temporal mode.")
     (0.0 <= brisk_p <= 1.0) || error("[brisklight].p must be in [0, 1], got $brisk_p")
     brisk_nbands >= 0 || error("[brisklight].n_bands must be >= 0, got $brisk_nbands")
@@ -236,8 +240,9 @@ if brisklight
         # The emission weighting needs one snapshot to take j from. Use the dump
         # nearest the middle of the series: it only sets the relative weight of each
         # step, never a rendered value.
-        ref_idx = max(1, div(length(dump_files) + 1, 2))
-        ref_data = reader.load_data(dump_files[ref_idx], Rhigh, model)
+        ref_file = isempty(brisk_ref_dump) ? dump_files[max(1, div(length(dump_files) + 1, 2))] : brisk_ref_dump
+        println("Emission-weighting reference dump: ", ref_file)
+        ref_data = reader.load_data(ref_file, Rhigh, model)
 
         stats, cache, sample = Jipole.Brisklight.analyze_bands(
             midplane_crossings, all_geodesics, nsteps, pixels_x, pixels_y,
@@ -347,7 +352,10 @@ elseif !slow_light && fast_cadence !== nothing
             n_frames = fast_nframes,
             output_dir = outdir, output_prefix = prefix,
             output_format = output_format, meta = meta,
-            polarized = do_polarization)
+            polarized = do_polarization,
+            # Optional [fastlight].t_ref: band-0 modal time of this geometry (from a brisk analysis), so the
+            # camera time of each frame is recorded as well.
+            t_ref = Float64(get(config["fastlight"], "t_ref", NaN)))
 
         result.frames > 0 && @printf("\nWrote %d frame(s) to %s; render %.2f s, peak RSS %.2f GB\n",
             result.frames, outdir, sum(r.render_seconds for r in result.metrics),
@@ -637,6 +645,8 @@ else
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
         engine=slowlight_engine,
         polarized=do_polarization,
+        # Optional [slowlight].t_ref (see the fast-light branch): the n = 0 fluid time of each frame is recorded.
+        t_ref=Float64(get(get(config, "slowlight", Dict{String,Any}()), "t_ref", NaN)),
         # Optional [slowlight].output_dir; without it frames go to ../slow_sims/<timestamp> as before.
         output_dir=let d = get(get(config, "slowlight", Dict{String,Any}()), "output_dir", nothing)
             d === nothing ? nothing : expanduser(d)

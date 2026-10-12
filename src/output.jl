@@ -167,6 +167,12 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     write(h5file, "header/camera/yoff", yoff)
     write(h5file, "header/camera/x", collect(Xcamera))
     write(h5file, "header/camera/t0", t)
+    # Time-dependent runs (fast light on a cadence, brisk, slow): which frame this is and its time on both
+    # clocks, so frames of different light modes pair by index and by time. t_fluid is the fluid time of the
+    # n = 0 (direct) image, t_camera the time the light reaches the camera; they differ by the band-0 delay.
+    haskey(data, "frame_index") && write(h5file, "frame/index", Int64(data["frame_index"]))
+    haskey(data, "t_fluid") && write(h5file, "frame/t_fluid", Float64(data["t_fluid"]))
+    haskey(data, "t_camera") && write(h5file, "frame/t_camera", Float64(data["t_camera"]))
 
     write(h5file, "header/units/L_unit", params.L_unit)
     write(h5file, "header/units/M_unit", params.M_unit)

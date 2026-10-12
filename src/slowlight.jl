@@ -399,8 +399,15 @@ function process_slowlight_images!(
     model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
     engine::Symbol = :CPU,
     polarized::Bool = false,
-    output_dir::Union{Nothing,AbstractString} = nothing
+    output_dir::Union{Nothing,AbstractString} = nothing,
+    t_ref::Real = NaN
 )
+    # With an explicit output_dir, frames are named by index, slow.00001.h5, ..., counted from the first
+    # frame (camera time tA - tgeof) in steps of the cadence -- the numbering brisk and fast light use, so
+    # frame k of every light mode is the same file number. Without it, the original Image.<time>.h5 names.
+    # `t_ref` (band-0 modal emission time, from the brisk analysis of the same geometry) gives each frame's
+    # n = 0 fluid time, t_camera + t_ref, recorded next to its camera time; NaN when not known.
+    index_names = output_dir !== nothing
     if engine === :GPU && isnothing(Base.get_extension(parentmodule(@__MODULE__), :JipoleCUDAExt))
         error("engine = :GPU needs CUDA.jl loaded: run `using CUDA` first")
     end
@@ -415,6 +422,7 @@ function process_slowlight_images!(
     println("Outputs will be saved to: $output_dir")
 
     last_img_target = params_slowlight.tA - tgeof
+    first_img_target = last_img_target
     nimgs_concurrently = round(Int, 2 + abs(t0) / params_slowlight.ImageCadence)
 
     movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
@@ -488,7 +496,9 @@ function process_slowlight_images!(
             if do_output[k]
                 Image_out = movie_intensity[:, :, k] .* freq^3
 
-                file_name = joinpath(output_dir, Printf.format(Printf.Format(output), target_times[k]))
+                frame_index = round(Int, (target_times[k] - first_img_target) / params_slowlight.ImageCadence) + 1
+                file_name = index_names ? joinpath(output_dir, @sprintf("slow.%05d.h5", frame_index)) :
+                            joinpath(output_dir, Printf.format(Printf.Format(output), target_times[k]))
                 out_data = Dict{String, Any}(
                     "image"      => Image_out,
                     "img_time"   => target_times[k],
@@ -503,7 +513,10 @@ function process_slowlight_images!(
                     "SourceD"    => SourceD,        
                     "scale"      => scale,          
                     "Xcamera"    => Xcamera,        
-                    "Rhigh" => Rhigh            
+                    "Rhigh" => Rhigh,
+                    "frame_index" => frame_index,
+                    "t_camera" => target_times[k],
+                    "t_fluid" => target_times[k] + t_ref
                 )
                 if movie_pol !== nothing
                     pol = zeros(Float64, Polarization.NIMG, pixels_x, pixels_y)

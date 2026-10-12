@@ -1319,8 +1319,12 @@ function process_fastlight_images!(series::DumpSeries,
                                    meta::Union{Nothing,Dict{String,Any}} = nothing,
                                    progress::Bool = true,
                                    verbose::Bool = true,
-                                   polarized::Bool = false)
+                                   polarized::Bool = false,
+                                   t_ref::Real = NaN)
 
+    # `t_ref`: band-0 modal emission time of the same geometry (BandStats.t_ref, negative), when known.
+    # Fast light renders the whole flow at t_frame, which is the n = 0 clock; with t_ref the camera time
+    # of the matching slow-light frame, t_frame - t_ref, is recorded too. NaN: not known, recorded as NaN.
     dt = series.times
     sched = if t_frames !== nothing
         Float64.(collect(t_frames))
@@ -1376,15 +1380,15 @@ function process_fastlight_images!(series::DumpSeries,
         file = ""
         if outdir !== nothing
             file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, dummy, meta; pol = pol)
+                               Image, snaps, dummy, meta; pol = pol, t_camera = t_frame - t_ref)
             open(manifest, "a") do io
                 @printf(io, "%d,%.10f,%.10f,%s,%d,%d,%d,%d,%.4f,%.4f,%.6f,%d\n",
-                        k, t_frame, t_frame, basename(file), length(idx), length(idx),
+                        k, t_frame, t_frame - t_ref, basename(file), length(idx), length(idx),
                         n_loads, bytes_read, load_seconds, render_seconds, 0.0, resident)
             end
         end
 
-        push!(rows, (index = k, t_frame = t_frame, t_camera = t_frame, file = file,
+        push!(rows, (index = k, t_frame = t_frame, t_camera = t_frame - t_ref, file = file,
                      dump_indices = idx, n_snapshots = length(idx),
                      dumps_per_band = [length(idx)], n_loads = n_loads,
                      bytes_read = bytes_read, load_seconds = load_seconds,
@@ -1600,7 +1604,7 @@ function process_brisklight_images!(stats::BandStats{T},
         file = ""
         if outdir !== nothing
             file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, stats, meta; pol = pol)
+                               Image, snaps, stats, meta; pol = pol, t_camera = t_frame - stats.t_ref)
             open(manifest, "a") do io
                 @printf(io, "%d,%.10f,%.10f,%s,%d,%s,%d,%d,%.4f,%.4f,%.6f,%d\n",
                         k, t_frame, t_frame - stats.t_ref, basename(file),
@@ -1651,7 +1655,8 @@ function write_frame(dir::AbstractString, prefix::AbstractString,
                      format::AbstractString, index::Int, t_frame,
                      Image, snaps::SnapshotSet, stats::BandStats,
                      meta::Union{Nothing,Dict{String,Any}};
-                     pol::Union{Nothing,AbstractArray} = nothing)
+                     pol::Union{Nothing,AbstractArray} = nothing,
+                     t_camera::Real = NaN)
     if meta === nothing
         path = joinpath(dir, @sprintf("%s.%05d.txt", prefix, index))
         open(path, "w") do io
@@ -1668,6 +1673,9 @@ function write_frame(dir::AbstractString, prefix::AbstractString,
     data["img_time"] = t_frame
     data["data"] = snaps.snaps[1]
     pol === nothing || (data["pol"] = pol)
+    data["frame_index"] = index
+    data["t_fluid"] = t_frame
+    data["t_camera"] = t_camera
     Output.generate_output_file(path, data; format = String(format))
     return path
 end

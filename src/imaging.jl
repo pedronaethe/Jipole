@@ -230,6 +230,7 @@ function trace_all_geodesics(model, ro, th, phi, freq, pixels_x::Int, pixels_y::
 
     T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a))
     Xcamera = SVector{4,T}(Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, _ = Tetrads.make_camera_tetrad(Xcamera, model.a, model)
     freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
 
     all_geodesics = Matrix{Vector{GeoTypes.OfTrajGeneric{T}}}(undef, pixels_x, pixels_y)
@@ -253,7 +254,7 @@ function trace_all_geodesics(model, ro, th, phi, freq, pixels_x::Int, pixels_y::
 
         for j in 0:(pixels_y - 1)
             nstep, crossings = Geodesics.get_pixel(
-                my_traj, i, j, Xcamera, fovx, fovy, freq_unitless,
+                my_traj, i, j, Xcamera, Econ, fovx, fovy, freq_unitless,
                 pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
 
             nsteps[i + 1, j + 1] = nstep

@@ -117,6 +117,11 @@ element type never changes.
 """
 @inline select_snapshot(snaps::Tuple{D}, k::Integer) where {D} = snaps[1]
 @inline select_snapshot(snaps::Tuple, k::Integer) = _select(snaps, k, 1)
+# Past ~16 snapshots the recursion defeats inference (a 40-snapshot set is ~200x slower per lookup and
+# allocates), so a homogeneous tuple that long is indexed directly: type stable on the CPU, which is the only
+# engine brisk light has. A GPU kernel would need another route for sets this large.
+@inline select_snapshot(snaps::NTuple{N,D}, k::Integer) where {N,D} =
+    N <= 16 ? _select(snaps, k, 1) : (@inbounds snaps[k])
 
 @inline _select(snaps::Tuple{D}, k::Integer, i::Int) where {D} = snaps[1]
 @inline _select(snaps::Tuple, k::Integer, i::Int) =
@@ -135,6 +140,8 @@ the weight returned by [`nearest_pair`](@ref) always lies in `[0, 1]` and the
 plasma is frozen rather than extrapolated.
 """
 @inline function bracket_index(times::SVector{N,T}, t) where {N,T}
+    # Long sets (brisk p near 1 holds hundreds of dumps): binary search, same result as the sweep below.
+    N > 16 && return clamp(searchsortedlast(times, t), 1, N - 1)
     iA = 1
     @inbounds for i in 1:(N - 1)
         iA = ifelse(times[i + 1] <= t, i + 1, iA)

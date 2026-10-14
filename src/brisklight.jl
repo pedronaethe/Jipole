@@ -966,7 +966,7 @@ dump_times_of(paths::AbstractVector{<:AbstractString}) =
 
 A time-ordered dump series with a load cache.
 
-The cache is keyed by dump index and is pruned to exactly the set a frame
+The cache is keyed by dump index and is pruned to the index range a frame
 needs, so the resident snapshot count is the brisk-light figure of merit rather
 than an unbounded leak: bands whose intervals fall within the same dump spacing
 share a single load, and frames that overlap in time pay nothing to re-enter a
@@ -1051,7 +1051,11 @@ see [`render_brisk_frame!`](@ref).
 """
 function frame_snapshots!(series::DumpSeries, indices::Vector{Int}, Rhigh, model)
     snaps = [load_dump!(series, k, Rhigh, model) for k in indices]
-    prune_cache!(series, indices)
+    # Keep every cached dump between the frame's oldest and newest, not only the ones it reads: a lensed
+    # band (n >= 1) reads the dumps the n = 0 band read 10-20 M earlier, so dropping them in the gap
+    # between band windows made small-p runs load each dump once per band (p = 0: ~3 loads per dump).
+    # Nothing is loaded into the gap; at p >= 0.5 the band windows already overlap and this keeps the same set.
+    prune_cache!(series, minimum(indices):maximum(indices))
     return SnapshotSet(snaps, [series.times[k] for k in indices])
 end
 
@@ -1530,7 +1534,12 @@ function process_brisklight_images!(stats::BandStats{T},
                                     clamp_warn::Real = 0.01,
                                     progress::Bool = true,
                                     verbose::Bool = true,
-                                    polarized::Bool = false) where {T}
+                                    polarized::Bool = false,
+                                    skip_existing::Bool = false) where {T}
+    # skip_existing: frames whose output file is already in output_dir are not rendered again, so a run cut
+    # short (a 1 h interactive session, a preempted job) picks up where it stopped. Frame k keeps its index, as
+    # the schedule depends only on t_start, cadence and n_frames; files are renamed into place once written,
+    # so one that exists is complete.
 
     dump_times = series.times
     length(dump_times) >= 1 || error("process_brisklight_images!: empty dump series")
@@ -1553,7 +1562,7 @@ function process_brisklight_images!(stats::BandStats{T},
     outdir = output_dir === nothing ? nothing : String(output_dir)
     outdir === nothing || mkpath(outdir)
     manifest = outdir === nothing ? nothing : joinpath(outdir, "frames.csv")
-    if manifest !== nothing
+    if manifest !== nothing && !(skip_existing && isfile(manifest))
         open(manifest, "w") do io
             println(io, "index,t_frame,t_camera,file,n_snapshots,dumps_per_band,",
                         "n_loads,bytes_read,load_seconds,render_seconds,clamped_fraction,resident_bytes")
@@ -1564,7 +1573,13 @@ function process_brisklight_images!(stats::BandStats{T},
     pol = polarized ? zeros(T, Polarization.NIMG, nx, ny) : nothing
     rows = NamedTuple[]
 
+    n_skipped = 0
     for (k, t_frame) in enumerate(sched)
+        if skip_existing && outdir !== nothing &&
+           isfile(joinpath(outdir, @sprintf("%s.%05d.%s", output_prefix, k, meta === nothing ? "txt" : "h5")))
+            n_skipped += 1
+            continue
+        end
         idx, per_band = frame_dump_indices(stats, t_frame, dump_times)
 
         loads0 = series.n_loads
@@ -1627,6 +1642,7 @@ function process_brisklight_images!(stats::BandStats{T},
                                   isfinite(clamped) ? 100 * clamped : NaN)
     end
 
+    verbose && n_skipped > 0 && @info "Brisk light: $n_skipped frame(s) already in $outdir, skipped"
     if verbose && !isempty(rows)
         tot_render = sum(r.render_seconds for r in rows)
         tot_load = sum(r.load_seconds for r in rows)
@@ -1676,7 +1692,10 @@ function write_frame(dir::AbstractString, prefix::AbstractString,
     data["frame_index"] = index
     data["t_fluid"] = t_frame
     data["t_camera"] = t_camera
-    Output.generate_output_file(path, data; format = String(format))
+    # written under a temporary name and renamed, so a file at `path` is always complete (see skip_existing)
+    tmp = joinpath(dir, @sprintf("%s.%05d.partial.h5", prefix, index))
+    Output.generate_output_file(tmp, data; format = String(format))
+    mv(tmp, path; force = true)
     return path
 end
 

@@ -92,6 +92,8 @@ if brisklight
     const brisk_cadence = Jipole.Utils.get_config(config, "brisklight", "cadence", 10.0)
     const brisk_t_start = get(get(config, "brisklight", Dict()), "t_start", nothing)
     const brisk_nframes = get(get(config, "brisklight", Dict()), "n_frames", nothing)
+    # Optional [brisklight].skip_existing: don't re-render frames already in the output directory (resume).
+    const brisk_skip_existing = get(get(config, "brisklight", Dict()), "skip_existing", false)
     const brisk_stride = Jipole.Utils.get_config(config, "brisklight", "sample_stride", 4)
     const brisk_weighting = Symbol(Jipole.Utils.get_config(config, "brisklight", "weighting", "emission"))
     # Optional [brisklight].ref_dump: the dump the emission weighting takes j from (default: the middle of the
@@ -277,7 +279,8 @@ if brisklight
             output_prefix = prefix,
             output_format = output_format,
             meta = meta,
-            polarized = do_polarization)
+            polarized = do_polarization,
+            skip_existing = brisk_skip_existing)
 
         if result.frames > 0
             @printf("\nWrote %d frame(s) to %s\n", result.frames, outdir)

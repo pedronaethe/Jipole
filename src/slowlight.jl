@@ -520,9 +520,21 @@ function process_slowlight_images!(
                 )
                 if movie_pol !== nothing
                     pol = zeros(Float64, Polarization.NIMG, pixels_x, pixels_y)
+                    Rh_pol = 1 + sqrt(1.0 - model.a * model.a)
+                    dl_unit_pol = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
                     Threads.@threads for i in 1:pixels_x
                         for j in 1:pixels_y
                             N, tauF = load_pol_state(movie_pol, i, j, k)
+                            # The render loop stops at step 2 (its "done" marker), so N has not been
+                            # carried over the last step to the camera, traj[2] -> traj[1]. Take it here,
+                            # as Polarization.integrate_emission_pol does: no emission out there, but
+                            # without it the projection at traj[1] reads all Stokes ~2% high.
+                            traj = all_geodesics[i, j]
+                            if nsteps[i, j] >= 2
+                                ti, tf = traj[2], traj[1]
+                                N, tauF = Polarization.polarized_step(N, tauF, ti.X, ti.Kcon, ti.Xhalf, ti.Kconhalf,
+                                    tf.X, tf.Kcon, tf.dl, dl_unit_pol, Rh_pol, freq, model.a, model, simulation_data)
+                            end
                             SI, SQ, SU, SV = Polarization.project_n(N, all_geodesics[i, j][1].X, model.a, model)
                             Polarization.save_pixel!(pol, i, j, SI, SQ, SU, SV, tauF, freq, 0)
                         end

@@ -45,9 +45,21 @@ and indexing a tuple with a runtime index is not GPU-compilable at all (see
 
 Build one with [`SnapshotSet`](@ref)'s vector constructor, which sorts for you.
 """
-struct SnapshotSet{N,D,T}
-    snaps::NTuple{N,D}
+struct SnapshotSet{N,D,T,S}
+    snaps::S                 # NTuple{N,D}; a Vector{D} for sets longer than MAX_TUPLE_SNAPSHOTS
     times::SVector{N,T}
+end
+
+# Longest set kept as a tuple. A tuple of snapshots (structs of many arrays) is carried by value: every call
+# that takes the set clears and copies all N of them, which at brisk p = 0.5 (40 dumps) made a frame ~5x slower
+# than at p = 0 or p = 1. Longer sets hold a Vector, one pointer wide; they are CPU-only (as brisk light is).
+const MAX_TUPLE_SNAPSHOTS = 16
+
+SnapshotSet(snaps::NTuple{N,D}, times::SVector{N,T}) where {N,D,T} =
+    SnapshotSet{N,D,T,NTuple{N,D}}(snaps, times)
+function SnapshotSet(snaps::Vector{D}, times::SVector{N,T}) where {N,D,T}
+    length(snaps) == N || throw(ArgumentError("SnapshotSet: $(length(snaps)) snapshots but $N times"))
+    return SnapshotSet{N,D,T,Vector{D}}(snaps, times)
 end
 
 Adapt.adapt_structure(to, s::SnapshotSet) =
@@ -68,6 +80,7 @@ function SnapshotSet(snaps::AbstractVector, times::AbstractVector)
     perm = sortperm(times)
     N = length(snaps)
     T = float(eltype(times))
+    N > MAX_TUPLE_SNAPSHOTS && return SnapshotSet([snaps[i] for i in perm], SVector{N,T}(times[perm]))
     return SnapshotSet(ntuple(i -> snaps[perm[i]], N), SVector{N,T}(times[perm]))
 end
 
@@ -116,6 +129,7 @@ every level has a concrete tuple type, so the whole chain inlines and the
 element type never changes.
 """
 @inline select_snapshot(snaps::Tuple{D}, k::Integer) where {D} = snaps[1]
+@inline select_snapshot(snaps::AbstractVector, k::Integer) = @inbounds snaps[k]
 @inline select_snapshot(snaps::Tuple, k::Integer) = _select(snaps, k, 1)
 # Past ~16 snapshots the recursion defeats inference (a 40-snapshot set is ~200x slower per lookup and
 # allocates), so a homogeneous tuple that long is indexed directly: type stable on the CPU, which is the only

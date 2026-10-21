@@ -32,21 +32,21 @@ const USE_MIXED_TPTE = true
 """
 A single GRMHD simulation snapshot: fluid primitives on the simulation
 grid, plus the derived electron/magnetic-field quantities used by the
-radiative transfer.
+radiative transfer, and the block mesh they live on.
 
-Parametric over TWO independent array types: `Araw` for the raw fluid
-primitives (`RHO`/`UU`/`U1`-`U3`/`B1`-`B3`, loaded directly from the dump
-and always `Float64`-valued. This means `Array{Float64,3}` on the CPU,
-`CuArray{Float64,3}` on the GPU via [`Utils_GPU.copy_iharm_to_gpu`](@ref)),
-and `Ader` for the derived electron/magnetic-field quantities
-(`ne`/`b`/`θe`/`sigma`/`beta`). These are independent so that a
-`ForwardDiff.Dual`-valued M_unit/Rhigh (see
-[`build_dual_params_and_data`](@ref)) only needs to promote the derived
-quantities. The raw primitives, which are M_unit/Rhigh-
-independent, stay `Float64` rather than needlessly tripling their memory
-footprint (`Dual{Float64,2}` is 24 bytes vs. `Float64`'s 8).
+Every field is stored as blocks: `field[i, j, k, mb]`, with one layer of ghost cells
+around each block (see [`Grid.BlockMesh`](@ref) and [`Grid.fill_ghosts!`](@ref)). A
+uniform iharm3d dump is a mesh with a single block; KHARMA dumps keep their own blocks.
+
+There are two array types: `Araw` for the raw fluid primitives
+(`RHO`/`UU`/`U1`-`U3`/`B1`-`B3`), which are always `Float64`, and `Ader` for the derived
+quantities (`ne`/`b`/`θe`/`sigma`/`beta`/`dθedRhi`). They are separate so that, when
+differentiating with respect to M_unit, Rhigh, etc. (see [`calculate_gradients`](@ref)),
+only the derived quantities become `ForwardDiff.Dual`; the primitives don't depend on
+those parameters and stay `Float64` (a `Dual{Float64,2}` takes 24 bytes instead of 8).
+On the GPU, all arrays (and the mesh) are `CuArray`s.
 """
-struct IharmData{Traw, Araw<:AbstractArray{Traw,3}, Tder, Ader<:AbstractArray{Tder,3}}
+struct IharmData{Traw, Araw<:AbstractArray{Traw,4}, Tder, Ader<:AbstractArray{Tder,4}, M<:Grid.BlockMesh}
     t::Float64
     RHO::Araw
     UU::Araw
@@ -62,6 +62,7 @@ struct IharmData{Traw, Araw<:AbstractArray{Traw,3}, Tder, Ader<:AbstractArray{Td
     sigma::Ader
     beta::Ader
     dθedRhi::Ader
+    mesh::M
 end
 
 Adapt.@adapt_structure IharmData
@@ -254,84 +255,84 @@ p.M_unit, p.T_unit, p.L_unit, p.MBH, p.tp_over_te, p.RHO_unit, p.U_unit, p.B_uni
 p.mks3H0, p.mks3MY1, p.mks3MY2, p.mks3MP0,p.N1,p.N2,p.N3,SVector(p.dx),SVector(p.startx),SVector(p.stopx),SVector(p.cstartx),SVector(p.cstopx),p.rmin_geo,p.rmax_geo,p.th_beg,
 p.Rlow,p.Rhigh,p.beta_crit,p.sigma_cut,p.sigma_cut_high,p.slow_light)
 
-"""
-    build_data(t, rho, uu, u1, u2, u3, b1, b2, b3, Rhigh, model::IharmParams)
 
-Assemble an [`IharmData`](@ref) from fluid primitives already laid out on the `(N1, N2, N3)`
-grid, and compute the derived quantities the radiative transfer needs (`b`, then `ne`, `θe`,
-`sigma`, `beta` via [`init_physical_quantities`](@ref)). Shared by [`load_data`](@ref) and
-`Kharma.load_data`, which differ only in how they read the primitives from disk.
 """
-function build_data(t, rho, uu, u1, u2, u3, b1, b2, b3, Rhigh, model::IharmParams)
+    build_data(t, rho, uu, u1, u2, u3, b1, b2, b3, mesh, Rhigh, model)
+
+Build an IharmData snapshot from the fluid primitives read from a dump.
+
+The primitives come in as block arrays with only the inside of each block filled. This
+fills their ghost cells, computes the magnetic field strength b in every cell (from the
+metric at the cell centre), fills the ghost cells of b too, and then computes the other
+derived quantities (electron density, temperature, sigma, beta).
+
+Used by both readers, Iharm.load_data and Kharma.load_data, which only differ in how they
+read the primitives from the file.
+"""
+function build_data(t, rho, uu, u1, u2, u3, b1, b2, b3, mesh, Rhigh, model::IharmParams)
+    # Ghost cells of the primitives, from the neighbouring blocks (once, at load time)
+    for A in (rho, uu, u1, u2, u3, b1, b2, b3)
+        Grid.fill_ghosts!(A, mesh)
+    end
+
     data = IharmData(Float64(t), rho, uu, u1, u2, u3, b1, b2, b3,
-        zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)))
+        zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), zeros(size(rho)), mesh)
 
-    # The metric depends only on (i, j), so compute it once per (i, j); then sweep the grid
-    # with i innermost, which matches the arrays' memory layout.
-    gcovs = Matrix{SMatrix{4,4,Float64,16}}(undef, model.N1, model.N2)
-    gcons = similar(gcovs)
-    Threads.@threads for j in 1:(model.N2)
-        for i in 1:(model.N1)
-            X = zeros(MVector{4,Float64})
-            Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
-            gcov = zeros(MMatrix{4,4,Float64})
-            gcon = zeros(MMatrix{4,4,Float64})
-            Metrics.gcov_func!(X, model.a, model, gcov)
-            Metrics.gcon_func!(gcov, gcon)
-            gcovs[i, j] = SMatrix(gcov)
-            gcons[i, j] = SMatrix(gcon)
-        end
-    end
+    # Magnetic field strength b in the inside cells of every block. The metric depends only on
+    # X1 and X2, so it is computed once per (i, j) of each block, then used for every k.
+    # Static vectors/matrices only, so nothing is allocated per cell.
+    nb, ng = mesh.nb, mesh.ng
+    Threads.@threads for jb in CartesianIndices((nb[2], size(rho, 4)))
+        jj, mb = Tuple(jb)
+        j = jj + ng[2]
+        for ii in 1:nb[1]
+            i = ii + ng[1]
+            X = SVector(0.0,
+                mesh.bstart[1, mb] + (ii - 0.5) * mesh.bdx[1, mb],
+                mesh.bstart[2, mb] + (jj - 0.5) * mesh.bdx[2, mb],
+                mesh.bstart[3, mb] + 0.5 * mesh.bdx[3, mb])
+            gcov = Metrics.gcov_func(X, model.a, model)
+            gcon = Metrics.gcon_func(gcov)
 
-    Threads.@threads for jk in CartesianIndices((model.N2, model.N3))
-        j, k = Tuple(jk)
-        for i in 1:(model.N1)
-            gcov = gcovs[i, j]
-            gcon = gcons[i, j]
+            for kk in 1:nb[3]
+                k = kk + ng[3]    
+                U = SVector(u1[i, j, k, mb], u2[i, j, k, mb], u3[i, j, k, mb])
+                B = SVector(b1[i, j, k, mb], b2[i, j, k, mb], b3[i, j, k, mb])
 
-            Ufields = (data.U1, data.U2, data.U3)
-            UdotU = 0.0
-            for l in 1:(Constants.NDIM-1)
-                for m in 1:(Constants.NDIM-1)
-                    UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
+                UdotU = 0.0
+                for l in 1:(Constants.NDIM-1)
+                    for m in 1:(Constants.NDIM-1)
+                        UdotU += gcov[l+1, m+1] * U[l] * U[m]
+                    end
                 end
-            end
+                ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
+                ucon = SVector(-ufac * gcon[1, 1],
+                    U[1] - ufac * gcon[1, 2], U[2] - ufac * gcon[1, 3], U[3] - ufac * gcon[1, 4])
+                ucov = Coordinates.flip_index(ucon, gcov)
 
-            ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
-            ucon = MVector{4,Float64}(undef)
-            ucon[1] = -ufac * gcon[1, 1]
+                udotB = ucov[2] * B[1] + ucov[3] * B[2] + ucov[4] * B[3]
+                bcon = SVector(udotB,
+                    (B[1] + ucon[2] * udotB) / ucon[1],
+                    (B[2] + ucon[3] * udotB) / ucon[1],
+                    (B[3] + ucon[4] * udotB) / ucon[1])
+                bcov = Coordinates.flip_index(bcon, gcov)
 
-            for μ in 1:(Constants.NDIM-1)
-                ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
+                bsq = 0.0
+                for l in 1:Constants.NDIM
+                    bsq += bcov[l] * bcon[l]
+                end
+                data.b[i, j, k, mb] = sqrt(bsq) * model.B_unit
             end
-
-            ucov = MVector{4,Float64}(undef)
-            Coordinates.flip_index!(ucov, ucon, gcov)
-            udotB = 0.0
-            Bfields = (data.B1, data.B2, data.B3)
-            for l in 1:(Constants.NDIM-1)
-                udotB += ucov[l+1] * Bfields[l][i, j, k]
-            end
-
-            bcon = MVector{4,Float64}(undef)
-            bcon[1] = udotB
-            for μ in 1:(Constants.NDIM-1)
-                bcon[μ+1] = (Bfields[μ][i, j, k] + ucon[μ+1] * udotB) / ucon[1]
-            end
-            bcov = MVector{4,Float64}(undef)
-            Coordinates.flip_index!(bcov, bcon, gcov)
-
-            bsq = 0.0
-            for l in 1:Constants.NDIM
-                bsq += bcov[l] * bcon[l]
-            end
-            data.b[i, j, k] = sqrt(bsq) * model.B_unit
         end
     end
+
+    # Ghost cells of b like the primitives (not recomputed), so the edges of the mesh behave as before
+    Grid.fill_ghosts!(data.b, mesh)
 
     init_physical_quantities([data], 1, model, Rhigh)
     return data
 end
+
 
 """
     read_header(filename, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
@@ -567,9 +568,19 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
     return IharmParams(params)
 end
 
+
+"""
+    load_data(filename, Rhigh, model; advance_path! = nothing)
+
+Read an iharm3d dump and build its IharmData snapshot. A uniform dump is stored as a mesh
+with a single block covering the whole grid, with one layer of ghost cells around it.
+"""
 function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::Union{Nothing,Function}=nothing)
     println("Loading data from '$filename' into 'Iharm' module...")
     !isfile(filename) && error("File not found: $filename")
+
+    mesh = Grid.uniform_mesh(model)
+    ng = mesh.ng
 
     t, fields = h5open(filename, "r") do file
         t = read(file, "t")
@@ -577,14 +588,17 @@ function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::U
         prims = read(file["prims"])
         size(prims)[2:4] == (model.N3, model.N2, model.N1) ||
             error("Data dimensions $(reverse(size(prims)[2:4])) do not match expected grid size ($(model.N1), $(model.N2), $(model.N3))")
-        fields = [Array{Float64}(undef, model.N1, model.N2, model.N3) for _ in VALID_PRIMS]
+
+        # One block with a ghost layer: the dump goes in the inside, build_data fills the ghosts
+        fields = [zeros(model.N1 + 2ng[1], model.N2 + 2ng[2], model.N3 + 2ng[3], 1) for _ in VALID_PRIMS]
         Threads.@threads for i in eachindex(VALID_PRIMS)
-            permutedims!(fields[i], view(prims, i, :, :, :), (3, 2, 1))
+            inside = view(fields[i], ng[1]+1:ng[1]+model.N1, ng[2]+1:ng[2]+model.N2, ng[3]+1:ng[3]+model.N3, 1)
+            permutedims!(inside, view(prims, i, :, :, :), (3, 2, 1))
         end
         t, fields
     end
 
-    data = build_data(t, fields..., Rhigh, model)
+    data = build_data(t, fields..., mesh, Rhigh, model)
     println("All primitives successfully loaded. Dimensions: ", size(data.RHO))
 
     advance_path! === nothing || advance_path!()
@@ -592,86 +606,86 @@ function load_data(filename::String, Rhigh, model::IharmParams; advance_path!::U
 end
 
 """
-    compute_accretion_diagnostics(model::IharmParams, data::IharmData)
+    compute_accretion_diagnostics(model, data)
 
-Compute the mass accretion rate (`Mdot`), Eddington-normalized accretion
-rate scale (`MdotEdd`), and advected energy flux (`Ladv`) for a loaded
-snapshot, matching `ipole`'s `load_iharm_data` diagnostics exactly (same
-per-zone 4-velocity reconstruction already used above to build the `b`
-field, restricted to the innermost 21 radial zones and integrated over
-the angular directions).
+Mass accretion rate (Mdot), Eddington accretion rate (MdotEdd) and advected energy flux
+(Ladv) of a snapshot, as in ipole: the radial mass and energy fluxes, integrated over theta
+and phi and averaged over the 21 innermost radial zones of the grid.
+
+With mesh refinement those zones may hold smaller cells; each cell then counts in
+proportion to its size, so the result is the same average over the same shell.
 
 # Returns
 - `(Mdot, MdotEdd, Ladv)`, all in cgs.
 """
 function compute_accretion_diagnostics(model::IharmParams, data::IharmData)
+    mesh = data.mesh
+    nb, ng = mesh.nb, mesh.ng
+
+    # The shell is the n_shell innermost zones of the root grid in X1
     n_shell = min(21, model.N1)
+    xshell = mesh.xmin[1] + n_shell * model.dx[2]
+
     dMact = 0.0
     Ladv = 0.0
+    for mb in axes(data.RHO, 4)
+        # cells of this block inside the shell (0 if the block is further out)
+        nshell_b = clamp(round(Int, (xshell - mesh.bstart[1, mb]) / mesh.bdx[1, mb]), 0, nb[1])
+        nshell_b == 0 && continue
+        # weight of one cell: its volume in native coordinates over the width of the shell
+        w = mesh.bdx[1, mb] * mesh.bdx[2, mb] * mesh.bdx[3, mb] / (n_shell * model.dx[2])
 
-    Ufields = (data.U1, data.U2, data.U3)
+        for jj in 1:nb[2], ii in 1:nshell_b
+            i = ii + ng[1]; j = jj + ng[2]
+            # the metric depends only on X1 and X2
+            X = SVector(0.0,
+                mesh.bstart[1, mb] + (ii - 0.5) * mesh.bdx[1, mb],
+                mesh.bstart[2, mb] + (jj - 0.5) * mesh.bdx[2, mb],
+                mesh.bstart[3, mb] + 0.5 * mesh.bdx[3, mb])
+            gcov = Metrics.gcov_func(X, model.a, model)
+            gcon = Metrics.gcon_func(gcov)
+            g = Metrics.gdet_func(gcov)
 
-    for i in 1:n_shell
-        for j in 1:(model.N2)
-            X = zeros(MVector{4,Float64})
-            Grid.ijk_to_x(i - 1, j - 1, 0, X, model)
-            gcov = zeros(MMatrix{4,4,Float64})
-            gcon = zeros(MMatrix{4,4,Float64})
-            Metrics.gcov_func!(X, model.a, model, gcov)
-            Metrics.gcon_func!(gcov, gcon)
-            g = Grid.gdet_zone(i - 1, j - 1, 0, model)
-
-            for k in 1:(model.N3)
+            for kk in 1:nb[3]
+                k = kk + ng[3]    
+                U = SVector(data.U1[i, j, k, mb], data.U2[i, j, k, mb], data.U3[i, j, k, mb])
                 UdotU = 0.0
                 for l in 1:(Constants.NDIM-1)
                     for m in 1:(Constants.NDIM-1)
-                        UdotU += gcov[l+1, m+1] * Ufields[l][i, j, k] * Ufields[m][i, j, k]
+                        UdotU += gcov[l+1, m+1] * U[l] * U[m]
                     end
                 end
-
                 ufac = sqrt(-1.0 / gcon[1, 1] * (1.0 + abs(UdotU)))
-                ucon = MVector{4,Float64}(undef)
-                ucon[1] = -ufac * gcon[1, 1]
-                for μ in 1:(Constants.NDIM-1)
-                    ucon[μ+1] = Ufields[μ][i, j, k] - ufac * gcon[1, μ+1]
-                end
+                ucon = SVector(-ufac * gcon[1, 1],
+                    U[1] - ufac * gcon[1, 2], U[2] - ufac * gcon[1, 3], U[3] - ufac * gcon[1, 4])
+                ucov = Coordinates.flip_index(ucon, gcov)
 
-                ucov = MVector{4,Float64}(undef)
-                Coordinates.flip_index!(ucov, ucon, gcov)
-
-                # ucon[2]/ucov[1] here are Julia's 1-indexed radial-contravariant
-                # and time-covariant components, matching ipole's ucon[1]/ucov[0].
-                dMact += g * data.RHO[i, j, k] * ucon[2]
-                Ladv += g * data.UU[i, j, k] * ucon[2] * ucov[1]
+                # ucon[2]/ucov[1] are the radial-contravariant and time-covariant components,
+                # matching ipole's ucon[1]/ucov[0]
+                dMact += w * g * data.RHO[i, j, k, mb] * ucon[2]
+                Ladv += w * g * data.UU[i, j, k, mb] * ucon[2] * ucov[1]
             end
         end
     end
 
-    dMact *= model.dx[4] * model.dx[3] / n_shell
-    Ladv *= model.dx[4] * model.dx[3] / n_shell
-
     Mdot = -dMact * model.M_unit / model.T_unit
     MdotEdd = 4π * Constants.GNEWT * (model.MBH * Constants.MSUN) * Constants.MP /
-              Constants.CL / 0.1 / Constants.SIGMA_THOMPSON
+            Constants.CL / 0.1 / Constants.SIGMA_THOMPSON
 
     return Mdot, MdotEdd, Ladv
 end
 
-"""
+ """
     init_physical_quantities(data, n, model, Rhigh)
 
-Compute the derived electron-density, magnetic-field-strength,
-electron-temperature, magnetization (`sigma`), and plasma-beta arrays
-(and the `Rhigh`-derivative of electron temperature) for snapshot
-`data[n]`, from its loaded fluid primitives (`RHO`, `UU`, `b`), using the
-Ressler/Athena mixed electron-temperature model.
+Compute, for every cell of snapshot data[n], the quantities the radiative transfer needs:
+electron density, electron temperature, magnetization (sigma), plasma beta, and the
+derivative of the electron temperature with respect to Rhigh. They come from the density,
+internal energy and magnetic field strength already stored in the snapshot, using the
+Rlow/Rhigh electron temperature model.
 
-# Arguments
-- `data`: Vector of loaded [`IharmData`](@ref) snapshots.
-- `n`: Index of the snapshot to process.
-- `model`: Iharm model parameters.
-- `Rhigh`: Electron/ion temperature ratio at high magnetization
-  (`Rhigh`).
+Each cell is computed on its own, so this works for any grid layout and also fills the
+ghost cells.
 """
 function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2) where {T2}
     rho_factor = model.RHO_unit / (Constants.MP + Constants.ME) * model.Ne_factor
@@ -691,42 +705,41 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2)
     UU_arr = data[n].UU
     dθedRhi = data[n].dθedRhi
 
-    @inbounds Threads.@threads for jk in CartesianIndices((model.N2, model.N3))
-        j, k = Tuple(jk)
-        for i in 1:model.N1
-            rho_ijk = RHO_arr[i, j, k]
-            uu_ijk = UU_arr[i, j, k]
-            b_ijk = b_arr[i, j, k]  # already correctly B_unit-scaled by the caller
+    # Purely per cell: loop over every cell of every block, ghosts included.
+    # eachindex over all the arrays also checks that they have the same shape.
+    @inbounds Threads.@threads for c in eachindex(ne_arr, b_arr, θe_arr, sigma_arr, beta_arr, RHO_arr, UU_arr, dθedRhi)
+        rho_c = RHO_arr[c]
+        uu_c = UU_arr[c]
+        b_c = b_arr[c]  # already correctly B_unit-scaled by the caller
 
-            ne_arr[i, j, k] = rho_ijk * rho_factor
+        ne_arr[c] = rho_c * rho_factor
 
-            bsq_normalized = b_ijk * B_unit_inv
-            bsq = bsq_normalized * bsq_normalized
+        bsq_normalized = b_c * B_unit_inv
+        bsq = bsq_normalized * bsq_normalized
 
-            sigma_m = bsq / rho_ijk
-            beta_m = uu_ijk * gam_minus_1 / (0.5 * bsq)
+        sigma_m = bsq / rho_c
+        beta_m = uu_c * gam_minus_1 / (0.5 * bsq)
 
-            betasq = beta_m * beta_m / beta_crit_sq
-            betasq_plus_1_inv = 1.0 / (1.0 + betasq)
-            trat = Rhigh * betasq * betasq_plus_1_inv + model.Rlow * betasq_plus_1_inv
-            θe_unit = θe_factor / (game_minus_1 * trat + gamp_minus_1)
-            θe_val = θe_unit * uu_ijk / rho_ijk
+        betasq = beta_m * beta_m / beta_crit_sq
+        betasq_plus_1_inv = 1.0 / (1.0 + betasq)
+        trat = Rhigh * betasq * betasq_plus_1_inv + model.Rlow * betasq_plus_1_inv
+        θe_unit = θe_factor / (game_minus_1 * trat + gamp_minus_1)
+        θe_val = θe_unit * uu_c / rho_c
 
-            dtratdRhi = betasq * betasq_plus_1_inv
-            dθe_unit_dRhi = -θe_factor * game_minus_1 / ((game_minus_1 * trat + gamp_minus_1)^2) * dtratdRhi
-            dθe_dRhi = dθe_unit_dRhi * uu_ijk / rho_ijk
+        dtratdRhi = betasq * betasq_plus_1_inv
+        dθe_unit_dRhi = -θe_factor * game_minus_1 / ((game_minus_1 * trat + gamp_minus_1)^2) * dtratdRhi
+        dθe_dRhi = dθe_unit_dRhi * uu_c / rho_c
 
-            if MaxwellJuettnerPol.primal(θe_val) > 1.0e-3
-                θe_arr[i, j, k] = θe_val
-                dθedRhi[i, j, k] = dθe_dRhi
-            else
-                θe_arr[i, j, k] = 1.0e-3
-                dθedRhi[i, j, k] = 0.0
-            end
-
-            sigma_arr[i, j, k] = MaxwellJuettnerPol.primal(sigma_m) > Constants.SMALL ? sigma_m : Constants.SMALL
-            beta_arr[i, j, k] = MaxwellJuettnerPol.primal(beta_m) > Constants.SMALL ? beta_m : Constants.SMALL
+        if MaxwellJuettnerPol.primal(θe_val) > 1.0e-3
+            θe_arr[c] = θe_val
+            dθedRhi[c] = dθe_dRhi
+        else
+            θe_arr[c] = 1.0e-3
+            dθedRhi[c] = 0.0
         end
+
+        sigma_arr[c] = MaxwellJuettnerPol.primal(sigma_m) > Constants.SMALL ? sigma_m : Constants.SMALL
+        beta_arr[c] = MaxwellJuettnerPol.primal(beta_m) > Constants.SMALL ? beta_m : Constants.SMALL
     end
 end
 
@@ -1027,7 +1040,7 @@ position `X`, optionally with their derivatives with respect to `Rhigh`.
 - A tuple `(j, k, dj_dRhigh, dk_dRhigh)`.
 """
 function jar_calc(X, Kcon, bhspin, model::IharmParams, data, ::Val{B}=Val(false)) where {B}
-    zone = Grid.locate(X, model)
+    zone = Grid.locate(X, model, data[1].mesh)
     Ne = get_model_ne(zone, X, model, data)
     z_base = zero(typeof(Ne))
     if MaxwellJuettnerPol.primal(Ne) == 0.0
@@ -1206,7 +1219,7 @@ function grmhd_context(params0::IharmParams, data0::IharmData)
               ELECTRONS=params0.ELECTRONS, RADIATION=params0.RADIATION, tp_over_te=params0.tp_over_te,
               slow_light=params0.slow_light, t=data0.t,
               RHO=data0.RHO, UU=data0.UU, U1=data0.U1, U2=data0.U2, U3=data0.U3,
-              B1=data0.B1, B2=data0.B2, B3=data0.B3, b_normalized=b_normalized)
+              B1=data0.B1, B2=data0.B2, B3=data0.B3, b_normalized=b_normalized, mesh=data0.mesh)
 end
 
 
@@ -1268,7 +1281,7 @@ function calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep, 
         sigma_cut_high_d, ctx.slow_light)
 
     b_d = ctx.b_normalized .* T(B_unit_d)
-    data_d = IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3, ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d, similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T))
+    data_d = IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3, ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d, similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), ctx.mesh)
     init_physical_quantities([data_d], 1, model_d, Rhigh_d)
 
     Dxsize = sourceD_d / L_unit_d / Constants.MUAS_PER_RAD * fovx_uas

@@ -6,30 +6,21 @@ module JipoleCUDAExt
 
 using CUDA
 using StaticArrays
+using Adapt
 using Jipole
 using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Slowlight, Utils_GPU, Tetrads
 using Jipole.GeoTypes: OfTrajGeneric, GPUTrajStep
 using Jipole.Slowlight: OfSlowLight, pack_trajectory_tile!
 
-function Utils_GPU.copy_iharm_to_gpu(cpu_data)
-    return Iharm.IharmData(
-        Float64(cpu_data.t),
-        CuArray(cpu_data.RHO),
-        CuArray(cpu_data.UU),
-        CuArray(cpu_data.U1),
-        CuArray(cpu_data.U2),
-        CuArray(cpu_data.U3),
-        CuArray(cpu_data.B1),
-        CuArray(cpu_data.B2),
-        CuArray(cpu_data.B3),
-        CuArray(cpu_data.ne),
-        CuArray(cpu_data.b),
-        CuArray(cpu_data.θe),
-        CuArray(cpu_data.sigma),
-        CuArray(cpu_data.beta),
-        CuArray(cpu_data.dθedRhi)
-    )
-end
+  """
+      copy_iharm_to_gpu(cpu_data)
+
+  Copy a snapshot to the GPU: every array (fluid fields, derived quantities and the block
+  mesh) becomes a CuArray of the same element type; the time stays a number.
+  """
+  function Utils_GPU.copy_iharm_to_gpu(cpu_data)
+      return Adapt.adapt(CuArray, cpu_data)
+  end
 
 
 """

@@ -46,7 +46,7 @@ the Leung et al. fit; it could be rewritten on top of this function.)
   not evaluated and are returned as zero.
 """
 @inline function plasma_state(X, Kcon, bhspin, model::Iharm.IharmParams, data)
-    zone = Grid.locate(X, model)
+    zone = Grid.locate(X, model, data[1].mesh)
     Ne = Iharm.get_model_ne(zone, X, model, data)
     Ucon, Ucov, Bcon, Bcov = Iharm.get_model_fourv(zone, X, Kcon, bhspin, model, data)
 
@@ -138,7 +138,8 @@ function dual_problem(ctx; MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma
         sigma_cut_high_d, ctx.slow_light)
 
     b_d = ctx.b_normalized .* T(B_unit_d)
-    data_d = Iharm.IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3, ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d, similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T))
+    data_d = Iharm.IharmData(ctx.t, ctx.RHO, ctx.UU, ctx.U1, ctx.U2, ctx.U3, ctx.B1, ctx.B2, ctx.B3, similar(ctx.RHO, T), b_d, similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), similar(ctx.RHO, T), ctx.mesh)
+
     Iharm.init_physical_quantities([data_d], 1, model_d, Rhigh_d)
 
     return (model=model_d, data=[data_d], ro=ro_d, th=th_d, phi=phi_d, sourceD=sourceD_d)

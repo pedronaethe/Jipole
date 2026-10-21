@@ -88,7 +88,8 @@ report(isbits(model) && isbitstype(eltype(traj)), "model parameters and trajecto
 # ---------------------------------------------------------------------------------------------
 const GPUCompiler = CUDA.GPUCompiler
 DeviceArray(T, N) = CUDA.CuDeviceArray{T,N,CUDA.AS.Global}
-const DeviceData = Jipole.Iharm.IharmData{Float64,DeviceArray(Float64, 3),Float64,DeviceArray(Float64, 3)}
+const DeviceMesh = Jipole.Grid.BlockMesh{DeviceArray(Int32, 3),DeviceArray(Float64, 2)}
+const DeviceData = Jipole.Iharm.IharmData{Float64,DeviceArray(Float64, 4),Float64,DeviceArray(Float64, 4),DeviceMesh}
 const TrajArray = DeviceArray(Jipole.GeoTypes.GPUTrajStep{Float64}, 3)
 # Declared but undefined only because nothing is linked here: GPUCompiler's routines for
 # reporting an exception raised inside a kernel. NVIDIA's math library (__nv_*) is the other.

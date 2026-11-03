@@ -80,26 +80,25 @@ const maxnstep = Jipole.Utils.get_config(config, "raytracing", "maxnstep", 25000
 const mode = Jipole.Utils.get_config(config, "raytracing", "mode", "cpu")
 
 
-# Brisk light: reduced temporal fidelity at slow-light geometry. `p` is the
-# retained probability mass of each lensing band's emission-time distribution,
-# and it controls how many dump files each band uses *through the geometry* --
-# there is no "snapshots per band" knob to set. See src/brisklight.jl.
 const brisklight = haskey(config, "brisklight") ?
                    Jipole.Utils.get_config(config, "brisklight", "on", false) : false
 if brisklight
+
+    # p is a tunning parameter that represents the amount of lensing time covered.
+    # it will control how many dump files each band uses through the geometry.
     const brisk_p = Jipole.Utils.get_config(config, "brisklight", "p", 0.5)
     const brisk_nbands = Jipole.Utils.get_config(config, "brisklight", "n_bands", 2)
     const brisk_cadence = Jipole.Utils.get_config(config, "brisklight", "cadence", 10.0)
     const brisk_t_start = get(get(config, "brisklight", Dict()), "t_start", nothing)
     const brisk_nframes = get(get(config, "brisklight", Dict()), "n_frames", nothing)
-    # Optional [brisklight].skip_existing: don't re-render frames already in the output directory (resume).
+    # Don't re-render frames already in the output directory (resume).
     const brisk_skip_existing = get(get(config, "brisklight", Dict()), "skip_existing", false)
-    const brisk_stride = Jipole.Utils.get_config(config, "brisklight", "sample_stride", 4)
-    const brisk_weighting = Symbol(Jipole.Utils.get_config(config, "brisklight", "weighting", "emission"))
-    # Optional [brisklight].ref_dump: the dump the emission weighting takes j from (default: the middle of the
-    # series). It sets t_ref, so runs that must share a frame grid (e.g. with a fast-light run given that t_ref)
-    # should name the same dump.
-    const brisk_ref_dump = get(get(config, "brisklight", Dict()), "ref_dump", "")
+    const brisk_interpolate_bands = get(get(config, "brisklight", Dict()), "interpolate_bands", true)
+    # Sample stride skips frames in x and y direction.
+    const brisk_stride = Jipole.Utils.get_config(config, "brisklight", "sample_stride", 1)
+    const brisk_grouping = Symbol(Jipole.Utils.get_config(config, "brisklight", "grouping", "nearest_crossing"))
+    const brisk_interval = Symbol(Jipole.Utils.get_config(config, "brisklight", "interval", "hdi"))
+    const brisk_t_ref = get(get(config, "brisklight", Dict()), "t_ref", nothing)
     slow_light && error("[physical].slow_light and [brisklight].on are mutually exclusive: pick one temporal mode.")
     (0.0 <= brisk_p <= 1.0) || error("[brisklight].p must be in [0, 1], got $brisk_p")
     brisk_nbands >= 0 || error("[brisklight].n_bands must be >= 0, got $brisk_nbands")
@@ -188,26 +187,26 @@ else
     const M_unit = M_unit_guess
 end
 
-# Temporal-mode branching: brisk light, then fast light, then slow light.
+# Here we branch out. Temporal-mode branching: brisk light, then fast light, then slow light.
+
+
 if brisklight
-    # Brisk light: trace every geodesic once, analyse the lensing bands' emission
-    # times at the requested p, then render each frame from only the dumps its
-    # bands actually need.
     println("")
-    println("Brisk-light rendering: p = $brisk_p, n_bands = $brisk_nbands, cadence = $brisk_cadence M")
+    println("Brisk-light rendering: p = $brisk_p, n_bands = $brisk_nbands, cadence = $brisk_cadence M, ",
+            brisk_interpolate_bands ? "interpolated between bands" : "clipped per band (paper)")
     use_gpu && @warn "A GPU brisk-light kernel is not implemented yet; rendering on the CPU."
 
     let
+        # Read the simulation time of each dumping without loading the whole dump.
         dump_times = Jipole.Brisklight.dump_times_of(dump_files)
         println("Dump series: $(length(dump_files)) file(s), t = $(round(dump_times[1], digits=3)) .. $(round(dump_times[end], digits=3)) M")
-        length(dump_times) >= 2 || error("""
-            Brisk light needs at least 2 dumps to interpolate between; found $(length(dump_times)) in
-            '$dump_filepath'. If the directory does hold more, check [dump].t_init/t_final -- they
-            filter the series by simulation time, and the defaults in example_par.toml
-            (t_init = $t_init, t_final = $t_final) will exclude a run at a different epoch.""")
+        length(dump_times) >= 2 || error(""" Brisk light needs at least 2 dumps to interpolate between; found $(length(dump_times)) in
+            '$dump_filepath'. If the directory does hold more, check [dump].t_init/t_final""")
 
-        # Any dump serves as the header source: the grid is fixed across the series.
+        # Check if it's phdf or h5 from iharm3D format.
         reader = Jipole.Kharma.is_kharma_dump(dump_files[1]) ? Jipole.Kharma : Jipole.Iharm
+
+        # Read the header from the dump file.
         model = reader.read_header(dump_files[1], MBH; th_beg = th_beg, Rlow = Rlow, Rhigh = Rhigh,
             beta_crit = beta_crit, sigma_cut = sigma_cut, sigma_cut_high = sigma_cut_high,
             rmin_geo = rmin_geo, rmax_geo = rmax_geo,
@@ -218,41 +217,30 @@ if brisklight
         DYsize = DXsize
         fovx = DXsize / ro
         fovy = DYsize / ro
-        # Report the field of view in M as well as microarcseconds: the conversion
-        # runs through both MBH and the source distance, so mixing a mass and a
-        # distance from different sources silently produces a pencil beam into the
-        # hole (or a field far wider than the grid), and the symptom otherwise shows
-        # up much later as a band with no emission-time samples.
         @printf("Field of view: %.1f uas = %.2f M at ro = %.1f M (%.2f M per pixel)\n",
                 fov_size, DXsize, ro, DXsize / pixels_x)
         DXsize < 1.0 && @warn "The field of view is under 1 M across: check that [physical].MBH and [observing].source_distance_pc describe the same source."
 
-        # Traced once and reused for every frame. This is the run's dominant memory
-        # cost: pixels_x * pixels_y * mean(nsteps) trajectory records.
+        # Trace all geodesics from the camera to the black hole.
         geo_time = @elapsed begin
             all_geodesics, nsteps, midplane_crossings, Xcamera, bounds =
                 Jipole.Imaging.trace_all_geodesics(model, ro, th, phi, freq, pixels_x, pixels_y,
                     fovx, fovy, maxnstep, Rh, xoff, yoff)
         end
+
+
         @printf("Traced %d geodesics in %.2f s (mean %.0f steps/ray)\n",
                 pixels_x * pixels_y, geo_time, sum(nsteps) / length(nsteps))
         println("Crossing counts: ", [(c, count(==(c), midplane_crossings))
                                       for c in sort(unique(midplane_crossings))])
 
-        # The emission weighting needs one snapshot to take j from. Use the dump
-        # nearest the middle of the series: it only sets the relative weight of each
-        # step, never a rendered value.
-        ref_file = isempty(brisk_ref_dump) ? dump_files[max(1, div(length(dump_files) + 1, 2))] : brisk_ref_dump
-        println("Emission-weighting reference dump: ", ref_file)
-        ref_data = reader.load_data(ref_file, Rhigh, model)
-
+        # This runs once per run, before any frame is rendered. It takes the
+        # traced rays and works out, for each lensing band, the band's time and its p window. Every frame then
+        # uses those to decide which dumps to load.
         stats, cache, sample = Jipole.Brisklight.analyze_bands(
             midplane_crossings, all_geodesics, nsteps, pixels_x, pixels_y,
             brisk_nbands, model, brisk_p;
-            sample_stride = brisk_stride, weighting = brisk_weighting,
-            ref_data = ref_data, freq = freq)
-        ref_data = nothing
-        GC.gc()
+            sample_stride = brisk_stride, grouping = brisk_grouping, interval = brisk_interval, t_ref0 = brisk_t_ref)
 
         scale_factor = Jipole.Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y,
                                                              SourceD, model.L_unit)
@@ -267,7 +255,10 @@ if brisklight
         prefix = first(splitext(basename(output_filename)))
         isempty(prefix) && (prefix = "brisk")
 
+        # It holds the series of dumps that will be used for rendering. Not their data, but path and time.
         series = Jipole.Brisklight.DumpSeries(dump_files; times = dump_times)
+
+        # Finally process image.
         result = Jipole.Brisklight.process_brisklight_images!(
             stats, cache, series, all_geodesics, nsteps, model,
             pixels_x, pixels_y, freq, Rhigh;
@@ -280,7 +271,8 @@ if brisklight
             output_format = output_format,
             meta = meta,
             polarized = do_polarization,
-            skip_existing = brisk_skip_existing)
+            skip_existing = brisk_skip_existing,
+            interpolate_bands = brisk_interpolate_bands)
 
         if result.frames > 0
             @printf("\nWrote %d frame(s) to %s\n", result.frames, outdir)
@@ -292,11 +284,9 @@ if brisklight
                     sum(r.load_seconds for r in result.metrics), Sys.maxrss() / 2^30)
         end
     end
+# Fast light on an observer-time cadence
 elseif !slow_light && fast_cadence !== nothing
-    # Fast light on an observer-time cadence: instead of one image per dump at that
-    # dump's own time, render on a time grid, interpolating the fluid between the two
-    # dumps bracketing each frame. That puts fast light on the same frame grid as a
-    # brisk or slow-light run, which is what makes the three directly comparable.
+    # Instead of doing one image per dump, we can interpolate between two different files to create a smooth sequence of frames.
     println("")
     println("Fast-light rendering on a cadence of $fast_cadence M")
     use_gpu && @warn "The cadence fast-light path is CPU-only for now; rendering on the CPU."
@@ -318,11 +308,6 @@ elseif !slow_light && fast_cadence !== nothing
         DYsize = DXsize
         fovx = DXsize / ro
         fovy = DYsize / ro
-        # Report the field of view in M as well as microarcseconds: the conversion
-        # runs through both MBH and the source distance, so mixing a mass and a
-        # distance from different sources silently produces a pencil beam into the
-        # hole (or a field far wider than the grid), and the symptom otherwise shows
-        # up much later as a band with no emission-time samples.
         @printf("Field of view: %.1f uas = %.2f M at ro = %.1f M (%.2f M per pixel)\n",
                 fov_size, DXsize, ro, DXsize / pixels_x)
         DXsize < 1.0 && @warn "The field of view is under 1 M across: check that [physical].MBH and [observing].source_distance_pc describe the same source."
@@ -347,18 +332,41 @@ elseif !slow_light && fast_cadence !== nothing
         prefix = first(splitext(basename(output_filename)))
         isempty(prefix) && (prefix = "fast")
 
+
+        # This is a parameter for band-0 modal time of this geometry, so the camera time
+        # of each frame is recorded as well.
+        fast_t_ref = Float64(get(config["fastlight"], "t_ref", NaN))
+
+        # If on_dumps = true: every frame is one dump at its own stored time, so no frame
+        # interpolates the fluid.
+        fast_t_frames = nothing
+        if get(config["fastlight"], "on_dumps", false)
+            fast_t_start === nothing && error("[fastlight].on_dumps needs t_start")
+            i0 = argmin(abs.(dump_times .- fast_t_start))
+            n = fast_nframes === nothing ? length(dump_times) - i0 + 1 : Int(fast_nframes)
+            i0 + n - 1 <= length(dump_times) || error("[fastlight].on_dumps: $n frames from dump $i0 run past the last dump")
+            fast_t_frames = dump_times[i0:i0 + n - 1]
+            gaps = diff(fast_t_frames)
+            maximum(abs, gaps .- fast_cadence) < 0.01 * fast_cadence ||
+                error("[fastlight].on_dumps: dumps are not $fast_cadence M apart (gaps $(extrema(gaps)))")
+            snap = dump_times[i0] - fast_t_start
+            isnan(fast_t_ref) || (fast_t_ref += snap)
+            @printf("Fast light on dumps: %d frames, dumps %d..%d (t = %.4f .. %.4f), snapped by %+.4f M, t_ref = %.4f\n",
+                    n, i0, i0 + n - 1, fast_t_frames[1], fast_t_frames[end], snap, fast_t_ref)
+        end
+
         series = Jipole.Brisklight.DumpSeries(dump_files; times = dump_times)
+        # Process fast light images for the given series of dumps.
         result = Jipole.Brisklight.process_fastlight_images!(
             series, all_geodesics, nsteps, model, pixels_x, pixels_y, freq, Rhigh;
             cadence = fast_cadence,
             t_start = fast_t_start,
             n_frames = fast_nframes,
+            t_frames = fast_t_frames,
             output_dir = outdir, output_prefix = prefix,
             output_format = output_format, meta = meta,
             polarized = do_polarization,
-            # Optional [fastlight].t_ref: band-0 modal time of this geometry (from a brisk analysis), so the
-            # camera time of each frame is recorded as well.
-            t_ref = Float64(get(config["fastlight"], "t_ref", NaN)))
+            t_ref = fast_t_ref)
 
         result.frames > 0 && @printf("\nWrote %d frame(s) to %s; render %.2f s, peak RSS %.2f GB\n",
             result.frames, outdir, sum(r.render_seconds for r in result.metrics),
@@ -534,9 +542,7 @@ else
     params_slowlight = Jipole.Slowlight.OfSlowLight(dump_start, dump_max, image_cadence, 0.0, 0.0, 0.0, "")
     params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path)
 
-    # Dispatch the reader on the dump itself, matching the fast-light branch, so a
-    # KHARMA directory loads through Jipole.Kharma. Both readers return the same
-    # IharmParams/IharmData types, so nothing downstream changes.
+
     const sl_reader = Jipole.Kharma.is_kharma_dump(params_slowlight.current_dumps_path) ? Jipole.Kharma : Jipole.Iharm
     model = sl_reader.read_header(params_slowlight.current_dumps_path, MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, rmin_geo=rmin_geo, rmax_geo=rmax_geo, M_unit=M_unit, slow_light=true)
 

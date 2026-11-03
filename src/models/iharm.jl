@@ -769,10 +769,13 @@ function set_tinterp_ns(X, model::IharmParams, data)
     if model.slow_light
         nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
         dataA, dataB = data[nA], data[nB]
-        tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
-        return dataA, dataB, tinterp, true
+        # Clamp, as ipole does (model/iharm/model.c set_tinterp_ns): slow light takes a step while its start is
+        # before data[2].t, so its end can lie past data[3].t, by up to ~9 M where the integrator's steps are long
+        # (r >> 100). Unclamped, the flow was extrapolated linearly there, and theta_e went negative (M87 crash at
+        # dump 01717, Oct 19: r = 459, extrapolated 3 M past the last snapshot). The Oct 5 clamp was left unreachable
+        # after the return by the Oct 10 merge of feature/polarization.
         tinterp = clamp(1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t), 0.0, 1.0)
-        return dataA, dataB, tinterp
+        return dataA, dataB, tinterp, true
     else
         return data[1], data[1], 0.0, false
     end
@@ -817,7 +820,8 @@ time via the tuple's length, unlike the `Vector` method's runtime
     else
         dataA, dataB = data[2], data[3]
     end
-    tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
+    # Clamped as in the Vector method above (and ipole): never extrapolate past the window.
+    tinterp = clamp(1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t), 0.0, 1.0)
     return dataA, dataB, tinterp, true
 end
 

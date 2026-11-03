@@ -57,8 +57,7 @@ geos, nsteps, crossings, Xcam, bounds = Jipole.Imaging.trace_all_geodesics(
 # rebuilt per evaluation. This is also how master's gradient path works -- a Dual
 # cannot enter through read_header, whose builder has concrete Float64 fields.
 loaded = [reader.load_data(dumps[1], RHIGH0, base)]
-cache, sample = BL.band_walk(crossings, geos, nsteps, NX, NY, NBANDS, base, Rh;
-    sample_stride = 1, weighting = :emission, ref_data = loaded[1], freq = FREQ)
+cache, sample = BL.band_walk(crossings, geos, nsteps, NX, NY, NBANDS, base, Rh; sample_stride = 1)
 
 stats = BL.band_stats(sample, 0.5; verbose = false)
 t_first, t_last = BL.frame_window(stats, times)
@@ -136,14 +135,14 @@ println("    the snapshot container and time map stay generic in the element typ
 # The time map itself must be differentiable in the frame time, and the clamp
 # must behave: a step inside its band's interval moves with the frame, one
 # clipped to the edge does not.
-let tm = BL.build_timemap(stats, T_FRAME, times[first(IDX)], times[last(IDX)])
+let tm = BL.build_timemap(stats, T_FRAME, times[first(IDX)], times[last(IDX)]; interpolate_bands = false)
     lo, hi = BL.band_interval(stats, 1)
     inside = 0.5 * (lo + hi)
     outside = lo - 10.0
     din = ForwardDiff.derivative(tf -> TI.map_time(
-        BL.build_timemap(stats, tf, times[first(IDX)], times[last(IDX)]), inside, 0), T_FRAME)
+        BL.build_timemap(stats, tf, times[first(IDX)], times[last(IDX)]; interpolate_bands = false), inside, 0), T_FRAME)
     dout = ForwardDiff.derivative(tf -> TI.map_time(
-        BL.build_timemap(stats, tf, times[first(IDX)], times[last(IDX)]), outside, 0), T_FRAME)
+        BL.build_timemap(stats, tf, times[first(IDX)], times[last(IDX)]; interpolate_bands = false), outside, 0), T_FRAME)
     @printf("[3] d(t_abs)/d(t_frame): step inside the interval = %.1f, clipped step = %.1f\n",
             din, dout)
     @assert din == 1.0 "an unclipped step should track the frame time exactly"

@@ -195,7 +195,7 @@ trajectory, threaded over pixels. Called from
 function render_round_cpu!(
     movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
     params_slowlight::OfSlowLight, freq, model, simulation_data;
-    movie_pol = nothing
+    movie_pol = nothing, movie_tau = nothing
 )
     Rh = 1 + sqrt(1.0 - model.a * model.a)
     dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
@@ -214,6 +214,8 @@ function render_round_cpu!(
                 # coefficients taken at the same (shifted) Xf as Stokes I's jf, kf.
                 N, tauF = movie_pol === nothing ? (Polarization.zero_tensor(Float64), 0.0) :
                           load_pol_state(movie_pol, i, j, k)
+                # optical depth along the ray, the dtau = kavg * dl of approximate_solve (ipole's tau)
+                tau = movie_tau === nothing ? 0.0 : movie_tau[i, j, k]
 
                 while (nstep > 2)
                     Xi = traj[nstep].X
@@ -242,6 +244,7 @@ function render_round_cpu!(
                     jf, kf = Radiation.get_jk(Xf, Kconf, freq, model.a, model, simulation_data)
 
                     Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
+                    tau += 0.5 * (ki + kf) * traj[nstep-1].dl
 
                     if movie_pol !== nothing
                         ti = traj[nstep]
@@ -253,6 +256,7 @@ function render_round_cpu!(
                 end
                 movie_nstep[i, j, k] = nstep
                 movie_intensity[i, j, k] = Intensity
+                movie_tau === nothing || (movie_tau[i, j, k] = tau)
                 movie_pol === nothing || store_pol_state!(movie_pol, i, j, k, N, tauF)
             end
         end
@@ -427,6 +431,8 @@ function process_slowlight_images!(
 
     movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
     movie_intensity = zeros(Float64, pixels_x, pixels_y, nimgs_concurrently)
+    # optical depth of each open frame's rays (CPU engine; the GPU engine does not track it and writes NaN)
+    movie_tau = engine === :CPU ? zeros(Float64, pixels_x, pixels_y, nimgs_concurrently) : nothing
     movie_pol = polarized ? zeros(Float64, POL_STATE_LEN, pixels_x, pixels_y, nimgs_concurrently) : nothing
     polarized && @printf("Polarized slow light: %d frames open at once, %.2f GB of polarization state\n",
         nimgs_concurrently, sizeof(movie_pol) / 1e9)
@@ -459,6 +465,7 @@ function process_slowlight_images!(
                     for j in 1:pixels_y
                         movie_nstep[i, j, nimg] = nsteps[i, j]
                         movie_intensity[i, j, nimg] = 0.0
+                        movie_tau === nothing || (movie_tau[i, j, nimg] = 0.0)
                         if movie_pol !== nothing
                             @views movie_pol[:, i, j, nimg] .= 0.0
                         end
@@ -476,7 +483,7 @@ function process_slowlight_images!(
 
         elapsed = @elapsed if engine === :CPU
             render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-                params_slowlight, freq, model, simulation_data; movie_pol = movie_pol)
+                params_slowlight, freq, model, simulation_data; movie_pol = movie_pol, movie_tau = movie_tau)
         else
             render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks,
                 nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
@@ -518,6 +525,7 @@ function process_slowlight_images!(
                     "t_camera" => target_times[k],
                     "t_fluid" => target_times[k] + t_ref
                 )
+                movie_tau === nothing || (out_data["tau"] = movie_tau[:, :, k])
                 if movie_pol !== nothing
                     pol = zeros(Float64, Polarization.NIMG, pixels_x, pixels_y)
                     Rh_pol = 1 + sqrt(1.0 - model.a * model.a)

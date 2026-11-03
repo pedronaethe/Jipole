@@ -72,7 +72,8 @@ fields (`pol`, `Ftot`, `nuLnu`) are written as zero, matching what
   argument to `load_data`), so it must be passed here explicitly
 
 # Optional keys
-- `"tau"`: optical depth image, `(nx, ny)` -- defaults to zeros
+- `"tau"`: optical depth image, `(nx, ny)` -- NaN where the light mode did not compute it (zeros would read as
+  an optically thin source; until Oct 23 no mode passed it and every file held zeros)
 - `"xoff"`, `"yoff"`, `"rotcam"` -- default to 0.0
 """
 function generate_output_ipole(output_file::String, data::Dict{String,Any})
@@ -91,7 +92,7 @@ function generate_output_ipole(output_file::String, data::Dict{String,Any})
     Rhigh = data["Rhigh"]
     t = data["img_time"]
 
-    tau = get(data, "tau", zeros(size(image)))
+    tau = get(data, "tau", fill(NaN, size(image)))
     xoff = get(data, "xoff", 0.0)
     yoff = get(data, "yoff", 0.0)
     rotcam = get(data, "rotcam", 0.0)

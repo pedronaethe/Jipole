@@ -95,7 +95,7 @@ println("    exact -- the shared loop reproduces upstream fast light bitwise")
 # --- brisk light at p = 0 --------------------------------------------------
 stats, cache, sample = BL.analyze_bands(
     crossings, geos, nsteps, NX, NY, NBANDS, model, 0.0;
-    sample_stride = 1, ref_data = snap_ref, freq = FREQ, verbose = true)
+    sample_stride = 1, verbose = true)
 
 series = BL.DumpSeries(dumps; times = times)
 idx, per_band = BL.frame_dump_indices(stats, T_FRAME, times)
@@ -104,7 +104,7 @@ println("dumps per band (n=0,1,2): ", [length(r) for r in per_band])
 @assert length(per_band[1]) == 1 "band 0 should need exactly 1 dump at p=0 on a dump time, got $(length(per_band[1]))"
 
 snaps = BL.frame_snapshots!(series, idx, RHIGH, model)
-tm = BL.build_timemap(stats, T_FRAME, times[first(idx)], times[last(idx)])
+tm = BL.build_timemap(stats, T_FRAME, times[first(idx)], times[last(idx)]; interpolate_bands = false)   # the paper's clip: p = 0 is fast light
 I_brisk = zeros(Float64, NX, NY)
 BL.render_brisk_frame!(I_brisk, geos, nsteps, model, NX, NY, FREQ,
                        cache, tm, snaps; progress = false)
@@ -141,7 +141,7 @@ idx2, per_band2 = BL.frame_dump_indices(stats, T_OFF, times)
 @assert length(per_band2[1]) == 2 "band 0 off-grid should need 2 dumps, got $(length(per_band2[1]))"
 
 snaps2 = BL.frame_snapshots!(series, idx2, RHIGH, model)
-tm2 = BL.build_timemap(stats, T_OFF, times[first(idx2)], times[last(idx2)])
+tm2 = BL.build_timemap(stats, T_OFF, times[first(idx2)], times[last(idx2)]; interpolate_bands = false)
 I_brisk2 = zeros(Float64, NX, NY)
 BL.render_brisk_frame!(I_brisk2, geos, nsteps, model, NX, NY, FREQ,
                        cache, tm2, snaps2; progress = false)

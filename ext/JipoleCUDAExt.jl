@@ -8,6 +8,7 @@ using CUDA
 using StaticArrays
 using Jipole
 using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Slowlight, Utils_GPU, Tetrads
+using Jipole.Coordinates: bl_coord
 using Jipole.GeoTypes: OfTrajGeneric, GPUTrajStep
 using Jipole.Slowlight: OfSlowLight, pack_trajectory_tile!
 
@@ -73,7 +74,7 @@ function Imaging.raytrace_image_gpu!(
     d_traj, d_Image, d_truncated,
     i_offset, j_offset, block_size_x, block_size_y, # New offset parameters
     Xcam, Econ, bhspin, nx, ny, nmaxstep,
-    freq, fovx, fovy, Rout, Rstop, data, params
+    freq, fovx, fovy, Rout, Rstop, data, params, d_lens = nothing
 )
     local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
@@ -85,7 +86,7 @@ function Imaging.raytrace_image_gpu!(
 
         calculate_image!(
             d_traj, d_Image, d_truncated, Xcam, Econ, bhspin, nx, ny, nmaxstep,
-            i, j, local_i, local_j, freq, fovx, fovy, Rout, Rstop, params, data
+            i, j, local_i, local_j, freq, fovx, fovy, Rout, Rstop, params, data, d_lens
         )
     end
     return nothing
@@ -130,7 +131,7 @@ function calculate_image!(
     i_global::Int64, j_global::Int64,
     i_local::Int64, j_local::Int64, # Accept local matrix indices directly
     freq::Float64, fovx::Float64, fovy::Float64, Rout::Float64, Rstop::Float64, params,
-    data::T_data = nothing
+    data::T_data = nothing, d_lens = nothing
 ) where {T_data}
 
     if (i_global >= nx || j_global >= ny)
@@ -166,9 +167,19 @@ function calculate_image!(
 
     @inbounds d_truncated[i_local, j_local] = (step >= nmaxstep) && (Geodesics.stop_backward_integration(X, K, Rh, Rstop) == 0)
 
-    # #Radiative Transfer Integration:
-
     Intensity = 0.0
+    # lensing bands: count the ray's midplane crossings
+    remaining = 0
+    if d_lens !== nothing
+        @inbounds for nstep in step:-1:2
+            (bl_coord(traj[i_local, j_local, nstep].X, params)[2] > π / 2) !=
+                (bl_coord(traj[i_local, j_local, nstep - 1].X, params)[2] > π / 2) && (remaining += 1)
+        end
+        @inbounds for b in 1:size(d_lens, 3)
+            d_lens[i_global + 1, j_global + 1, b] = 0.0
+        end
+    end
+    cap = remaining - 1   # Lensing bands is counted such that first crossing is band 0.
 
     @inbounds Xi_S = traj[i_local, j_local, step].X
     @inbounds Kconi_S = traj[i_local, j_local, step].Kcon
@@ -182,12 +193,17 @@ function calculate_image!(
         Kconf_S = traj[i_local, j_local, nstep - 1].Kcon
         dl_step = traj[i_local, j_local, nstep].dl
 
+        if d_lens !== nothing && (bl_coord(Xi_S, params)[2] > π / 2) != (bl_coord(Xf_S, params)[2] > π / 2)
+            remaining -= 1
+        end
         if !Radiation.radiating_region(Xf_S, params, Rh)
             continue
         end
         jf, kf = Radiation.get_jk(Xf_S, Kconf_S, freq, bhspin, params, data)
 
         Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, dl_step)
+        d_lens === nothing ||
+            Radiation.lens_step!(d_lens, ji, ki, jf, kf, dl_step, min(remaining, cap), i_global + 1, j_global + 1)
 
         CUDA.@cuassert !(isnan(Intensity) || isinf(Intensity)) "NaN/Inf Intensity encountered!"
 
@@ -196,6 +212,11 @@ function calculate_image!(
     end
 
     @inbounds d_Image[i_global + 1, j_global + 1] = Intensity * (freq^3)
+    if d_lens !== nothing
+        @inbounds for b in 1:size(d_lens, 3)
+            d_lens[i_global + 1, j_global + 1, b] *= freq^3
+        end
+    end
 
     return nothing
 end
@@ -237,7 +258,8 @@ plain host arrays again afterwards, same as the CPU path. Called from
 """
 function Slowlight.render_round_gpu!(
     movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks, nimgs_concurrently,
-    target_times, pixels_x, pixels_y, params_slowlight::OfSlowLight, freq, model, gpu_data
+    target_times, pixels_x, pixels_y, params_slowlight::OfSlowLight, freq, model, gpu_data;
+    movie_lens = nothing, movie_cross = nothing, crossings = nothing
 )
     threads_per_block = (16, 16)
     valid_mask_host = zeros(Int, nimgs_concurrently)
@@ -262,17 +284,22 @@ function Slowlight.render_round_gpu!(
 
         d_nstep = CuArray(@view movie_nstep[:, j0:j1, :])
         d_intensity = CuArray(@view movie_intensity[:, j0:j1, :])
+        d_lens = movie_lens === nothing ? nothing : CuArray(@view movie_lens[:, j0:j1, :, :])
+        d_cross = movie_cross === nothing ? nothing : CuArray(@view movie_cross[:, j0:j1, :])
+        d_crossings = crossings === nothing ? nothing : CuArray(@view crossings[:, j0:j1])
 
         blocks_per_grid = (cld(pixels_x, threads_per_block[1]), cld(tile_ny, threads_per_block[2]))
         @cuda threads = threads_per_block blocks = blocks_per_grid slowlight_kernel!(
             d_traj, d_nstep, d_intensity, d_valid_mask, d_target_times,
             params_slowlight.tA, params_slowlight.tB, params_slowlight.tf,
-            freq, model.a, model, data_tuple
+            freq, model.a, model, data_tuple, d_lens, d_cross, d_crossings
         )
         CUDA.synchronize()
 
         copyto!(@view(movie_nstep[:, j0:j1, :]), Array(d_nstep))
         copyto!(@view(movie_intensity[:, j0:j1, :]), Array(d_intensity))
+        d_lens === nothing || copyto!(@view(movie_lens[:, j0:j1, :, :]), Array(d_lens))
+        d_cross === nothing || copyto!(@view(movie_cross[:, j0:j1, :]), Array(d_cross))
     end
     return nothing
 end
@@ -308,7 +335,7 @@ via `@cuda` from [`render_round_gpu!`](@ref).
 function slowlight_kernel!(
     traj, nstep_state, intensity, valid_mask, target_times,
     tA::Float64, tB::Float64, tf::Float64,
-    freq::Float64, bhspin::Float64, model, data
+    freq::Float64, bhspin::Float64, model, data, lens = nothing, cross = nothing, crossings = nothing
 )
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
@@ -325,6 +352,7 @@ function slowlight_kernel!(
             nstep = nstep_state[i, j, k]
             Intensity = intensity[i, j, k]
             dt = target_times[k] + 1e-5
+            remaining = cross === nothing ? 0 : Int(cross[i, j, k])
 
             while nstep > 2
                 Xi = traj[i, j, nstep].X
@@ -353,12 +381,18 @@ function slowlight_kernel!(
                 jf, kf = Radiation.get_jk(Xf, Kconf, freq, bhspin, model, data)
 
                 Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[i, j, nstep-1].dl)
+                if lens !== nothing
+                    (bl_coord(traj[i, j, nstep].X, model)[2] > π / 2) != (bl_coord(traj[i, j, nstep-1].X, model)[2] > π / 2) &&
+                        (remaining -= 1)
+                    Radiation.lens_step!(lens, ji, ki, jf, kf, traj[i, j, nstep-1].dl, min(remaining, crossings[i, j] - 1), i, j, k)
+                end
 
                 nstep -= 1
             end
 
             nstep_state[i, j, k] = nstep
             intensity[i, j, k] = Intensity
+            cross === nothing || (cross[i, j, k] = remaining)
         end
     end
     return nothing
@@ -385,11 +419,12 @@ when `engine = :GPU`, before the rounds loop starts.
 # Returns
 - `tile_height`: number of image rows (the `j` dimension) per tile.
 """
-function Slowlight.gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+function Slowlight.gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data; lens_bands = 0)
     traj_elem_bytes = sizeof(OfTrajGeneric{Float64})
 
     grid_bytes = 3 * Base.summarysize(simulation_data[1])
-    state_bytes = pixels_x * pixels_y * nimgs_concurrently * (sizeof(Float64) + sizeof(Int))
+    state_bytes = pixels_x * pixels_y * nimgs_concurrently *
+                  (sizeof(Float64) + sizeof(Int) + (lens_bands > 0 ? lens_bands * sizeof(Float64) + sizeof(Int32) : 0))
 
     gpu_usable_bytes = max(CUDA.available_memory() - grid_bytes - state_bytes, 0)
     host_usable_bytes = Sys.free_memory()
@@ -403,7 +438,7 @@ function Slowlight.gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrent
 end
 
 function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-    nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
+    nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64, lens=nothing)
     
     threads_per_block = (16, 16)
     blocks_per_grid = (cld(block_size, threads_per_block[1]), cld(block_size, threads_per_block[2]))
@@ -417,6 +452,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
     d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
     d_truncated = CUDA.zeros(Bool, block_size, block_size)
     d_Image = CUDA.zeros(Float64, nx, ny)
+    d_lens = lens === nothing ? nothing : CUDA.zeros(Float64, nx, ny, size(lens, 3))
 
     CUDA.@time begin
         for i_offset in 0:block_size:(nx - 1)
@@ -428,7 +464,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
                         d_traj, d_Image, d_truncated,
                         i_offset, j_offset, block_size, block_size,
                         Xcam, Econ, model.a, nx, ny, nmaxstep,
-                        freq, fovx, fovy, model.Rout, model.rmax_geo, gpu_sim_data, model
+                        freq, fovx, fovy, model.Rout, model.rmax_geo, gpu_sim_data, model, d_lens
                     )
                     CUDA.synchronize()
 
@@ -450,6 +486,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
     end
 
     copyto!(Image, d_Image)
+    lens === nothing || copyto!(lens, d_lens)
     CUDA.unsafe_free!(d_traj)
     return nmaxstep
 end

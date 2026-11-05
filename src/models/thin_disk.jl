@@ -397,7 +397,9 @@ integral: `Image[I, J]` is set to the surface intensity of the last
 disk-midplane crossing found along the trajectory (`data` is unused by
 this model).
 """
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing) where {T}
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing;
+                                      lens=nothing, crossings::Int=0) where {T}
+    lens === nothing || error("[output].save_lens is not implemented for the thin-disk model")
     Xi = MVector{4,T}(undef)
     Kconi = MVector{4,T}(undef)
     Xf = MVector{4,T}(undef)

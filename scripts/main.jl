@@ -154,6 +154,10 @@ end
 # Output parameters
 const output_filename = Jipole.Utils.get_config(config, "output", "filename", "jipole_output.h5")
 const output_format = Jipole.Utils.get_config(config, "output", "format", "ipole")
+# We enabled the option of saving the image of different lensing bands now. This is all optional.
+const save_lens = Jipole.Utils.get_config(config, "output", "save_lens", false)
+const lens_bands = save_lens ? Jipole.Utils.get_config(config, "output", "max_lens", 2) + 1 : 0
+save_lens && do_gradients && error("[output].save_lens is not implemented with [gradient].on")
 
 const SourceD = source_distance_pc * Jipole.Constants.PC
 const freq_unitless = freq * Jipole.Constants.HPL / (Jipole.Constants.ME * Jipole.Constants.CL^2)
@@ -272,7 +276,8 @@ if brisklight
             meta = meta,
             polarized = do_polarization,
             skip_existing = brisk_skip_existing,
-            interpolate_bands = brisk_interpolate_bands)
+            interpolate_bands = brisk_interpolate_bands,
+            lens_bands = lens_bands, crossings = midplane_crossings)
 
         if result.frames > 0
             @printf("\nWrote %d frame(s) to %s\n", result.frames, outdir)
@@ -366,7 +371,8 @@ elseif !slow_light && fast_cadence !== nothing
             output_dir = outdir, output_prefix = prefix,
             output_format = output_format, meta = meta,
             polarized = do_polarization,
-            t_ref = fast_t_ref)
+            t_ref = fast_t_ref,
+            lens_bands = lens_bands, crossings = midplane_crossings)
 
         result.frames > 0 && @printf("\nWrote %d frame(s) to %s; render %.2f s, peak RSS %.2f GB\n",
             result.frames, outdir, sum(r.render_seconds for r in result.metrics),
@@ -377,6 +383,7 @@ elseif !slow_light
 
     
     Image = zeros(Float64, pixels_x, pixels_y)
+    Lens = lens_bands > 0 ? zeros(Float64, pixels_x, pixels_y, lens_bands) : nothing
     if mode == "gpu"
         # nmaxstep for the first GPU attempt. render_image_gpu! doubles it for any tile with a
         # truncated geodesic, and the value it ends on carries over to the next dump.
@@ -429,10 +436,10 @@ elseif !slow_light
                     wrt=gradient_wrt);
                 copyto!(Image, grad_image)
             elseif do_polarization
-                unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff)
+                unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff; lens = Lens)
                 copyto!(Image, unpol_image)
             else
-                copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
+                copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff; lens = Lens))
             end
         else
             println("Copying simulation data grid to the GPU...")
@@ -443,10 +450,10 @@ elseif !slow_light
                 if do_polarization
                     pol = zeros(Float64, Jipole.Polarization.NIMG, pixels_x, pixels_y)
                     global gpu_maxnstep = Jipole.ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                        nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                        nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128, lens=Lens)
                 else
                     global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                        nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                        nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128, lens=Lens)
                 end
             end
             @printf("GPU raytracing took %.3f s\n", gpu_time)
@@ -514,6 +521,7 @@ elseif !slow_light
         #Add the polarized image, and its gradients, if they were calculated.
         do_polarization && (output_data["pol"] = pol)
         do_polarization && do_gradients && (output_data["grads_pol"] = grads_pol)
+        Lens === nothing || (output_data["lens"] = Lens)
 
 
         # Determine the output filename based on whether we are processing a batch of dumps or a single dump.
@@ -579,6 +587,7 @@ else
 
     all_geodesics = Matrix{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(undef, pixels_x, pixels_y)
     nsteps = zeros(Int, pixels_x, pixels_y)
+    midplane_crossings = zeros(Int, pixels_x, pixels_y)
 
     row_t0 = zeros(Float64, pixels_x)
     row_tgeoi = fill(-1e100, pixels_x)
@@ -591,9 +600,10 @@ else
         #my_traj = row_trajs[i + 1]
         my_traj = take!(traj_pool)
         for j in 0:(pixels_y - 1)
-            nstep, _ = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, Econ, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
+            nstep, ncross = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, Econ, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
 
             nsteps[i + 1, j + 1] = nstep
+            midplane_crossings[i + 1, j + 1] = ncross
             all_geodesics[i + 1, j + 1] = my_traj[1:nstep]
 
             final_step_time = my_traj[nstep].X[1]
@@ -654,9 +664,14 @@ else
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
         engine=slowlight_engine,
         polarized=do_polarization,
-        # Optional [slowlight].t_ref (see the fast-light branch): the n = 0 fluid time of each frame is recorded.
+        lens_bands=lens_bands, crossings=midplane_crossings,
+        # Optional option to restart slowlight runs.
+        start_time=get(get(config, "slowlight", Dict{String,Any}()), "start_time", nothing),
+        grid_t0=get(get(config, "slowlight", Dict{String,Any}()), "grid_t0", nothing),
+        grid_cadence=get(get(config, "slowlight", Dict{String,Any}()), "grid_cadence", image_cadence),
+        # t_ref is an optional parameter that specifies the n = 0 fluid time of each frame is recorded.
         t_ref=Float64(get(get(config, "slowlight", Dict{String,Any}()), "t_ref", NaN)),
-        # Optional [slowlight].output_dir; without it frames go to ../slow_sims/<timestamp> as before.
+        # Specify the output directory.
         output_dir=let d = get(get(config, "slowlight", Dict{String,Any}()), "output_dir", nothing)
             d === nothing ? nothing : expanduser(d)
         end

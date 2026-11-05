@@ -1174,9 +1174,9 @@ function integrate_brisk!(traj, nsteps::Int, Image::AbstractMatrix{T},
                           cache, off::Int,
                           tm::TimeMap, snaps::SnapshotSet,
                           bad_pixels::Threads.Atomic{Int};
-                          tau_img = nothing) where {T}
-    # tau_img: optical depth along the ray, the dtau = kavg * dl of approximate_solve (ipole's tau)
+                          tau_img = nothing, lens = nothing, crossings::Int = 0) where {T}
 
+    lens === nothing || (@inbounds lens[I, J, :] .= zero(T))
     if nsteps < 2
         @inbounds Image[I, J] = zero(T)
         tau_img === nothing || (@inbounds tau_img[I, J] = zero(T))
@@ -1192,9 +1192,14 @@ function integrate_brisk!(traj, nsteps::Int, Image::AbstractMatrix{T},
     Intensity = zero(T)
     tau = zero(T)
     pending = false
+    remaining = crossings
 
     for nstep in nsteps:-1:2
         @inbounds Xf = traj[nstep - 1].X
+
+        if lens !== nothing && (bl_coord(traj[nstep].X, model)[2] > π / 2) != (bl_coord(Xf, model)[2] > π / 2)
+            remaining -= 1
+        end
 
         bn = step_band(cache, off, nstep)
         if bn != b
@@ -1220,11 +1225,13 @@ function integrate_brisk!(traj, nsteps::Int, Image::AbstractMatrix{T},
         @inbounds Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf,
                                                           traj[nstep - 1].dl)
         @inbounds tau += (ki + kf) / 2 * traj[nstep - 1].dl
+        lens === nothing || lens_step!(lens, ji, ki, jf, kf, traj[nstep - 1].dl, min(remaining, crossings - 1), I, J)
 
         if !isfinite(Intensity)
             Threads.atomic_add!(bad_pixels, 1)
             @inbounds Image[I, J] = T(NaN)
             tau_img === nothing || (@inbounds tau_img[I, J] = T(NaN))
+            lens === nothing || (@inbounds lens[I, J, :] .= T(NaN))
             return
         end
 
@@ -1312,8 +1319,11 @@ function render_brisk_frame!(Image::AbstractMatrix{T},
                              progress::Bool = true,
                              desc::AbstractString = "brisk ",
                              pol::Union{Nothing,AbstractArray} = nothing,
-                             tau::Union{Nothing,AbstractMatrix} = nothing) where {T}
+                             tau::Union{Nothing,AbstractMatrix} = nothing,
+                             lens::Union{Nothing,AbstractArray} = nothing,
+                             crossings::Union{Nothing,AbstractMatrix{Int}} = nothing) where {T}
 
+    lens === nothing || crossings !== nothing || error("render_brisk_frame!: lens needs the rays' midplane crossings")
     Rh = 1 + sqrt(1.0 - model.a * model.a)
     bad_pixels = Threads.Atomic{Int}(0)
     bad_pol = Threads.Atomic{Int}(0)
@@ -1328,7 +1338,8 @@ function render_brisk_frame!(Image::AbstractMatrix{T},
             off = offsets === nothing ? 0 : Int(@inbounds offsets[(j - 1) * nx + i])
             integrate_brisk!(all_geodesics[i, j], nsteps[i, j], Image, i, j,
                              freq, model.a, model, Rh, cache, off, tm, snaps,
-                             bad_pixels; tau_img = tau)
+                             bad_pixels; tau_img = tau, lens = lens,
+                             crossings = crossings === nothing ? 0 : crossings[i, j])
             pol === nothing ||
                 integrate_brisk_pol!(all_geodesics[i, j], nsteps[i, j], pol, i, j,
                                      freq, model.a, model, Rh, cache, off, tm, snaps,
@@ -1361,12 +1372,15 @@ function Imaging.raytrace_image_at_time!(Image::AbstractMatrix, model, snaps::Sn
                                          progress::Bool = true,
                                          desc::AbstractString = "fast light ",
                                          pol::Union{Nothing,AbstractArray} = nothing,
-                                         tau::Union{Nothing,AbstractMatrix} = nothing)
+                                         tau::Union{Nothing,AbstractMatrix} = nothing,
+                                         lens::Union{Nothing,AbstractArray} = nothing,
+                                         crossings::Union{Nothing,AbstractMatrix{Int}} = nothing)
     nx, ny = size(Image)
     ts = snapshot_times(snaps)
     tm = fastlight_timemap(float(t_frame), float(ts[1]), float(ts[end]))
     return render_brisk_frame!(Image, all_geodesics, nsteps, model, nx, ny, freq,
-                               nothing, tm, snaps; progress = progress, desc = desc, pol = pol, tau = tau)
+                               nothing, tm, snaps; progress = progress, desc = desc, pol = pol, tau = tau,
+                               lens = lens, crossings = crossings)
 end
 
 """
@@ -1398,11 +1412,9 @@ function process_fastlight_images!(series::DumpSeries,
                                    progress::Bool = true,
                                    verbose::Bool = true,
                                    polarized::Bool = false,
-                                   t_ref::Real = NaN)
-
-    # `t_ref`: band-0 modal emission time of the same geometry (BandStats.t_ref, negative), when known.
-    # Fast light renders the whole flow at t_frame, which is the n = 0 clock; with t_ref the camera time
-    # of the matching slow-light frame, t_frame - t_ref, is recorded too. NaN: not known, recorded as NaN.
+                                   t_ref::Real = NaN,
+                                   lens_bands::Int = 0,
+                                   crossings::Union{Nothing,AbstractMatrix{Int}} = nothing)
     dt = series.times
     sched = if t_frames !== nothing
         Float64.(collect(t_frames))
@@ -1434,6 +1446,7 @@ function process_fastlight_images!(series::DumpSeries,
     Image = zeros(Float64, nx, ny)
     Tau = zeros(Float64, nx, ny)
     pol = polarized ? zeros(Float64, Polarization.NIMG, nx, ny) : nothing
+    Lens = lens_bands > 0 ? zeros(Float64, nx, ny, lens_bands) : nothing
     rows = NamedTuple[]
     # Band-0-only statistics, so the manifest columns line up with a brisk run
     # and the two can be diffed directly.
@@ -1452,14 +1465,16 @@ function process_fastlight_images!(series::DumpSeries,
         pol === nothing || fill!(pol, 0.0)
         render_seconds = @elapsed Imaging.raytrace_image_at_time!(
             Image, model, snaps, all_geodesics, nsteps, freq, t_frame;
-            progress = progress, desc = @sprintf("fast t=%.1fM ", t_frame), pol = pol, tau = Tau)
+            progress = progress, desc = @sprintf("fast t=%.1fM ", t_frame), pol = pol, tau = Tau,
+            lens = Lens, crossings = crossings)
         Image .*= freq^3
+        Lens === nothing || (Lens .*= freq^3)
 
         resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
         file = ""
         if outdir !== nothing
             file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, dummy, meta; pol = pol, t_camera = t_frame - t_ref, tau = Tau)
+                               Image, snaps, dummy, meta; pol = pol, t_camera = t_frame - t_ref, tau = Tau, lens = Lens)
             open(manifest, "a") do io
                 @printf(io, "%d,%.10f,%.10f,%s,%d,%d,%d,%d,%.4f,%.4f,%.6f,%d\n",
                         k, t_frame, t_frame - t_ref, basename(file), length(idx), length(idx),
@@ -1614,7 +1629,10 @@ function process_brisklight_images!(stats::BandStats{T},
                                     verbose::Bool = true,
                                     polarized::Bool = false,
                                     skip_existing::Bool = false,
-                                    interpolate_bands::Bool = true) where {T}
+                                    interpolate_bands::Bool = true,
+                                    lens_bands::Int = 0,
+                                    crossings::Union{Nothing,AbstractMatrix{Int}} = nothing) where {T}
+    # lens_bands > 0: also write the image split by lensing band ([output].save_lens)
     # skip_existing: frames whose output file is already in output_dir are not rendered again, so a run cut
     # short (a 1 h interactive session, a preempted job) picks up where it stopped. Frame k keeps its index, as
     # the schedule depends only on t_start, cadence and n_frames; files are renamed into place once written,
@@ -1651,6 +1669,7 @@ function process_brisklight_images!(stats::BandStats{T},
     Image = zeros(T, nx, ny)
     Tau = zeros(T, nx, ny)
     pol = polarized ? zeros(T, Polarization.NIMG, nx, ny) : nothing
+    Lens = lens_bands > 0 ? zeros(T, nx, ny, lens_bands) : nothing
     rows = NamedTuple[]
 
     n_skipped = 0
@@ -1690,8 +1709,10 @@ function process_brisklight_images!(stats::BandStats{T},
         render_seconds = @elapsed render_brisk_frame!(
             Image, all_geodesics, nsteps, model, nx, ny, freq, cache, tm, snaps;
             progress = progress,
-            desc = @sprintf("brisk p=%.2f t=%.1fM ", stats.p, t_frame), pol = pol, tau = Tau)
+            desc = @sprintf("brisk p=%.2f t=%.1fM ", stats.p, t_frame), pol = pol, tau = Tau,
+            lens = Lens, crossings = crossings)
         Image .*= freq^3
+        Lens === nothing || (Lens .*= freq^3)
 
         resident = sum(snapshot_bytes(v) for v in values(series.cache); init = 0)
         dumps_per_band = [length(r) for r in per_band]
@@ -1699,7 +1720,7 @@ function process_brisklight_images!(stats::BandStats{T},
         file = ""
         if outdir !== nothing
             file = write_frame(outdir, output_prefix, output_format, k, t_frame,
-                               Image, snaps, stats, meta; pol = pol, t_camera = t_frame - stats.t_ref, tau = Tau)
+                               Image, snaps, stats, meta; pol = pol, t_camera = t_frame - stats.t_ref, tau = Tau, lens = Lens)
             open(manifest, "a") do io
                 @printf(io, "%d,%.10f,%.10f,%s,%d,%s,%d,%d,%.4f,%.4f,%.6f,%d\n",
                         k, t_frame, t_frame - stats.t_ref, basename(file),
@@ -1753,7 +1774,8 @@ function write_frame(dir::AbstractString, prefix::AbstractString,
                      meta::Union{Nothing,Dict{String,Any}};
                      pol::Union{Nothing,AbstractArray} = nothing,
                      t_camera::Real = NaN,
-                     tau::Union{Nothing,AbstractMatrix} = nothing)
+                     tau::Union{Nothing,AbstractMatrix} = nothing,
+                     lens::Union{Nothing,AbstractArray} = nothing)
     if meta === nothing
         path = joinpath(dir, @sprintf("%s.%05d.txt", prefix, index))
         open(path, "w") do io
@@ -1771,6 +1793,7 @@ function write_frame(dir::AbstractString, prefix::AbstractString,
     data["data"] = snaps.snaps[1]
     pol === nothing || (data["pol"] = pol)
     tau === nothing || (data["tau"] = tau)
+    lens === nothing || (data["lens"] = lens)
     data["frame_index"] = index
     data["t_fluid"] = t_frame
     data["t_camera"] = t_camera

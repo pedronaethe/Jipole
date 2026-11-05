@@ -797,8 +797,8 @@ Leung et al. (2011) emissivity averaged over each step, the polarized one the
 Dexter (2016) fits evaluated at the end of each step. Their Stokes I therefore
 differ slightly, by design.
 """
-@inline function integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink::PolSink)
-    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data)
+@inline function integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink::PolSink; lens=nothing, crossings::Int=0)
+    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data; lens=lens, crossings=crossings)
     SI, SQ, SU, SV, tauF = integrate_emission_pol(traj, nsteps, freq, bhspin, model, sink.data)
     save_pixel!(sink.pol, I, J, SI, SQ, SU, SV, tauF, freq, sink.qu_conv)
     return nothing
@@ -811,8 +811,9 @@ Polarized pixel integration: selected when the pixel loop is given a
 [`PolSink`](@ref) in place of the model data. See
 [`integrate_emission_sink!`](@ref).
 """
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, sink::PolSink) where {T}
-    return integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink)
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, sink::PolSink;
+                                      lens=nothing, crossings::Int=0) where {T}
+    return integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink; lens=lens, crossings=crossings)
 end
 
 end

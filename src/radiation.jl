@@ -15,9 +15,10 @@ using ..Constants
 using ..GeoTypes
 using ..AbstractModels
 using ..DebugFunctions
+using ..Coordinates: bl_coord
 
 export get_fluid_nu, bnu_inv, get_jk, integrate_emission!, get_bk_angle,
-    approximate_solve, radiating_region
+    approximate_solve, radiating_region, lens_step!
 
 """
     get_fluid_nu(Kcon, Ucov)
@@ -126,7 +127,10 @@ crossing emission model.
 - `model`: Model parameters.
 - `data`: Model-specific auxiliary data.
 """
-function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing) where {T}
+function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing;
+                             lens=nothing, crossings::Int=0) where {T}
+    # lens: image split by lensing band (lens_step!); crossings: the ray's midplane crossings, N. As in brisk, the
+    # band is the crossings left to the camera, capped at N - 1
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
     Xi = traj[nsteps].X
@@ -134,8 +138,13 @@ function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::In
     ji, ki = get_jk(Xi, Kconi, freq, bhspin, model, data)
 
     Intensity = zero(T)
+    remaining = crossings
+    lens === nothing || (@inbounds lens[I, J, :] .= zero(T))
     for nstep = nsteps:-1:2
         Xf = traj[nstep-1].X
+        if lens !== nothing && (bl_coord(traj[nstep].X, model)[2] > π / 2) != (bl_coord(Xf, model)[2] > π / 2)
+            remaining -= 1
+        end
         if !radiating_region(Xf, model, Rh)
             continue
         end
@@ -143,6 +152,7 @@ function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::In
 
         jf, kf = get_jk(Xf, Kconf, freq, bhspin, model, data)
         Intensity = approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
+        lens === nothing || lens_step!(lens, ji, ki, jf, kf, traj[nstep-1].dl, min(remaining, crossings - 1), I, J)
 
         if isnan(Intensity) || isinf(Intensity)
             @error "NaN or Inf encountered in intensity calculation at pixel ($I, $J)"
@@ -220,6 +230,31 @@ function approximate_solve(Ii, ji, ki, jf, kf, dl)
     end
 
     return If
+end
+
+"""
+    lens_step!(lens, ji, ki, jf, kf, dl, remaining, I...)
+
+`approximate_solve` for an image split by lensing band: every band is attenuated, and
+the step's own emission goes to band `remaining` (the last band collects higher orders).
+"""
+@inline function lens_step!(lens, ji, ki, jf, kf, dl, remaining, I...)
+    javg = (ji + jf) / 2.0
+    kavg = (ki + kf) / 2.0
+    dtau = dl * kavg
+    if dtau < 1.e-3
+        c = dl * (1.0 - (dtau / 2.0) * (1.0 - dtau / 3.0))
+        A, B = 1.0 - kavg * c, javg * c
+    else
+        A = exp(-dtau)
+        B = (javg / kavg) * (1.0 - A)
+    end
+    nb = size(lens, ndims(lens))
+    @inbounds for b in 1:nb
+        lens[I..., b] *= A
+    end
+    @inbounds lens[I..., clamp(remaining, 0, nb - 1) + 1] += B
+    return nothing
 end
 
 end

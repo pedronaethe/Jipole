@@ -223,7 +223,9 @@ the existing thin-disk method, then the polarized pixel from
 so the generic `PolSink` method would be ambiguous with it; this method also
 resolves that.)
 """
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDisk.ThinDiskParams, sink::Polarization.PolSink) where {T}
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDisk.ThinDiskParams, sink::Polarization.PolSink;
+                                      lens=nothing, crossings::Int=0) where {T}
+    lens === nothing || error("[output].save_lens is not implemented for the thin-disk model")
     Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data)
     nsteps_pol = disk_stop_index(traj, nsteps, model)
     SI, SQ, SU, SV, tauF = Polarization.integrate_emission_pol(traj, nsteps_pol, freq, bhspin, model, sink.data)

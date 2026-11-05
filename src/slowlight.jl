@@ -12,6 +12,7 @@ using ProgressMeter
 using StaticArrays
 using ..Constants
 using ..Radiation
+using ..Coordinates: bl_coord
 using ..Iharm
 using ..Kharma
 using ..Output
@@ -195,7 +196,7 @@ trajectory, threaded over pixels. Called from
 function render_round_cpu!(
     movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
     params_slowlight::OfSlowLight, freq, model, simulation_data;
-    movie_pol = nothing, movie_tau = nothing
+    movie_pol = nothing, movie_tau = nothing, movie_lens = nothing, movie_cross = nothing, crossings = nothing
 )
     Rh = 1 + sqrt(1.0 - model.a * model.a)
     dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
@@ -216,6 +217,7 @@ function render_round_cpu!(
                           load_pol_state(movie_pol, i, j, k)
                 # optical depth along the ray, the dtau = kavg * dl of approximate_solve (ipole's tau)
                 tau = movie_tau === nothing ? 0.0 : movie_tau[i, j, k]
+                remaining = movie_cross === nothing ? 0 : Int(movie_cross[i, j, k])
 
                 while (nstep > 2)
                     Xi = traj[nstep].X
@@ -245,6 +247,11 @@ function render_round_cpu!(
 
                     Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
                     tau += 0.5 * (ki + kf) * traj[nstep-1].dl
+                    if movie_lens !== nothing
+                        (bl_coord(traj[nstep].X, model)[2] > π / 2) != (bl_coord(traj[nstep-1].X, model)[2] > π / 2) &&
+                            (remaining -= 1)
+                        Radiation.lens_step!(movie_lens, ji, ki, jf, kf, traj[nstep-1].dl, min(remaining, crossings[i, j] - 1), i, j, k)
+                    end
 
                     if movie_pol !== nothing
                         ti = traj[nstep]
@@ -257,6 +264,7 @@ function render_round_cpu!(
                 movie_nstep[i, j, k] = nstep
                 movie_intensity[i, j, k] = Intensity
                 movie_tau === nothing || (movie_tau[i, j, k] = tau)
+                movie_cross === nothing || (movie_cross[i, j, k] = remaining)
                 movie_pol === nothing || store_pol_state!(movie_pol, i, j, k, N, tauF)
             end
         end
@@ -404,8 +412,14 @@ function process_slowlight_images!(
     engine::Symbol = :CPU,
     polarized::Bool = false,
     output_dir::Union{Nothing,AbstractString} = nothing,
-    t_ref::Real = NaN
+    t_ref::Real = NaN,
+    lens_bands::Int = 0,
+    crossings::Union{Nothing,AbstractMatrix{Int}} = nothing,
+    start_time::Union{Nothing,Real} = nothing,
+    grid_t0::Union{Nothing,Real} = nothing,
+    grid_cadence::Real = params_slowlight.ImageCadence
 )
+    lens_bands > 0 && crossings === nothing && error("process_slowlight_images!: lens_bands needs the rays' crossings")
     # With an explicit output_dir, frames are named by index, slow.00001.h5, ..., counted from the first
     # frame (camera time tA - tgeof) in steps of the cadence -- the numbering brisk and fast light use, so
     # frame k of every light mode is the same file number. Without it, the original Image.<time>.h5 names.
@@ -427,6 +441,14 @@ function process_slowlight_images!(
 
     last_img_target = params_slowlight.tA - tgeof
     first_img_target = last_img_target
+    # Optional: first frame at camera time start_time (resume, or a grid shifted from tA - tgeof); files numbered
+    # on the grid grid_t0 + (index - 1) * grid_cadence, so runs on shifted grids share one numbering.
+    if start_time !== nothing
+        start_time >= last_img_target - 1e-9 ||
+            error("slow light: start_time $start_time is before the first frame these dumps can serve ($last_img_target)")
+        last_img_target = Float64(start_time)
+    end
+    grid_t0 === nothing || (first_img_target = Float64(grid_t0))
     nimgs_concurrently = round(Int, 2 + abs(t0) / params_slowlight.ImageCadence)
 
     movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
@@ -434,6 +456,9 @@ function process_slowlight_images!(
     # optical depth of each open frame's rays (CPU engine; the GPU engine does not track it and writes NaN)
     movie_tau = engine === :CPU ? zeros(Float64, pixels_x, pixels_y, nimgs_concurrently) : nothing
     movie_pol = polarized ? zeros(Float64, POL_STATE_LEN, pixels_x, pixels_y, nimgs_concurrently) : nothing
+    movie_lens = lens_bands > 0 ? zeros(Float64, pixels_x, pixels_y, nimgs_concurrently, lens_bands) : nothing
+    movie_cross = lens_bands > 0 ? zeros(Int32, pixels_x, pixels_y, nimgs_concurrently) : nothing
+    lens_bands > 0 && @printf("Lensing bands: %d, %.2f GB of state\n", lens_bands, (sizeof(movie_lens) + sizeof(movie_cross)) / 1e9)
     polarized && @printf("Polarized slow light: %d frames open at once, %.2f GB of polarization state\n",
         nimgs_concurrently, sizeof(movie_pol) / 1e9)
     target_times = zeros(Float64, nimgs_concurrently)
@@ -450,22 +475,28 @@ function process_slowlight_images!(
     if engine === :GPU
         println("Preparing GPU workspace...")
         max_nstep = maximum(nsteps)
-        tile_height = gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+        tile_height = gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data; lens_bands = lens_bands)
         gpu_data = init_gpu_data(simulation_data)
         println("GPU tiling: $(cld(pixels_y, tile_height)) tile(s) of height $tile_height (image is $(pixels_x)x$(pixels_y), up to $max_nstep steps/pixel)")
     end
 
+    opened_any = false   # with start_time, the first rounds can have no frame open yet
     while true
         while (last_img_target + t0 < params_slowlight.tB)
             target_times[nimg] = last_img_target
             if (last_img_target + tgeoi < params_slowlight.tf - model.rmax_geo)
                 valid_images[nimg] = 1
                 nopenimgs += 1
+                opened_any = true
                 for i in 1:pixels_x
                     for j in 1:pixels_y
                         movie_nstep[i, j, nimg] = nsteps[i, j]
                         movie_intensity[i, j, nimg] = 0.0
                         movie_tau === nothing || (movie_tau[i, j, nimg] = 0.0)
+                        if movie_lens !== nothing
+                            @views movie_lens[i, j, nimg, :] .= 0.0
+                            movie_cross[i, j, nimg] = crossings[i, j]
+                        end
                         if movie_pol !== nothing
                             @views movie_pol[:, i, j, nimg] .= 0.0
                         end
@@ -483,10 +514,12 @@ function process_slowlight_images!(
 
         elapsed = @elapsed if engine === :CPU
             render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-                params_slowlight, freq, model, simulation_data; movie_pol = movie_pol, movie_tau = movie_tau)
+                params_slowlight, freq, model, simulation_data; movie_pol = movie_pol, movie_tau = movie_tau,
+                movie_lens = movie_lens, movie_cross = movie_cross, crossings = crossings)
         else
             render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks,
-                nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
+                nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data;
+                movie_lens = movie_lens, movie_cross = movie_cross, crossings = crossings)
         end
         println("Round rendered in $(round(elapsed, digits=3))s on $engine")
 
@@ -503,7 +536,7 @@ function process_slowlight_images!(
             if do_output[k]
                 Image_out = movie_intensity[:, :, k] .* freq^3
 
-                frame_index = round(Int, (target_times[k] - first_img_target) / params_slowlight.ImageCadence) + 1
+                frame_index = round(Int, (target_times[k] - first_img_target) / grid_cadence) + 1
                 file_name = index_names ? joinpath(output_dir, @sprintf("slow.%05d.h5", frame_index)) :
                             joinpath(output_dir, Printf.format(Printf.Format(output), target_times[k]))
                 out_data = Dict{String, Any}(
@@ -526,6 +559,7 @@ function process_slowlight_images!(
                     "t_fluid" => target_times[k] + t_ref
                 )
                 movie_tau === nothing || (out_data["tau"] = movie_tau[:, :, k])
+                movie_lens === nothing || (out_data["lens"] = movie_lens[:, :, k, :] .* freq^3)
                 if movie_pol !== nothing
                     pol = zeros(Float64, Polarization.NIMG, pixels_x, pixels_y)
                     Rh_pol = 1 + sqrt(1.0 - model.a * model.a)
@@ -557,7 +591,7 @@ function process_slowlight_images!(
             end
         end
 
-        if nopenimgs <= 1
+        if nopenimgs <= 1 && opened_any
             break
         end
         update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)

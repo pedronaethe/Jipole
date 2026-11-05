@@ -91,7 +91,7 @@ function calculate_image_pol!(
     i_global::Int64, j_global::Int64,
     i_local::Int64, j_local::Int64,
     freq::Float64, fovx::Float64, fovy::Float64, Rstop::Float64, qu_conv::Int64, params,
-    data::T_data = nothing
+    data::T_data = nothing, d_lens = nothing
 ) where {T_data}
 
     if (i_global >= nx || j_global >= ny)
@@ -110,6 +110,18 @@ function calculate_image_pol!(
     Intensity = 0.0
     N = Polarization.zero_tensor(Float64)
     tauF = 0.0
+    # lensing bands: count the ray's midplane crossings
+    remaining = 0
+    if d_lens !== nothing
+        @inbounds for nstep in step:-1:2
+            (bl_coord(traj[i_local, j_local, nstep].X, params)[2] > Ï€ / 2) !=
+                (bl_coord(traj[i_local, j_local, nstep - 1].X, params)[2] > Ï€ / 2) && (remaining += 1)
+        end
+        @inbounds for b in 1:size(d_lens, 3)
+            d_lens[i_global + 1, j_global + 1, b] = 0.0
+        end
+    end
+    cap = remaining - 1   # A ray N = 1 has two midplane crossings...
 
     @inbounds far = traj[i_local, j_local, step]
     ji, ki = Radiation.get_jk(far.X, far.Kcon, freq, bhspin, params, data)
@@ -127,9 +139,14 @@ function calculate_image_pol!(
             dlam, dl_unit, Rh, freq, bhspin, params, data)
 
         # Unpolarized: same update as in calculate_image!.
+        if d_lens !== nothing && (bl_coord(ti.X, params)[2] > Ï€ / 2) != (bl_coord(tf.X, params)[2] > Ï€ / 2)
+            remaining -= 1
+        end
         if Radiation.radiating_region(tf.X, params, Rh)
             jf, kf = Radiation.get_jk(tf.X, tf.Kcon, freq, bhspin, params, data)
             Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, dlam)
+            d_lens === nothing ||
+                Radiation.lens_step!(d_lens, ji, ki, jf, kf, dlam, min(remaining, cap), i_global + 1, j_global + 1)
             ji = jf
             ki = kf
         end
@@ -138,6 +155,11 @@ function calculate_image_pol!(
     SI, SQ, SU, SV = Polarization.project_n(N, Ecov)
 
     @inbounds d_Image[i_global+1, j_global+1] = Intensity * (freq^3)
+    if d_lens !== nothing
+        @inbounds for b in 1:size(d_lens, 3)
+            d_lens[i_global + 1, j_global + 1, b] *= freq^3
+        end
+    end
     Polarization.save_pixel!(d_pol, i_global + 1, j_global + 1, SI, SQ, SU, SV, tauF, freq, qu_conv)
 
     return nothing
@@ -155,7 +177,7 @@ function raytrace_image_gpu_pol!(
     d_traj, d_Image, d_pol, d_truncated,
     i_offset, j_offset, block_size_x, block_size_y,
     Xcam, Econ, Ecov, bhspin, nx, ny, nmaxstep,
-    freq, fovx, fovy, Rstop, qu_conv, data, params
+    freq, fovx, fovy, Rstop, qu_conv, data, params, d_lens = nothing
 )
     local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
@@ -166,7 +188,7 @@ function raytrace_image_gpu_pol!(
     if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
         calculate_image_pol!(
             d_traj, d_Image, d_pol, d_truncated, Xcam, Econ, Ecov, bhspin, nx, ny, nmaxstep,
-            i, j, local_i, local_j, freq, fovx, fovy, Rstop, qu_conv, params, data
+            i, j, local_i, local_j, freq, fovx, fovy, Rstop, qu_conv, params, data, d_lens
         )
     end
     return nothing
@@ -185,7 +207,7 @@ tile's geodesics do not fit in `nmaxstep` points.
 - The `nmaxstep` the run ended on, to start the next image from.
 """
 function ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, Î¸o, phi, freq, fovx, fovy, nx, ny;
-    nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64, qu_conv::Int=0)
+    nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64, qu_conv::Int=0, lens=nothing)
 
     threads_per_block = (16, 16)
     blocks_per_grid = (cld(block_size, threads_per_block[1]), cld(block_size, threads_per_block[2]))
@@ -201,6 +223,7 @@ function ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, Î
     d_truncated = CUDA.zeros(Bool, block_size, block_size)
     d_Image = CUDA.zeros(Float64, nx, ny)
     d_pol = CUDA.zeros(Float64, Polarization.NIMG, nx, ny)
+    d_lens = lens === nothing ? nothing : CUDA.zeros(Float64, nx, ny, size(lens, 3))
 
     CUDA.@time begin
         for i_offset in 0:block_size:(nx - 1)
@@ -212,7 +235,7 @@ function ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, Î
                         d_traj, d_Image, d_pol, d_truncated,
                         i_offset, j_offset, block_size, block_size,
                         Xcam, Econ, Ecov, model.a, nx, ny, nmaxstep,
-                        freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model
+                        freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model, d_lens
                     )
                     CUDA.synchronize()
 
@@ -235,6 +258,7 @@ function ImagingPol.render_image_gpu_pol!(Image, pol, model, gpu_sim_data, ro, Î
 
     copyto!(Image, d_Image)
     copyto!(pol, d_pol)
+    lens === nothing || copyto!(lens, d_lens)
     CUDA.unsafe_free!(d_traj)
     return nmaxstep
 end

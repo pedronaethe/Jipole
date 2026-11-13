@@ -10,7 +10,7 @@ using ..Coordinates
 using ..Metrics
 using ..Radiation
 
-export AnalyticParams, get_analytic_jk
+export AnalyticParams
 
 """
 Parameters for the [`Analytic`](@ref) torus emission model.
@@ -165,29 +165,28 @@ function get_model_4vel(X, bhspin, model::AnalyticParams)
 end
 
 """
-    get_analytic_jk(X, Kcon, freqcgs, bhspin, model)
+    Radiation.get_jk(X, Kcon, freq, bhspin, model::AnalyticParams, data=nothing)
 
-Compute the emissivity and absorption coefficient of the analytic torus
-at position `X` and frequency `freqcgs`.
-
-`bhspin` is a separate argument (rather than `model.a`) so this function
-stays differentiable when called on the autodiff path.
+Emissivity and absorption coefficient (invariant) of the analytic torus at position `X`
+and frequency `freq`. `bhspin` is its own argument (not `model.a`) so the function stays
+differentiable with respect to the spin. `data` is unused by this model.
 
 # Arguments
 - `X`: Position four-vector in internal coordinates.
 - `Kcon`: Contravariant photon 4-momentum, in internal coordinates.
-- `freqcgs`: Pivotal frequency, in cgs units.
+- `freq`: Pivotal frequency, in cgs units.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Analytic model parameters.
+- `data`: Unused.
 
 # Returns
-- A tuple `(j, k, 0, 0)`.
+- A tuple `(j, k)`.
 """
-function get_analytic_jk(X, Kcon, freqcgs::Float64, bhspin, model::AnalyticParams)
+function Radiation.get_jk(X, Kcon, freq::Float64, bhspin, model::AnalyticParams, data=nothing)
     Ne = get_model_ne(X, model)
     if Ne <= 0.0
         z = zero(eltype(X))
-        return z, z, z, z
+        return z, z
     end
 
     Ucov = get_model_4vel(X, bhspin, model)
@@ -200,11 +199,11 @@ function get_analytic_jk(X, Kcon, freqcgs::Float64, bhspin, model::AnalyticParam
         error("Frequency must be positive, got ν = $ν")
     end
 
-    jnu_inv = max(Ne * (ν / freqcgs)^(-model.α) / ν^2, 0.0)
-    knu_inv = max((model.A * Ne * (ν / freqcgs)^(-(model.α + 2.5)) + 1.e-54) * ν, 0.0)
+    jnu_inv = max(Ne * (ν / freq)^(-model.α) / ν^2, 0.0)
+    knu_inv = max((model.A * Ne * (ν / freq)^(-(model.α + 2.5)) + 1.e-54) * ν, 0.0)
 
     if isnan(jnu_inv) || isinf(jnu_inv)
-        @error "Invalid jnu_inv computed" jnu_inv
+                @error "Invalid jnu_inv computed" jnu_inv
         println("Ne = $Ne, ν = $ν")
         error("Invalid jnu_inv computed: $jnu_inv")
     end
@@ -214,19 +213,7 @@ function get_analytic_jk(X, Kcon, freqcgs::Float64, bhspin, model::AnalyticParam
         error("Invalid knu_inv computed: $knu_inv")
     end
 
-    z = zero(typeof(jnu_inv))
-    return jnu_inv, knu_inv, z, z
-end
-
-"""
-    Radiation.get_jk(X, Kcon, freq, bhspin, model::AnalyticParams, data=nothing, derivative_calculation=Val(false))
-
-Compute the emissivity and absorption coefficient of the analytic torus
-(delegates to [`get_analytic_jk`](@ref); `data` and
-`derivative_calculation` are unused by this model).
-"""
-function Radiation.get_jk(X, Kcon, freq::Float64, bhspin, model::AnalyticParams, data=nothing, derivative_calculation::Val{B}=Val(false)) where {B}
-    return get_analytic_jk(X, Kcon, freq, bhspin, model)
+    return jnu_inv, knu_inv
 end
 
 end

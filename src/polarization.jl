@@ -525,24 +525,6 @@ implements it (ipole's `#if THIN_DISK` block in `integrate_emission`).
 """
 @inline apply_boundary(N, Xi, Xf, Kconf, bhspin, model::AbstractModel) = N
 
-# ---------------------------------------------------------------------------
-# One step of polarized transfer
-# ---------------------------------------------------------------------------
-
-"""
-    plasma_tetrad(Ucon, Kcon, Bcon, gcov)
-
-`Tetrads.make_plasma_tetrad` with its four inputs first promoted to a common
-element type. The existing routine takes its type from `Ucon` alone, which
-fails when only some of the inputs carry dual numbers.
-
-# Returns
-- A tuple `(flag, Econ, Ecov)`, as `Tetrads.make_plasma_tetrad`.
-"""
-@inline function plasma_tetrad(Ucon, Kcon, Bcon, gcov)
-    T = promote_type(eltype(Ucon), eltype(Kcon), eltype(Bcon), eltype(gcov))
-    return Tetrads.make_plasma_tetrad(SVector{4,T}(Ucon), SVector{4,T}(Kcon), SVector{4,T}(Bcon), SMatrix{4,4,T,16}(gcov))
-end
 
 """
     evolve_n(N, tauF, Xf, Kconf, dlam, freq, bhspin, model, data)
@@ -580,7 +562,7 @@ end point `Xf` and held constant over the step:
     end
 
     gcov = Metrics.gcov_func(Xf, bhspin, model)
-    _, Econ, Ecov = plasma_tetrad(Ucon, Kconf, Bcon, gcov)
+    _, Econ, Ecov = Tetrads.make_plasma_tetrad(Ucon, Kconf, Bcon, gcov)
 
     # Convert N to Stokes parameters in the plasma frame, evolve them, convert back.
     N_tetrad = complex_coord_to_tetrad_rank2(N, Ecov)
@@ -785,34 +767,24 @@ end
 PolSink(data, pol) = PolSink(data, pol, 0)
 
 """
-    integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink)
+    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink::PolSink)
 
-Compute one pixel of both images (ipole's `get_pixel` + `save_pixel`): the
-unpolarized intensity `Image[I, J]`, with the model's existing
-`Radiation.integrate_emission!` method, and the polarized pixel
-`sink.pol[:, I, J]`, with [`integrate_emission_pol`](@ref).
+Compute one pixel of both images (ipole's `get_pixel` + `save_pixel`), selected
+when the pixel loop is given a [`PolSink`](@ref) in place of the model data: the
+unpolarized intensity `Image[I, J]` with the model's own
+`Radiation.integrate_emission!` method, and the polarized pixel `sink.pol[:, I, J]`
+with [`integrate_emission_pol`](@ref).
 
 As in ipole, the two are separate calculations: the unpolarized image uses the
 Leung et al. (2011) emissivity averaged over each step, the polarized one the
 Dexter (2016) fits evaluated at the end of each step. Their Stokes I therefore
 differ slightly, by design.
 """
-@inline function integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink::PolSink)
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, sink::PolSink) where {T}
     Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data)
     SI, SQ, SU, SV, tauF = integrate_emission_pol(traj, nsteps, freq, bhspin, model, sink.data)
     save_pixel!(sink.pol, I, J, SI, SQ, SU, SV, tauF, freq, sink.qu_conv)
     return nothing
-end
-
-"""
-    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink::PolSink)
-
-Polarized pixel integration: selected when the pixel loop is given a
-[`PolSink`](@ref) in place of the model data. See
-[`integrate_emission_sink!`](@ref).
-"""
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, sink::PolSink) where {T}
-    return integrate_emission_sink!(traj, nsteps, Image, I, J, freq, bhspin, model, sink)
 end
 
 end

@@ -186,10 +186,10 @@ if !slow_light
         if mode == "cpu"
             if do_gradients && do_polarization
                 ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
-                grad_image, pol, grads, grads_pol = Jipole.IharmPol.calculate_gradients_pol(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
-                    MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
-                    M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
-                    wrt=gradient_wrt);
+                grad_image, pol, grads, grads_pol = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
+                      MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
+                      M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
+                      wrt=gradient_wrt, pol=true);
                 copyto!(Image, grad_image)
             elseif do_gradients
                 ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])

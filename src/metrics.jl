@@ -14,7 +14,7 @@ using ..DebugFunctions
 
 export METRIC_MKS, METRIC_BHACMKS, METRIC_FMKS, METRIC_MKS3, METRIC_EKS,
     METRIC_MINKOWSKI, METRIC_EMINKOWSKI,
-    gdet_func, gcov_func!, gcov_func, gcov_func_fd, gcon_func!, gcon_func, gcov_bl!
+    gdet_func, gcov_func, gcov_func_fd, gcon_func!, gcon_func, gcov_bl!
 
 const METRIC_MKS = 0
 const METRIC_BHACMKS = 1
@@ -46,77 +46,6 @@ function gdet_func(gcov)
 
     gdet = prod(diag(U))
     return sqrt(abs(gdet))
-end
-
-"""
-    gcov_func!(X, bhspin, model, gcov, R0=0.0)
-
-In-place version of [`gcov_func`](@ref), writing the result into `gcov`.
-
-`bhspin` is a separate argument (rather than `model.a`) so this function
-stays differentiable when called on the autodiff path.
-
-# Arguments
-- `X`: Position four-vector in internal coordinates.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters (metric family via `model.metric`).
-- `gcov`: Output matrix, overwritten with the covariant metric tensor.
-- `R0`: Optional radial coordinate shift, reminescent from old MKS models.
-"""
-function gcov_func!(X, bhspin, model, gcov, R0::Float64=0.0)
-    r, th = Coordinates.bl_coord(X, model, R0)
-    T = promote_type(typeof(r), typeof(th), typeof(bhspin))
-    fill!(gcov, 0.0)
-
-    if model.metric == METRIC_MINKOWSKI
-        gcov[1, 1] = -1.0
-        gcov[2, 2] = 1.0
-        gcov[3, 3] = r * r
-        gcov[4, 4] = r * r * sin(th)^2
-        return
-    elseif model.metric == METRIC_EMINKOWSKI
-        gcov[1, 1] = -1.0
-        gcov[2, 2] = r * r
-        gcov[3, 3] = r * r
-        gcov[4, 4] = r * r * sin(th)^2
-        return
-    end
-
-    Gcov_ks = @MMatrix zeros(T, 4, 4)
-
-    cth = cos(th)
-    sth = sin(th)
-    s2 = sth^2
-    rho2 = r^2 + bhspin^2 * cth^2
-
-    Gcov_ks[1, 1] = -1.0 + 2.0 * r / rho2
-    Gcov_ks[1, 2] = 2.0 * r / rho2
-    Gcov_ks[1, 4] = -2.0 * bhspin * r * s2 / rho2
-
-    Gcov_ks[2, 1] = Gcov_ks[1, 2]
-    Gcov_ks[2, 2] = 1.0 + 2.0 * r / rho2
-    Gcov_ks[2, 4] = -bhspin * s2 * (1.0 + 2.0 * r / rho2)
-
-    Gcov_ks[3, 3] = rho2
-
-    Gcov_ks[4, 1] = Gcov_ks[1, 4]
-    Gcov_ks[4, 2] = Gcov_ks[2, 4]
-    Gcov_ks[4, 4] = s2 * (rho2 + bhspin^2 * s2 * (1.0 + 2.0 * r / rho2))
-
-    dxdX = Coordinates.set_ks_jacobian(X, model)
-
-    fill!(gcov, 0.0)
-    for mu in 1:4
-        for nu in 1:4
-            sum_val = 0.0
-            for lam in 1:4
-                for kap in 1:4
-                    sum_val += Gcov_ks[lam, kap] * dxdX[lam, mu] * dxdX[kap, nu]
-                end
-            end
-            gcov[mu, nu] = sum_val
-        end
-    end
 end
 
 """
@@ -179,40 +108,6 @@ function gcov_func(X, bhspin, model, R0::Float64=0.0)
     return transpose(dxdX) * Gcov_ks * dxdX
 end
 
-"""
-    gcov_func_fd(X, bhspin, model, R0=0.0)
-
-Compute the covariant metric tensor via [`Coordinates.gcov_ks`](@ref) and
-the Jacobian from [`Coordinates.set_ks_jacobian`](@ref) (used as a finite-
-difference-friendly alternative to [`gcov_func`](@ref)).
-
-# Arguments
-- `X`: Position four-vector in internal coordinates.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters.
-- `R0`: Optional radial coordinate shift.
-
-# Returns
-- The covariant metric tensor.
-"""
-function gcov_func_fd(X, bhspin, model, R0::Float64=0.0)
-    r, th = Coordinates.bl_coord(X, model, R0)
-    T = promote_type(typeof(r), typeof(th), typeof(bhspin))
-    gcov = @MMatrix zeros(T, 4, 4)
-    Gcov_ks = Coordinates.gcov_ks(r, th, bhspin)
-
-    dxdX = Coordinates.set_ks_jacobian(X, model)
-    for μ in 1:Constants.NDIM
-        for ν in 1:Constants.NDIM
-            for λ in 1:Constants.NDIM
-                for κ in 1:Constants.NDIM
-                    gcov[μ, ν] += Gcov_ks[λ, κ] * dxdX[λ, μ] * dxdX[κ, ν]
-                end
-            end
-        end
-    end
-    return gcov
-end
 
 """
     gcon_func!(gcov, gcon)

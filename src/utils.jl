@@ -8,7 +8,7 @@ using LinearAlgebra
 using HDF5
 using ..Constants
 
-export set_econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
+export set_econ_from_trial, normalize_vector, project_out, check_handedness
 
 
 """

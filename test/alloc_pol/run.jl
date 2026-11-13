@@ -54,7 +54,7 @@ model, data = redirect_stdout(devnull) do
 end
 ctx = Jipole.Iharm.grmhd_context(model, data[1])
 wrt = (:M_unit, :Rhigh, :Rlow, :beta_crit, :MBH, :ro, :th, :phi, :sourceD)
-dp = Jipole.IharmPol.dual_problem(ctx; kw..., wrt=wrt)
+dp = Jipole.Iharm.dual_problem(ctx; kw..., wrt=wrt)
 
 """Trace the geodesic of pixel (i, j) and return everything the integrators need."""
 function setup_pixel(model, ro, th, phi, sourceD, i, j)
@@ -89,7 +89,7 @@ for (label, m, d, p) in (("Float64", model, data, px), ("Dual", dp.model, dp.dat
     N0 = P.stokes_to_tensor(P.zero_tensor(T), T(1.0), T(0.2), T(-0.1), T(0.05))
     tau0 = zero(T)
     coeffs, Ucon, Bcon, Bcov = P.get_pol_state(tf.X, tf.Kcon, freq, m.a, m, d)
-    s = Jipole.IharmPol.plasma_state(tf.X, tf.Kcon, m.a, m, d)
+    s = Jipole.Iharm.plasma_state(tf.X, tf.Kcon, m.a, m, d)
     lconn = Jipole.Geodesics.get_connection_analytic(ti.X, m.a, m)
     pol = zeros(T, P.NIMG, 1, 1)
     Image = zeros(T, 1, 1)
@@ -101,7 +101,7 @@ for (label, m, d, p) in (("Float64", model, data, px), ("Dual", dp.model, dp.dat
         ("maxwell_juettner_rho_q", @bytes M.maxwell_juettner_rho_q(s.Ne, s.nu, s.θe, s.B, s.θ)),
         ("maxwell_juettner_rho_v", @bytes M.maxwell_juettner_rho_v(s.Ne, s.nu, s.θe, s.B, s.θ)),
         ("thermal_jar", @bytes P.thermal_jar(s.Ne, s.nu, s.θe, s.B, s.θ)),
-        ("plasma_state", @bytes Jipole.IharmPol.plasma_state(tf.X, tf.Kcon, m.a, m, d)),
+        ("plasma_state", @bytes Jipole.Iharm.plasma_state(tf.X, tf.Kcon, m.a, m, d)),
         ("get_pol_state", @bytes P.get_pol_state(tf.X, tf.Kcon, freq, m.a, m, d)),
         ("push_polar", @bytes P.push_polar(N0, N0, lconn, ti.Kcon, 0.01)),
         ("evolve_stokes", @bytes P.evolve_stokes(T(1.0), T(0.2), T(-0.1), T(0.05), coeffs, tf.dl)),
@@ -156,16 +156,13 @@ let bhspin = 0.99, Rout = 100.0
     traj = Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep)
     frequ = tdfreq * C.HPL / (C.ME * C.CL^2)
     nstep, _ = Jipole.Geodesics.get_pixel(traj, 20, 30, Xcam, Econ, 40.0 / 1.0e4, 40.0 / 1.0e4, frequ, 80, 80, bhspin, Rh, td.rmax_geo, td, 0.0, 0.0)
-    nstop = Jipole.ThinDiskPol.disk_stop_index(traj, nstep, td)
-    S = P.integrate_emission_pol(traj, nstop, tdfreq, bhspin, td, nothing)
+    S = P.integrate_emission_pol(traj, nstep, tdfreq, bhspin, td, nothing)
     report(S[1] > 0 && S[2] != 0, "thin disk: test ray hits the disk (I = $(round(S[1] * tdfreq^3, sigdigits=4)) cgs)")
     pol = zeros(P.NIMG, 1, 1); Image = zeros(1, 1); sink = P.PolSink(nothing, pol, 0)
-    b = @bytes Jipole.ThinDiskPol.disk_stop_index(traj, nstep, td)
-    report(b == 0, "thin disk: disk_stop_index allocates $b bytes")
-    b = @bytes P.integrate_emission_pol(traj, nstop, tdfreq, bhspin, td, nothing)
+    b = @bytes P.integrate_emission_pol(traj, nstep, tdfreq, bhspin, td, nothing)
     report(b == 0, "thin disk: integrate_emission_pol (whole ray) allocates $b bytes")
     ok = try
-        @inferred P.integrate_emission_pol(traj, nstop, tdfreq, bhspin, td, nothing); true
+        @inferred P.integrate_emission_pol(traj, nstep, tdfreq, bhspin, td, nothing); true
     catch err
         println("      ", sprint(showerror, err)); false
     end
@@ -180,7 +177,7 @@ end
 # Method ambiguities and source hygiene
 # ---------------------------------------------------------------------------------------------
 println("\n== Methods and sources ==")
-new_modules = (Jipole.MaxwellJuettnerPol, Jipole.Polarization, Jipole.ImagingPol, Jipole.IharmPol, Jipole.ThinDiskPol)
+new_modules = (Jipole.MaxwellJuettnerPol, Jipole.Polarization, Jipole.ImagingPol, Jipole.Iharm, Jipole.ThinDisk)
 amb = Test.detect_ambiguities(Jipole; recursive=true)
 ours = [a for a in amb if any(m -> m.module in new_modules, a)]
 foreach(a -> println("      ", a[1], "\n      ", a[2]), ours)

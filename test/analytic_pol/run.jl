@@ -131,7 +131,7 @@ function run_pipeline(model, traj)
             tf.dl, dl_unit, Rh, 1.0, model.a, model, nothing)
         # Stokes parameters in the plasma tetrad at the end of the step
         gcov = Jipole.Metrics.gcov_func(tf.X, model.a, model)
-        _, _, Ecov = P.plasma_tetrad(SVector(1.0, 0.0, 0.0, 0.0), tf.Kcon, SVector(0.0, 1.0, 1.0, 1.0), gcov)
+        _, _, Ecov = Jipole.Tetrads.make_plasma_tetrad(SVector(1.0, 0.0, 0.0, 0.0), tf.Kcon, SVector(0.0, 1.0, 1.0, 1.0), gcov)
         l += tf.dl
         lam[k] = l
         S[:, k] .= P.tensor_to_stokes(P.complex_coord_to_tetrad_rank2(N, Ecov))

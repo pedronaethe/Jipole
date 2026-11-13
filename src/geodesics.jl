@@ -21,8 +21,8 @@ using ..Tetrads
 using ..DebugFunctions
 
 export init_kcon, get_pixel, models_and_mks_connection_analytic,
-    fmks_connection_analytic, get_connection_analytic, get_connection_analytic!,
-    compute_dkcon, push_photon, push_photon!, get_connection, stepsize,
+    fmks_connection_analytic, get_connection_analytic,
+    compute_dkcon, push_photon, stepsize,
     stop_backward_integration, trace_geodesic!, count_midplane_crossings
 
 """
@@ -465,25 +465,6 @@ MKS or FMKS formula based on `model.metric`.
     end
 end
 
-"""
-    get_connection_analytic!(X, lconn, bhspin, model)
-
-In-place version of [`get_connection_analytic`](@ref), writing the result
-into `lconn`.
-
-# Arguments
-- `X`: Position four-vector in internal coordinates.
-- `lconn`: Output tensor, overwritten with the connection coefficients.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters (`model.metric`).
-"""
-@inline function get_connection_analytic!(X::AbstractVector{T}, lconn, bhspin, model) where {T}
-    if model.metric == Metrics.METRIC_MKS
-        lconn .= models_and_mks_connection_analytic(X, bhspin, model)
-    else
-        lconn .= fmks_connection_analytic(X, bhspin, model)
-    end
-end
 
 """
     compute_dkcon(dl, lconn, Kcon)
@@ -542,116 +523,6 @@ Base.@inline function push_photon(X::SVector{4,T}, Kcon::SVector{4,T}, dl, bhspi
     return new_X, new_Kcon, Xhalf, Kconhalf
 end
 
-"""
-    push_photon!(X, Kcon, dl, Xhalf, Kconhalf, lconn, bhspin, model)
-
-In-place version of [`push_photon`](@ref).
-
-# Arguments
-- `X`: Position four-vector, overwritten with the new position.
-- `Kcon`: Contravariant photon 4-momentum, overwritten with the new value.
-- `dl`: Step size along the geodesic.
-- `Xhalf`: Output vector, overwritten with the half-step position.
-- `Kconhalf`: Output vector, overwritten with the half-step 4-momentum.
-- `lconn`: Scratch tensor for the connection coefficients.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters.
-"""
-Base.@inline function push_photon!(X::MVector{4,Float64}, Kcon::MVector{4,Float64}, dl::Float64, Xhalf::MVector{4,Float64}, Kconhalf::MVector{4,Float64}, lconn, bhspin::Float64, model)
-    dKcon::Float64 = 0.0
-
-    get_connection_analytic!(X, lconn, bhspin, model)
-
-    @inbounds for k in 1:Constants.NDIM
-        @inbounds for i in 1:Constants.NDIM
-            @inbounds for j in 1:Constants.NDIM
-                dKcon -= 0.5 * dl * lconn[k, i, j] * Kcon[i] * Kcon[j]
-            end
-        end
-        Kconhalf[k] = Kcon[k] + dKcon
-        Xhalf[k] = X[k] + 0.5 * dl * Kcon[k]
-        dKcon = 0.0
-    end
-
-    get_connection_analytic!(Xhalf, lconn, bhspin, model)
-
-    dKcon = 0.0
-
-    @inbounds for k in 1:Constants.NDIM
-        @inbounds for i in 1:Constants.NDIM
-            @inbounds for j in 1:Constants.NDIM
-                dKcon -= dl * lconn[k, i, j] * Kconhalf[i] * Kconhalf[j]
-            end
-        end
-        Kcon[k] += dKcon
-        X[k] += dl * Kconhalf[k]
-        dKcon = 0.0
-    end
-end
-
-const DEL = 1.e-6
-
-"""
-    get_connection(X, bhspin, model, conn)
-
-Compute the connection coefficients at `X` via finite differences of the
-metric tensor (an alternative to the closed-form
-[`get_connection_analytic`](@ref)). It is currently not used in the codebase, but is provided for reference.
-
-# Arguments
-- `X`: Position four-vector in internal coordinates.
-- `bhspin`: Dimensionless black hole spin parameter.
-- `model`: Model parameters.
-- `conn`: Output tensor, overwritten with the connection coefficients.
-
-# Returns
-- `conn`.
-"""
-function get_connection(X::AbstractVector{T}, bhspin, model, conn) where {T}
-    tmp = similar(conn)
-    Xh = copy(X)
-    Xl = copy(X)
-
-    gcov = Metrics.gcov_func(X, bhspin, model)
-    gcon = Metrics.gcon_func(gcov)
-
-    @inbounds for k in 1:Constants.NDIM
-        Xh .= X
-        Xl .= X
-        Xh[k] += DEL
-        Xl[k] -= DEL
-
-        gh = Metrics.gcov_func(Xh, bhspin, model)
-        gl = Metrics.gcov_func(Xl, bhspin, model)
-
-        @inbounds for i in 1:Constants.NDIM
-            @inbounds for j in 1:Constants.NDIM
-                conn[i, j, k] = (gh[i, j] - gl[i, j]) / (Xh[k] - Xl[k])
-            end
-        end
-    end
-
-    @inbounds for i in 1:Constants.NDIM
-        @inbounds for j in 1:Constants.NDIM
-            @inbounds for k in 1:Constants.NDIM
-                tmp[i, j, k] = 0.5 * (conn[j, i, k] + conn[k, i, j] - conn[k, j, i])
-            end
-        end
-    end
-
-    @inbounds for i in 1:Constants.NDIM
-        @inbounds for j in 1:Constants.NDIM
-            @inbounds for k in 1:Constants.NDIM
-                s = 0.0
-                for l in 1:Constants.NDIM
-                    s += gcon[i, l] * tmp[l, j, k]
-                end
-                conn[i, j, k] = s
-            end
-        end
-    end
-    return conn
-end
 
 """
     stepsize(X, Kcon, cstartx, cstopx, eps_ipole=0.01)

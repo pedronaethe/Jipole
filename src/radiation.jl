@@ -61,15 +61,13 @@ function bnu_inv(nu, θe)
 end
 
 """
-    get_jk(X, Kcon, freq, bhspin, model, data=nothing, derivative_calculation=Val(false))
+    get_jk(X, Kcon, freq, bhspin, model, data=nothing)
 
 Compute the (invariant) emissivity `j` and absorption coefficient `k` at
 position `X`.
 
 This is model-specific: each model provides its own method, dispatched on
-`model`'s type. `derivative_calculation` additionally requests the
-derivatives of `j`/`k` with respect to `Rhigh` (used by `Iharm`); models
-that don't support this simply ignore it.
+`model`'s type.
 
 # Arguments
 - `X`: Position four-vector in internal coordinates.
@@ -78,12 +76,9 @@ that don't support this simply ignore it.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Model parameters, used to select the emission model.
 - `data`: Model-specific auxiliary data (e.g. `Iharm`'s GRMHD snapshots).
-- `derivative_calculation`: `Val(true)` to additionally return
-  `dj/dRhigh`, `dk/dRhigh`.
 
 # Returns
-- A tuple `(j, k, dj_dRhigh, dk_dRhigh)` (the last two are zero unless
-  `derivative_calculation === Val(true)` and the model supports it).
+- A tuple `(j, k)`.
 """
 function get_jk end
 

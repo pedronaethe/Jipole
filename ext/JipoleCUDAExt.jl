@@ -252,8 +252,8 @@ via `@cuda` from [`render_round_gpu!`](@ref).
 - `freq`: Frequency, in cgs units.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Iharm model parameters.
-- `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (see
-  [`refresh_gpu_data!`](@ref)).
+- `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (kept in step
+with the CPU window by `process_slowlight_images!`).
 """
 function slowlight_kernel!(
     traj, nstep_state, intensity, valid_mask, target_times,

@@ -55,20 +55,7 @@ end
 
 function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
     println("Initializing grid from KHARMA dump: $filename")
-
-    params = Iharm.IharmParamsBuilder()
-    params.th_beg = th_beg
-    params.Rlow = Rlow
-    params.Rhigh = Rhigh
-    params.beta_crit = beta_crit
-    params.sigma_cut = sigma_cut
-    params.sigma_cut_high = sigma_cut_high
-    params.slow_light = slow_light
-
-    params.L_unit = Constants.GNEWT * MBH * Constants.MSUN / Constants.CL^2
-    params.T_unit = params.L_unit / Constants.CL
-    params.MBH = MBH
-    params.M_unit = M_unit
+    params = Iharm.IharmParamsBuilder(MBH; th_beg, Rlow, Rhigh, beta_crit, sigma_cut, sigma_cut_high, slow_light, M_unit)
 
     cstopx_2 = 0.0
 
@@ -135,38 +122,10 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
             params.mks_smooth = deck_value(deck, "coordinates", "mks_smooth", Float64)
             params.poly_xt = deck_value(deck, "coordinates", "poly_xt", Float64)
             params.poly_alpha = deck_value(deck, "coordinates", "poly_alpha", Float64)
-            params.poly_norm = 0.5 * π * 1.0 / (1.0 + 1.0 / (params.poly_alpha + 1.0) * 1.0 / (params.poly_xt^params.poly_alpha))
-            @printf(stderr, "FMKS parameters poly_xt: %f poly_alpha: %f mks_smooth: %f poly_norm: %f\n",
-                params.poly_xt, params.poly_alpha, params.mks_smooth, params.poly_norm)
         end
     end
 
-    # From here on, exactly as Iharm.read_header
-    params.rmax_geo = min(params.rmax_geo, params.Rout)
-    params.rmin_geo = max(params.rmin_geo, params.Rin)
-
-    params.stopx = MVector{4,Float64}(
-        1.0,
-        params.startx[2] + params.N1 * params.dx[2],
-        params.startx[3] + params.N2 * params.dx[3],
-        params.startx[4] + params.N3 * params.dx[4]
-    )
-
-    params.cstartx = MVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
-    params.cstopx = MVector{4,Float64}(0.0, 0.0, cstopx_2, 2 * π)
-    if params.metric != Metrics.METRIC_EKS
-        params.cstopx[2] = log(params.Rout)
-    end
-
-    @printf(stderr, "Grid start (startx): %.15e, %.15e, %.15e stop (stopx): %.15e, %.15e, %.15e\n",
-        params.startx[2], params.startx[3], params.startx[4], params.stopx[2], params.stopx[3], params.stopx[4])
-    @printf(stderr, "grid dx: %.15e, %.15e, %.15e\n", params.dx[2], params.dx[3], params.dx[4])
-
-    params.RHO_unit = params.M_unit / params.L_unit^3
-    params.U_unit = params.RHO_unit * Constants.CL^2
-    params.B_unit = Constants.CL * sqrt(4 * π * params.RHO_unit)
-
-    return Iharm.IharmParams(params)
+   return Iharm.IharmParams(params, cstopx_2)
 end
 
 function block_view(A, c, mb, nb)

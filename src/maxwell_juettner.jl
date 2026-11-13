@@ -7,7 +7,7 @@ module MaxwellJuettner
 using Bessels
 using ForwardDiff
 using ..Constants
-export get_nu_c, dexter_shape_function, maxwell_juettner_dexter_i, maxwell_juettner_leung_i, maxwell_juettner_i
+export dexter_shape_function, maxwell_juettner_dexter_i, maxwell_juettner_leung_i
 
 
 """
@@ -25,20 +25,6 @@ function besselk_ad(v, x::ForwardDiff.Dual{T}) where {T}
     return ForwardDiff.Dual{T}(kv, deriv * ForwardDiff.partials(x))
 end
 
-"""
-    get_nu_c(B)
-
-Compute the cyclotron frequency for magnetic field strength `B`.
-
-# Arguments
-- `B`: Magnetic field strength (Gauss).
-
-# Returns
-- The cyclotron frequency.
-"""
-function get_nu_c(B)
-    return Constants.EE * B / (2 * π * Constants.ME * Constants.CL)
-end
 
 """
     dexter_shape_function(x)
@@ -116,8 +102,6 @@ function maxwell_juettner_leung_i(Ne, ν, θe, B, θ)
     return j
 end
 
-function maxwell_juettner_i(B, θ, θe, ν, ne)
-    return maxwell_juettner_leung_i(ne, ν, θe, B, θ)
-end
+
 
 end

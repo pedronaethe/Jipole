@@ -239,65 +239,6 @@ function pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
 end
 
 """
-    upload_gpu_snapshot(cpu_snapshot)
-
-Copy one CPU-resident GRMHD snapshot to the GPU. Small helper used by
-[`init_gpu_data`](@ref) and [`refresh_gpu_data!`](@ref).
-
-# Arguments
-- `cpu_snapshot`: GRMHD snapshot with `Array`-backed fields.
-
-# Returns
-- The same snapshot, with `CuArray`-backed fields.
-"""
-upload_gpu_snapshot(cpu_snapshot) = Utils_GPU.copy_iharm_to_gpu(cpu_snapshot)
-
-"""
-    init_gpu_data(simulation_data)
-
-Upload all 3 starting GRMHD snapshots to the GPU. Called once from
-[`process_slowlight_images!`](@ref) when a `:GPU` run starts; after that,
-[`refresh_gpu_data!`](@ref) takes over for each new round.
-
-# Arguments
-- `simulation_data`: 3-element window of loaded GRMHD snapshots.
-
-# Returns
-- 3-element `Vector` of GPU-resident snapshots.
-"""
-function init_gpu_data(simulation_data)
-    return [upload_gpu_snapshot(simulation_data[1]),
-            upload_gpu_snapshot(simulation_data[2]),
-            upload_gpu_snapshot(simulation_data[3])]
-end
-
-"""
-    refresh_gpu_data!(gpu_data, simulation_data)
-
-Keep the GPU's copy of the GRMHD snapshots in sync after
-[`update_data!`](@ref) slides the CPU-side window forward by one dump:
-slots 1 and 2 just get re-pointed at the snapshots already on the GPU,
-and only the genuinely new slot 3 is re-uploaded. Called from
-[`process_slowlight_images!`](@ref) after each `update_data!` call, when
-`engine = :GPU`.
-
-# Arguments
-- `gpu_data`: 3-element vector of GPU-resident snapshots, overwritten in
-  place.
-- `simulation_data`: 3-element window of loaded (CPU) GRMHD snapshots,
-  already advanced by [`update_data!`](@ref).
-
-# Returns
-- `gpu_data`.
-"""
-function refresh_gpu_data!(gpu_data, simulation_data)
-    gpu_data[1] = gpu_data[2]
-    gpu_data[2] = gpu_data[3]
-    gpu_data[3] = upload_gpu_snapshot(simulation_data[3])
-    return gpu_data
-end
-
-"""
     process_slowlight_images!(params_slowlight, simulation_data, all_geodesics, nsteps, model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path)
 
 Render a slow-light movie: repeatedly integrate the (already-traced)
@@ -369,7 +310,7 @@ function process_slowlight_images!(
         println("Preparing GPU workspace...")
         max_nstep = maximum(nsteps)
         tile_height = gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
-        gpu_data = init_gpu_data(simulation_data)
+        gpu_data = [Utils_GPU.copy_iharm_to_gpu(d) for d in simulation_data]
         println("GPU tiling: $(cld(pixels_y, tile_height)) tile(s) of height $tile_height (image is $(pixels_x)x$(pixels_y), up to $max_nstep steps/pixel)")
     end
 
@@ -447,7 +388,7 @@ function process_slowlight_images!(
         end
         update_data!(params_slowlight, simulation_data, Rhigh, model, all_dumps_path)
         if engine === :GPU
-            refresh_gpu_data!(gpu_data, simulation_data)
+            gpu_data[1], gpu_data[2], gpu_data[3] = gpu_data[2], gpu_data[3], Utils_GPU.copy_iharm_to_gpu(simulation_data[3])
         end
     end
 end

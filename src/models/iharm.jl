@@ -769,7 +769,7 @@ time via the tuple's length, unlike the `Vector` method's runtime
     else
         dataA, dataB = data[2], data[3]
     end
-    tinterp = 1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t)
+    tinterp = clamp(1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t), 0.0, 1.0)
     return dataA, dataB, tinterp
 end
 
@@ -796,66 +796,41 @@ density) at position `X`.
 end
 
 """
-    get_sigma_smoothfac(sigma, model)
+      get_model_ne(zone, X, model, data)
 
-Compute the smooth cutoff factor that tapers the electron density to zero
-as the magnetization `sigma` approaches `model.sigma_cut`/
-`model.sigma_cut_high`, avoiding a hard discontinuity at the cutoff.
+  Interpolate the electron number density at position `X`, with the magnetization
+  cut applied if `USE_GEODESIC_SIGMACUT` is enabled: no emission where sigma is at or
+  above `sigma_cut`. If `sigma_cut_high > sigma_cut`, the cut moves to
+  `sigma_cut_high` and the density fades out smoothly (cosine) between the two.
 
-# Arguments
-- `sigma`: Magnetization at the position of interest.
-- `model`: Iharm model parameters (`model.sigma_cut`,
-  `model.sigma_cut_high`).
+  (ipole zeroes everything above `sigma_cut` before its taper is reached, so its
+  `sigma_cut_high` has no effect. ==.)
 
-# Returns
-- `1` well below the cutoff, `0` well above it, and a smooth cosine
-  taper in between.
-"""
-function get_sigma_smoothfac(sigma, model::IharmParams)
-    T = typeof(sigma)
-    sigma_above = model.sigma_cut
-    if model.sigma_cut_high > 0.0
-        sigma_above = model.sigma_cut_high
-    end
-    if sigma < model.sigma_cut
-        return one(T)
-    end
-    if sigma >= sigma_above
-        return zero(T)
-    end
-    dsig = sigma_above - model.sigma_cut
-    return cos(π / 2.0 / dsig * (sigma - model.sigma_cut))
-end
+  # Arguments
+  - `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
+  - `X`: Position four-vector in internal coordinates.
+  - `model`: Iharm model parameters.
+  - `data`: GRMHD snapshot(s).
 
-"""
-    get_model_ne(zone, X, model, data)
-
-Interpolate the electron number density at position `X`, applying the
-geodesic magnetization cutoff (via [`get_model_sigma`](@ref)/
-[`get_sigma_smoothfac`](@ref)) if `USE_GEODESIC_SIGMACUT` is enabled.
-
-# Arguments
-- `zone`: A `Grid.ZoneLoc` struct containing the zone indices, interpolation weights, and domain flag.
-- `X`: Position four-vector in internal coordinates.
-- `model`: Iharm model parameters.
-- `data`: GRMHD snapshot(s).
-
-# Returns
-- The electron number density, or `0` if `X` is outside the grid or above
-  the magnetization cutoff.
-"""
-@inline function get_model_ne(zone::Grid.ZoneLoc, X, model::IharmParams, data)
-    T = promote_type(typeof(zone.del2), eltype(data[1].ne))
-    !zone.in_domain && return zero(T)
-    sigma_smoothfac = one(T)
-    if USE_GEODESIC_SIGMACUT
-        sigma = get_model_sigma(zone, X, model, data)
-        MaxwellJuettnerPol.primal(sigma) > model.sigma_cut && return zero(T)
-        sigma_smoothfac = get_sigma_smoothfac(sigma, model)
-    end
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.ne, dataB.ne, tfac, model.slow_light) * sigma_smoothfac
-end
+  # Returns
+  - The electron number density, or `0` if `X` is outside the grid or above
+    the magnetization cutoff.
+  """
+  @inline function get_model_ne(zone::Grid.ZoneLoc, X, model::IharmParams, data)
+      T = promote_type(typeof(zone.del2), eltype(data[1].ne))
+      !zone.in_domain && return zero(T)
+      sigma_smoothfac = one(T)
+      if USE_GEODESIC_SIGMACUT
+          sigma = get_model_sigma(zone, X, model, data)
+          sigma_above = max(model.sigma_cut, model.sigma_cut_high)
+          MaxwellJuettnerPol.primal(sigma) >= sigma_above && return zero(T)
+          if sigma >= model.sigma_cut
+              sigma_smoothfac = cos(π / 2.0 / (sigma_above - model.sigma_cut) * (sigma - model.sigma_cut))
+          end
+      end
+      dataA, dataB, tfac = set_tinterp_ns(X, model, data)
+      return Grid.interp_scalar_time(zone, dataA.ne, dataB.ne, tfac, model.slow_light) * sigma_smoothfac
+  end
 
 """
     get_model_thetae(zone, X, model, data)

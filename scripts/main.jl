@@ -311,10 +311,7 @@ else
 
     advance_dump_path! = () -> (params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path))
 
-    simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 3)
-    simulation_data[1] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
-    simulation_data[2] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
-    simulation_data[3] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data = [Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!) for _ in 1:3]
 
     params_slowlight.tA = simulation_data[1].t
     params_slowlight.tB = simulation_data[2].t
@@ -331,84 +328,14 @@ else
 
     println("Tracing geodesics (dump-independent; traced once for the whole slow-light run)...")
 
-    dummy_svec = zero(SVector{4,Float64})
-    dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
-
-    nbuf = Threads.nthreads()
-    traj_pool = Channel{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(nbuf)
-    for _ in 1:nbuf
-        put!(traj_pool, fill(dummy_traj, maxnstep))
-    end
-
-    all_geodesics = Matrix{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(undef, pixels_x, pixels_y)
-    nsteps = zeros(Int, pixels_x, pixels_y)
-
-    row_t0 = zeros(Float64, pixels_x)
-    row_tgeoi = fill(-1e100, pixels_x)
-    row_tgeof = zeros(Float64, pixels_x)
-
-    p = Progress(pixels_x * pixels_y; desc="Tracing geodesics...", showspeed=true, barlen=30)
-    progress_lock = ReentrantLock()
-    #Calculate the geodesic in slowlight has to be done first.
-    Threads.@threads :greedy for i in 0:(pixels_x - 1)
-        #my_traj = row_trajs[i + 1]
-        my_traj = take!(traj_pool)
-        for j in 0:(pixels_y - 1)
-            nstep, _ = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, Econ, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
-
-            nsteps[i + 1, j + 1] = nstep
-            all_geodesics[i + 1, j + 1] = my_traj[1:nstep]
-
-            final_step_time = my_traj[nstep].X[1]
-            if final_step_time < row_t0[i + 1]
-                row_t0[i + 1] = final_step_time
-            end
-
-            pixel_tgeoi = 1.0
-            pixel_tgeof = 1.0
-            for k in 1:nstep
-                X = my_traj[k].X
-                K = my_traj[k].Kcon
-
-                log_r = X[2]
-                t_coord = X[1]
-                k_r = K[2]
-
-                if pixel_tgeoi > 0.0 && log_r < log(100.0)
-                    pixel_tgeoi = t_coord
-                end
-                if pixel_tgeof > 0.0 && log_r > log(100.0) && k_r < 0.0
-                    pixel_tgeof = t_coord
-                end
-            end
-
-            if pixel_tgeoi < 0.0 && pixel_tgeoi > row_tgeoi[i + 1]
-                row_tgeoi[i + 1] = pixel_tgeoi
-            end
-            if pixel_tgeof < 0.0 && pixel_tgeof < row_tgeof[i + 1]
-                row_tgeof[i + 1] = pixel_tgeof
-            elseif pixel_tgeof > 0.0 && final_step_time < row_tgeof[i + 1]
-                row_tgeof[i + 1] = final_step_time
-            end
-        end
-        lock(progress_lock) do
-            ProgressMeter.next!(p; step = pixels_y)
-        end
-        put!(traj_pool, my_traj)
-    end
-    finish!(p)
-
-    t0 = minimum(row_t0)
-    tgeof = minimum(row_tgeof)
-    tgeoi = maximum(row_tgeoi)
+    all_geodesics, nsteps, _, t0, tgeof, tgeoi = Jipole.Slowlight.trace_slowlight(model, Xcamera, Econ, fovx, fovy, freq_unitless,
+        pixels_x, pixels_y, maxnstep, Rh, xoff, yoff)
 
     println("Calculated t0 (absolute longest time): $t0")
     println("Calculated tgeof (oldest active time): $tgeof")
     println("Calculated tgeoi (newest active time): $tgeoi")
-
-    traj_pool = nothing
     GC.gc()
-
+    
     #Finally generate the image
     println("Starting slow-light image processing loop...")
     Jipole.Slowlight.process_slowlight_images!(

@@ -19,8 +19,8 @@ using LinearAlgebra
 using ..Constants
 using ..AbstractModels
 
-export get_theta_from_x, bl_to_ks, vec_to_ks, set_ks_jacobian,
-    gcov_ks, set_ks_jacobian_inverse, vec_from_ks, bl_coord, flip_index
+export get_theta_from_x, bl_to_ks, set_ks_jacobian,
+      set_ks_jacobian_inverse, vec_from_ks, bl_coord, flip_index
 
 """
     get_theta_from_x(X, model)
@@ -82,34 +82,6 @@ function bl_to_ks(X, ucon_bl, bhspin, model)
     return ucon_ks
 end
 
-
-
-"""
-    vec_to_ks(X, v_nat, model)
-
-Convert a 4-vector from the native (internal) coordinate system to
-Kerr-Schild coordinates.
-
-# Arguments
-- `X`: Position four-vector in internal coordinates.
-- `v_nat`: 4-vector in the native coordinate system.
-- `model`: Model parameters, used to select the coordinate mapping.
-
-# Returns
-- The 4-vector in Kerr-Schild coordinates.
-"""
-function vec_to_ks(X, v_nat, model)
-    v_ks = zero(MVector{4,Float64})
-    dxdX = set_ks_jacobian(X, model)
-
-    for μ in 1:Constants.NDIM
-        for ν in 1:Constants.NDIM
-            v_ks[μ] += dxdX[μ, ν] * v_nat[ν]
-        end
-    end
-
-    return v_ks
-end
 
 """
     set_ks_jacobian(X, model)

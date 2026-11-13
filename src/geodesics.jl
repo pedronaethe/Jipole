@@ -23,7 +23,7 @@ using ..DebugFunctions
 export init_kcon, get_pixel, models_and_mks_connection_analytic,
     fmks_connection_analytic, get_connection_analytic, get_connection_analytic!,
     compute_dkcon, push_photon, push_photon!, get_connection, stepsize,
-    stop_backward_integration, trace_geodesic
+    stop_backward_integration, trace_geodesic!, count_midplane_crossings
 
 """
     init_kcon(i, j, Econ, nx, ny, fovx, fovy, xoff=0, yoff=0)
@@ -51,15 +51,15 @@ always the camera position, so no position output is needed. GPU-safe.
 end
 
 """
-    get_pixel(traj, i, j, Xcam, Econ, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0)
+    get_pixel(traj, i, j, Xcam, Econ, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0,
+yoff=0)
 
-Trace the geodesic for camera pixel `(i, j)`, filling `traj` with the
-trajectory steps.
-
-The function initializes the four-position and four-momentum of the photon, then calls [`trace_geodesic`](@ref) to perform the integration. The trajectory is stored in `traj`, which is a vector of `OfTrajS` structs.
+Trace the geodesic of camera pixel (i, j) into `traj` with [`trace_geodesic!`](@ref)
+and count its midplane crossings. If running on CPU and `traj` fills up before the photon
+stops, it is doubled and the pixel traced again, up to `MAX_TRAJ_POINTS` points.
 
 # Arguments
-- `traj`: Output trajectory vector, filled by [`trace_geodesic`](@ref).
+- `traj`: Trajectory buffer, filled by [`trace_geodesic!`](@ref); grown if too short.
 - `i`, `j`: Pixel indices in the image plane.
 - `Xcam`: Camera position in internal coordinates.
 - `Econ`: Camera tetrad (`Tetrads.make_camera_tetrad`), built once per image.
@@ -73,20 +73,29 @@ The function initializes the four-position and four-momentum of the photon, then
 - `xoff`, `yoff`: Image plane offsets.
 
 # Returns
-- A tuple `(nstep, midplane_crossings)`.
+- `(nstep, midplane_crossings)`: points stored, and how many times the ray crosses
+the equatorial plane ([`count_midplane_crossings`](@ref)).
 """
-function get_pixel(traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j, Xcam::AbstractVector{T}, Econ, fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0) where {T}
+function get_pixel(traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j, Xcam::AbstractVector{T}, Econ,
+fovx, fovy, freq, nx, ny, bhspin, Rh, Rstop, model, xoff=0, yoff=0) where {T}
     X = SVector{4,T}(Xcam)
     Kcon = init_kcon(i, j, Econ, nx, ny, fovx, fovy, xoff, yoff) * freq
+    max_points = 50000
 
-    nstep, midplane_crossings = trace_geodesic(X, Kcon, traj, i, j, bhspin, Rh, Rstop, model)
+    nstep, truncated = trace_geodesic!(traj, X, Kcon, bhspin, Rh, Rstop, model)
+    while truncated && length(traj) < max_points
+        @warn "Trajectory array length exceeded at pixel ($i, $j)."
+        resize!(traj, min(2 * length(traj), max_points))
+        nstep, truncated = trace_geodesic!(traj, X, Kcon, bhspin, Rh, Rstop, model)
+    end
 
-    if nstep >= (50000 - 1)
+    if truncated
         @error "Photon orbit trapped at pixel ($i, $j). Reached max $nstep steps."
     end
 
-    return nstep, midplane_crossings
+    return nstep, count_midplane_crossings(traj, nstep, model)
 end
+
 
 
 """
@@ -708,7 +717,7 @@ function stop_backward_integration(X, Kcon, Rh::Float64, Rstop::Float64)
 end
 
 """
-    trace_geodesic(Xi, Kconi, traj, i, j, bhspin, Rh, Rstop, model)
+    trace_geodesic!(Xi, Kconi, traj, i, j, bhspin, Rh, Rstop, model)
 
 Trace the photon geodesic backward from the camera, starting at position
 `Xi` with 4-momentum `Kconi`, filling `traj` with the trajectory steps.
@@ -727,56 +736,42 @@ Trace the photon geodesic backward from the camera, starting at position
 # Returns
 - A tuple `(nstep, midplane_crossings)`.
 """
-function trace_geodesic(Xi::SVector{4,T}, Kconi::SVector{4,T}, traj::Vector{GeoTypes.OfTrajGeneric{T}}, i, j, bhspin, Rh, Rstop, model) where {T}
-    X = Xi
-    Kcon = Kconi
-
-    traj[1] = GeoTypes.OfTrajGeneric{T}(zero(T), Xi, Kconi, Xi, Kconi)
-
-    midplane_crossings = 0
-    _, th = Coordinates.bl_coord(Xi, model)
-    position_in_midplane = th > π / 2 ? 1 : 0
-
+@inline function trace_geodesic!(traj::AbstractVector{P}, X::SVector{4,T}, Kcon::SVector{4,T},
+bhspin, Rh, Rstop, model) where {P,T}
+    nmax = length(traj)
+    Xhalf = X
+    Kconhalf = Kcon
     nstep = 1
-    #lconn = MArray{Tuple{4,4,4},Float64,3,64}(undef)
-    ABSOLUTE_MAX = 50000
-
-    while (stop_backward_integration(X, Kcon, Rh, Rstop) == 0) && (nstep < ABSOLUTE_MAX)
-        if nstep >= length(traj)
-            @warn "Trajectory array length exceeded at pixel ($i, $j)."
-            resize!(traj, length(traj) * 2)
-
-            dummy = @SVector zeros(4)
-            for k in (nstep+1):length(traj)
-                traj[k] = GeoTypes.OfTrajGeneric{T}(zero(T), dummy, dummy, dummy, dummy)
-            end
-        end
-
+    @inbounds while stop_backward_integration(X, Kcon, Rh, Rstop) == 0 && nstep < nmax
         dl = stepsize(X, Kcon, model.cstartx, model.cstopx)
-        unit_dl = dl * model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
-
-        traj[nstep] = GeoTypes.OfTrajGeneric{T}(unit_dl, traj[nstep].X, traj[nstep].Kcon, traj[nstep].Xhalf, traj[nstep].Kconhalf)
-
-        _, th = Coordinates.bl_coord(X, model)
-        if (position_in_midplane == 1) && (th <= π / 2)
-            position_in_midplane = 0
-            midplane_crossings += 1
-        elseif (position_in_midplane == 0) && (th > π / 2)
-            position_in_midplane = 1
-            midplane_crossings += 1
-        end
-
-        new_X, new_Kcon, Xhalf, Kconhalf = push_photon(X, Kcon, -dl, bhspin, model)
-
+        traj[nstep] = P(dl * model.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2), X, Kcon, Xhalf, Kconhalf)
+        X, Kcon, Xhalf, Kconhalf = push_photon(X, Kcon, -dl, bhspin, model)
         nstep += 1
-
-       traj[nstep] = GeoTypes.OfTrajGeneric{T}(zero(T), new_X, new_Kcon, Xhalf, Kconhalf)
-
-        X = new_X
-        Kcon = new_Kcon
     end
+    @inbounds traj[nstep] = P(zero(T), X, Kcon, Xhalf, Kconhalf)
+    truncated = stop_backward_integration(X, Kcon, Rh, Rstop) == 0
+    return nstep, truncated
+end
 
-    return nstep, midplane_crossings
+"""
+    count_midplane_crossings(traj, nstep, model)
+
+Number of times a stored trajectory crosses the equatorial plane (θ = π/2),
+checked at points 1 to nstep-1, as the old tracer counted them. It only reads the
+stored positions, so it works on any trajectory (also one pixel's slice of the GPU
+buffer) and with dual numbers. Does not allocate.
+"""
+@inline function count_midplane_crossings(traj, nstep, model)
+    @inbounds _, th = Coordinates.bl_coord(traj[1].X, model)
+    below = th > π / 2
+    crossings = 0
+    @inbounds for k in 2:(nstep - 1)
+        _, th = Coordinates.bl_coord(traj[k].X, model)
+        now_below = th > π / 2
+        crossings += (now_below != below)
+        below = now_below
+    end
+    return crossings
 end
 
 end

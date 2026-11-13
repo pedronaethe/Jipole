@@ -77,21 +77,19 @@ intensity to a flux density in Jankys (JY).
 end
 
 """
-    raytrace_image_gpu!(d_traj, d_Image, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
-        Xcam, Econ, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rout, Rstop, data, params)
+    raytrace_image_gpu!(d_traj, d_Image, d_pol, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
+        Xcam, Econ, Ecov, bhspin, nx, ny, freq, fovx, fovy, Rstop, qu_conv, data, params)
 
-GPU kernel that raytraces one tile of the image plane, launch it with `@cuda`.
-Its method lives in the `JipoleCUDAExt` extension, so `using CUDA` must come first.
+GPU kernel that raytraces one tile of the image, unpolarized (`d_pol = nothing`) or
+polarized.
 """
 function raytrace_image_gpu! end
 
 """
     render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-        nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
+        pol=nothing, qu_conv=0, nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
 
-Raytrace the full image on the GPU tile by tile into the host array `Image`. A tile with a
-truncated geodesic is re-run with `nmaxstep` doubled, up to `nmaxstep_ceiling`. Returns the
-`nmaxstep` finally used. Its method lives in the `JipoleCUDAExt` extension.
+Raytrace the full image on the GPU tile by tile into the host array `Image`.
 """
 function render_image_gpu! end
 

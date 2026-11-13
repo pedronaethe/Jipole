@@ -705,7 +705,7 @@ to `traj[n-1]`, the half-step point is stored in `traj[n]` and the step length
 in `traj[n-1]`.
 
 # Arguments
-- `traj`: Geodesic trajectory, as filled by `Geodesics.trace_geodesic`.
+- `traj`: Geodesic trajectory, as filled by `Geodesics.trace_geodesic!`.
 - `nsteps`: Number of points in the trajectory.
 - `freq`: Observing frequency [Hz].
 - `bhspin`: Dimensionless black hole spin parameter.

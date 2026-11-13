@@ -24,13 +24,16 @@ struct OfTrajGeneric{T}
 end
 
 """
-Geodesic step for GPU. 
+Geodesic step for the GPU, without the half-step point, to save
+GPU memory.
 """
 struct GPUTrajStep{T}
-      dl::T
-      X::SVector{4,T}
-      Kcon::SVector{4,T}
-  end
+    dl::T
+    X::SVector{4,T}
+    Kcon::SVector{4,T}
+end
 
+# Construct of GPUTrajStep, such that the same type can be used in GPU
+GPUTrajStep{T}(dl, X, Kcon, Xhalf, Kconhalf) where {T} = GPUTrajStep{T}(dl, X, Kcon)
 
 end

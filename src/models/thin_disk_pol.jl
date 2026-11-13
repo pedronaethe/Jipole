@@ -167,7 +167,7 @@ Number of trajectory points ipole would have stored for this ray. ipole treats
 the disk as opaque by ending the backward geodesic integration shortly behind
 it (the `THIN_DISK` block of `stop_backward_integration`): once a step ends
 across the emitting midplane from its half-step point, three more points are
-taken and the integration stops. Jipole's `trace_geodesic` has no such rule and
+taken and the integration stops. Jipole's `trace_geodesic!` has no such rule and
 runs on to the horizon or the outer boundary, so the polarized integration
 starts from this index instead of from the end of the stored trajectory. The
 geodesic itself is identical up to that point.

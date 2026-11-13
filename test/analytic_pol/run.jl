@@ -92,7 +92,7 @@ end
 """
 Trace the ray of pixel (0, 0) of a 2x2 image backward from the camera to r = Rh, with the
 geodesic integrator and step-size function of the main code, storing it as
-`Geodesics.trace_geodesic` does. (That routine is not used because its stop test is written for
+`Geodesics.trace_geodesic!` does. (That routine is not used because its stop test is written for
 a logarithmic radial coordinate.) As in ipole's INTEGRATOR_TEST the wavevector is not scaled by
 the frequency.
 """

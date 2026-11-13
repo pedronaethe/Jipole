@@ -1,24 +1,23 @@
-# Polarized GPU kernel, checked without a GPU.
+# GPU image kernel, checked without a GPU.
 #
-# The per-pixel body of the polarized GPU kernel (calculate_image_pol! in
-# ext/polarized_kernel.jl) contains nothing CUDA-specific: it reads and writes arrays and
-# calls the same routines as the CPU path. It is run here on the CPU, with ordinary arrays in
-# place of CUDA device arrays, and must reproduce the image of the CPU path
-# (ImagingPol.raytrace_image_pol). That covers what is specific to the kernel: its trajectory
-# layout (step length stored with the far point, no half-step values), the recomputation of
-# the half-step point, and the unpolarized update it carries alongside.
+# The per-pixel body of the GPU kernel (calculate_image! in ext/JipoleCUDAExt.jl) contains
+# nothing CUDA-specific: it reads and writes arrays and calls the same routines as the CPU path.
+# It is run here on the CPU, with ordinary arrays in place of CUDA device arrays, in polarized
+# mode, and must reproduce the image of the CPU path (ImagingPol.raytrace_image_pol). That
+# covers what is specific to the kernel: its trajectory layout (no half-step values), the
+# recomputation of the half-step point, and the unpolarized update it carries alongside.
 #
-# Then the whole kernel (raytrace_image_gpu_pol!) is compiled for an NVIDIA target with
-# GPUCompiler, the compiler CUDA.jl uses, and its validation is run on the result: it reports
-# anything a GPU kernel cannot contain (dynamic dispatch, heap allocation, calls into the Julia
-# runtime). No GPU is needed for that, only for linking and running, which are skipped. The
-# existing unpolarized kernel, which is known to run on GPUs, goes through the same check as a
-# control.
+# Then the kernel (Imaging.raytrace_image_gpu!) is compiled for an NVIDIA target with
+# GPUCompiler, the compiler CUDA.jl uses, in both modes (a polarized output array, or nothing
+# for an unpolarized image), and its validation is run on the result: it reports anything a GPU
+# kernel cannot contain (dynamic dispatch, heap allocation, calls into the Julia runtime). No GPU
+# is needed for that, only for linking and running, which are skipped.
 #
 # CUDA.jl loads on a machine without a GPU. What this test cannot cover is linking the kernel
 # against NVIDIA's libraries, launching it, and its results on a GPU.
 #
 # Usage: julia --project=scripts run.jl
+
 using Jipole
 using CUDA
 using StaticArrays
@@ -55,14 +54,14 @@ pol_k = zeros(Jipole.Polarization.NIMG, nx, nx)
 truncated = zeros(Bool, nx, nx)
 gpu_like_data = (data[1],)
 function run_kernel_body!(traj, unpol_k, pol_k, truncated, model, gpu_like_data, ro, th, phi, freq, fov, nx, nmaxstep)
-    # Camera position and tetrad, built once per image as render_image_gpu_pol! does.
+    # Camera position and tetrad, built once per image as render_image_gpu! does.
     Xcam = SVector{4,Float64}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
     _, Econ, Ecov = Jipole.Tetrads.make_camera_tetrad(Xcam, model.a, model)
     Econ = SMatrix{4,4,Float64,16}(Econ)
     Ecov = SMatrix{4,4,Float64,16}(Ecov)
     for i in 0:nx-1, j in 0:nx-1
-        ext.calculate_image_pol!(traj, unpol_k, pol_k, truncated, Xcam, Econ, Ecov, model.a, nx, nx, nmaxstep,
-            i, j, i + 1, j + 1, freq, fov, fov, model.rmax_geo, 0, model, gpu_like_data)
+        ext.calculate_image!(traj, unpol_k, pol_k, truncated, Xcam, Econ, Ecov, model.a, nx, nx,
+              i, j, i + 1, j + 1, freq, fov, fov, model.rmax_geo, 0, model, gpu_like_data)
     end
 end
 run_kernel_body!(traj, unpol_k, pol_k, truncated, model, gpu_like_data, ro, th, phi, freq, fov, nx, nmaxstep)
@@ -128,17 +127,17 @@ end
 
 # Tile offsets and sizes; then, after the camera arguments, bhspin, nx, ny, nmaxstep, freq, fovx, fovy.
 head = (Int64, Int64, Int64, Int64)
-tail = (Float64, Int64, Int64, Int64, Float64, Float64, Float64)
+tail = (Float64, Int64, Int64, Float64, Float64, Float64)
 CamPos = SVector{4,Float64}
 CamTetrad = SMatrix{4,4,Float64,16}
-tt_unpol = Tuple{TrajArray,DeviceArray(Float64, 2),DeviceArray(Bool, 2),head...,CamPos,CamTetrad,tail...,Float64,Float64,Tuple{DeviceData},typeof(model)}
+tt_unpol = Tuple{TrajArray,DeviceArray(Float64, 2),Nothing,DeviceArray(Bool, 2),head...,CamPos,CamTetrad,CamTetrad,tail...,Float64,Int64,Tuple{DeviceData},typeof(model)}
 tt_pol = Tuple{TrajArray,DeviceArray(Float64, 2),DeviceArray(Float64, 3),DeviceArray(Bool, 2),head...,CamPos,CamTetrad,CamTetrad,tail...,Float64,Int64,Tuple{DeviceData},typeof(model)}
 try
     errors_unpol, math_unpol = validate_kernel(Jipole.Imaging.raytrace_image_gpu!, tt_unpol)
-    errors_pol, math_pol = validate_kernel(ext.raytrace_image_gpu_pol!, tt_pol)
-    foreach(e -> println("      ", e), errors_pol)
-    report(isempty(errors_unpol), "control: the existing unpolarized kernel compiles for the GPU target with no validation error")
-    report(isempty(errors_pol), "the polarized kernel compiles for the GPU target with $(length(errors_pol)) validation error(s)")
+    errors_pol, math_pol = validate_kernel(Jipole.Imaging.raytrace_image_gpu!, tt_pol)
+    foreach(e -> println("      ", e), vcat(errors_unpol, errors_pol))
+    report(isempty(errors_unpol), "unpolarized mode compiles for the GPU target with $(length(errors_unpol)) validation error(s)")
+    report(isempty(errors_pol), "polarized mode compiles for the GPU target with $(length(errors_pol)) validation error(s)")
     println("info  math-library functions called by the polarized kernel: ", join(math_pol, " "))
     println("info  of which the unpolarized kernel does not call: ", join(setdiff(math_pol, math_unpol), " "))
 catch err

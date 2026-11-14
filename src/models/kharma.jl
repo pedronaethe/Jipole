@@ -5,7 +5,7 @@ Reader for native KHARMA dumps (Parthenon `.phdf` HDF5 files), following `ipole`
 Every emission, geodesic, output and GPU routine written for `Iharm`
 works on KHARMA dumps unchanged. Only the reading differs: KHARMA stores its grid and
 coordinate parameters in the input deck saved inside the dump, and its fluid variables
-split into meshblocks that have to be placed back on the global grid.
+ split into meshblocks, which are kept as they are.
 """
 module Kharma
 
@@ -15,6 +15,7 @@ using StaticArrays
 using ..Constants
 using ..Metrics
 using ..Iharm
+using ..Grid
 
 export is_kharma_dump, read_header, load_data
 
@@ -54,20 +55,7 @@ end
 
 function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0, beta_crit=1.0, sigma_cut=1.0, sigma_cut_high=-1.0, slow_light=false, M_unit=3.e26)
     println("Initializing grid from KHARMA dump: $filename")
-
-    params = Iharm.IharmParamsBuilder()
-    params.th_beg = th_beg
-    params.Rlow = Rlow
-    params.Rhigh = Rhigh
-    params.beta_crit = beta_crit
-    params.sigma_cut = sigma_cut
-    params.sigma_cut_high = sigma_cut_high
-    params.slow_light = slow_light
-
-    params.L_unit = Constants.GNEWT * MBH * Constants.MSUN / Constants.CL^2
-    params.T_unit = params.L_unit / Constants.CL
-    params.MBH = MBH
-    params.M_unit = M_unit
+    params = Iharm.IharmParamsBuilder(MBH; th_beg, Rlow, Rhigh, beta_crit, sigma_cut, sigma_cut_high, slow_light, M_unit)
 
     cstopx_2 = 0.0
 
@@ -134,55 +122,10 @@ function read_header(filename::String, MBH; th_beg=1.74e-2, Rlow=1.0, Rhigh=20.0
             params.mks_smooth = deck_value(deck, "coordinates", "mks_smooth", Float64)
             params.poly_xt = deck_value(deck, "coordinates", "poly_xt", Float64)
             params.poly_alpha = deck_value(deck, "coordinates", "poly_alpha", Float64)
-            params.poly_norm = 0.5 * π * 1.0 / (1.0 + 1.0 / (params.poly_alpha + 1.0) * 1.0 / (params.poly_xt^params.poly_alpha))
-            @printf(stderr, "FMKS parameters poly_xt: %f poly_alpha: %f mks_smooth: %f poly_norm: %f\n",
-                params.poly_xt, params.poly_alpha, params.mks_smooth, params.poly_norm)
         end
     end
 
-    # From here on, exactly as Iharm.read_header
-    params.rmax_geo = min(params.rmax_geo, params.Rout)
-    params.rmin_geo = max(params.rmin_geo, params.Rin)
-
-    params.stopx = MVector{4,Float64}(
-        1.0,
-        params.startx[2] + params.N1 * params.dx[2],
-        params.startx[3] + params.N2 * params.dx[3],
-        params.startx[4] + params.N3 * params.dx[4]
-    )
-
-    params.cstartx = MVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
-    params.cstopx = MVector{4,Float64}(0.0, 0.0, cstopx_2, 2 * π)
-    if params.metric != Metrics.METRIC_EKS
-        params.cstopx[2] = log(params.Rout)
-    end
-
-    @printf(stderr, "Grid start (startx): %.15e, %.15e, %.15e stop (stopx): %.15e, %.15e, %.15e\n",
-        params.startx[2], params.startx[3], params.startx[4], params.stopx[2], params.stopx[3], params.stopx[4])
-    @printf(stderr, "grid dx: %.15e, %.15e, %.15e\n", params.dx[2], params.dx[3], params.dx[4])
-
-    params.RHO_unit = params.M_unit / params.L_unit^3
-    params.U_unit = params.RHO_unit * Constants.CL^2
-    params.B_unit = Constants.CL * sqrt(4 * π * params.RHO_unit)
-
-    return Iharm.IharmParams(params)
-end
-
-function read_block_locations(file::HDF5.File, nblocks)
-    if haskey(file, "Blocks") && haskey(file["Blocks"], "loc.lx123")
-        locs = read(file["Blocks"]["loc.lx123"])
-    elseif haskey(file, "LogicalLocations")           # older Parthenon outputs
-        locs = read(file["LogicalLocations"])
-    else
-        error("KHARMA dump has no meshblock locations (Blocks/loc.lx123)")
-    end
-    size(locs) == (3, nblocks) || error("Meshblock locations have size $(size(locs)), expected (3, $nblocks)")
-
-    if haskey(file, "Blocks") && haskey(file["Blocks"], "loc.level")
-        levels = read(file["Blocks"]["loc.level"])
-        all(==(first(levels)), levels) || error("KHARMA dump uses mesh refinement, which is not supported")
-    end
-    return Int.(locs)
+   return Iharm.IharmParams(params, cstopx_2)
 end
 
 function block_view(A, c, mb, nb)
@@ -195,49 +138,56 @@ function block_view(A, c, mb, nb)
     end
 end
 
-function scatter_blocks!(dest, A, c, locs, nb)
-    nb1, nb2, nb3 = nb
-    Threads.@threads for mb in axes(locs, 2)
-        i0 = locs[1, mb] * nb1
-        j0 = locs[2, mb] * nb2
-        k0 = locs[3, mb] * nb3
-        dest[i0+1:i0+nb1, j0+1:j0+nb2, k0+1:k0+nb3] .= block_view(A, c, mb, nb)
-    end
-    return dest
-end
+"""
+    load_data(filename, Rhigh, model; advance_path! = nothing)
 
+Read a KHARMA dump and build its IharmData snapshot, keeping the meshblocks the dump is
+stored in (refined or not). The mesh is built from the block face coordinates saved in the
+dump, and each block's cells go into the inside of a block with one ghost layer;
+build_data then fills the ghosts from the neighbouring blocks.
+"""
 function load_data(filename::String, Rhigh, model::Iharm.IharmParams; advance_path!::Union{Nothing,Function}=nothing)
     println("Loading data from '$filename' into 'Kharma' module...")
     isfile(filename) || error("File not found: $filename")
 
-    t, fields = h5open(filename, "r") do file
+    t, fields, mesh = h5open(filename, "r") do file
         info = file["Info"]
         nblocks = Int(read_attribute(info, "NumMeshBlocks"))
         nb = Tuple(Int.(read_attribute(info, "MeshBlockSize")))
         if haskey(attributes(info), "IncludesGhost") && read_attribute(info, "IncludesGhost") != 0
             error("KHARMA dump was written with ghost zones, which is not supported")
         end
-        nblocks * prod(nb) == model.N1 * model.N2 * model.N3 ||
-            error("$nblocks meshblocks of size $nb do not tile the $(model.N1)×$(model.N2)×$(model.N3) mesh")
 
-        locs = read_block_locations(file, nblocks)
-        fields = [Array{Float64}(undef, model.N1, model.N2, model.N3) for _ in 1:8]
+        # Faces of every block in native coordinates, size (cells + 1, nblocks) in each direction.
+        # They define the mesh, so refinement levels never have to be read.
+        xf, yf, zf = read(file["Locations"]["x"]), read(file["Locations"]["y"]), read(file["Locations"]["z"])
+        size(xf) == (nb[1] + 1, nblocks) && size(yf) == (nb[2] + 1, nblocks) && size(zf) == (nb[3] + 1, nblocks) ||
+            error("KHARMA block faces have sizes $(size(xf)), $(size(yf)), $(size(zf)); expected (n + 1, $nblocks) for blocks of $nb cells")
+        mesh = Grid.BlockMesh([(view(xf, :, mb), view(yf, :, mb), view(zf, :, mb)) for mb in 1:nblocks], nb)
 
-        # Read each dataset once (HDF5 is not thread-safe); placing the blocks is threaded.
-        scatter_blocks!(fields[1], read(file["prims.rho"]), 1, locs, nb)
-        scatter_blocks!(fields[2], read(file["prims.u"]), 1, locs, nb)
-        uvec = read(file["prims.uvec"])
-        B = read(file["prims.B"])
-        for c in 1:3
-            scatter_blocks!(fields[2+c], uvec, c, locs, nb)
-            scatter_blocks!(fields[5+c], B, c, locs, nb)
+        # The blocks must cover exactly the domain of the input deck that read_header used
+        xmax = mesh.xmin .+ size(mesh.lookup) .* mesh.dfine
+        all(isapprox.(mesh.xmin, model.startx[2:4]; atol=1e-10)) && all(isapprox.(xmax, model.stopx[2:4]; atol=1e-10)) ||
+            error("KHARMA blocks span $(mesh.xmin) to $xmax, but the input deck gives $(model.startx[2:4]) to $(model.stopx[2:4])")
+
+        # Read each dataset once (HDF5 is not thread-safe), then copy every block of every field
+        # into the inside of its padded block, in parallel.
+        ng = mesh.ng
+        fields = [zeros(nb[1] + 2ng[1], nb[2] + 2ng[2], nb[3] + 2ng[3], nblocks) for _ in 1:8]
+        rho, u = read(file["prims.rho"]), read(file["prims.u"])
+        uvec, B = read(file["prims.uvec"]), read(file["prims.B"])
+        sources = ((rho, 1), (u, 1), (uvec, 1), (uvec, 2), (uvec, 3), (B, 1), (B, 2), (B, 3))
+        Threads.@threads for fm in CartesianIndices((8, nblocks))
+                        f, mb = Tuple(fm)
+            A, c = sources[f]
+            view(fields[f], ng[1]+1:ng[1]+nb[1], ng[2]+1:ng[2]+nb[2], ng[3]+1:ng[3]+nb[3], mb) .= block_view(A, c, mb, nb)
         end
 
-        Float64(read_attribute(info, "Time")), fields
+        Float64(read_attribute(info, "Time")), fields, mesh
     end
 
-    data = Iharm.build_data(t, fields..., Rhigh, model)
-    println("All primitives successfully loaded. Dimensions: ", size(data.RHO))
+    data = Iharm.build_data(t, fields..., mesh, Rhigh, model)
+    println("All primitives successfully loaded: $(size(data.RHO, 4)) blocks of size ", size(data.RHO)[1:3])
 
     advance_path! === nothing || advance_path!()
     return data

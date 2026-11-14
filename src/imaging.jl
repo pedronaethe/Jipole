@@ -13,8 +13,9 @@ using ..GeoTypes
 using ..Camera
 using ..Geodesics
 using ..Radiation
+using ..Tetrads
 
-export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image, calculate_gradients,  render_image_gpu!
+export output_stokes_parameters, calculate_scale_factor, raytrace_image_gpu!, raytrace_image,  render_image_gpu!
 
 """
     output_stokes_parameters(Image, freq_cgs, scale_factor, res, Dsource)
@@ -76,21 +77,23 @@ intensity to a flux density in Jankys (JY).
 end
 
 """
-    raytrace_image_gpu!(d_traj, d_Image, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
-        ro, θo, phi, bhspin, nx, ny, nmaxstep, freq, fovx, fovy, Rout, Rstop, data, params)
+    raytrace_image_gpu!(d_traj, d_Image, d_pol, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
+        Xcam, Econ, Ecov, bhspin, nx, ny, freq, fovx, fovy, Rstop, qu_conv, data, params)
 
-GPU kernel that raytraces one tile of the image plane, launch it with `@cuda`.
-Its method lives in the `JipoleCUDAExt` extension, so `using CUDA` must come first.
+GPU kernel that raytraces one tile of the image, unpolarized (`d_pol = nothing`) or
+polarized.
 """
 function raytrace_image_gpu! end
 
 """
     render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-        nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
+        pol=nothing, qu_conv=0, nmaxstep=16000)
 
-Raytrace the full image on the GPU tile by tile into the host array `Image`. A tile with a
-truncated geodesic is re-run with `nmaxstep` doubled, up to `nmaxstep_ceiling`. Returns the
-`nmaxstep` finally used. Its method lives in the `JipoleCUDAExt` extension.
+Raytrace the full image on the GPU into the host array `Image` (and `pol`), one square tile
+at a time, each as large as the free GPU memory holds geodesic buffers of `nmaxstep` points
+for ([`Utils_GPU.gpu_tile_plan`](@ref)). A geodesic longer than `nmaxstep` points is cut
+there, losing its emission beyond that point; a warning says how many were cut. Returns
+that number.
 """
 function render_image_gpu! end
 
@@ -124,40 +127,43 @@ function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pix
     T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a))
 
     Xcamera = SVector{4,T}(Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, _ = Tetrads.make_camera_tetrad(Xcamera, model.a, model)
     freq_unitless = freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
 
     Image = Matrix{T}(undef, pixels_x, pixels_y)
 
     println("Allocating workspaces for $pixels_x row-tasks...")
-    task_trajs = [Vector{GeoTypes.OfTrajGeneric{T}}(undef, maxnstep) for _ in 1:pixels_x]
+    nbuf = Threads.nthreads()
+    traj_pool = Channel{Vector{GeoTypes.OfTrajGeneric{T}}}(nbuf)
+    for _ in 1:nbuf
+        put!(traj_pool, Vector{GeoTypes.OfTrajGeneric{T}}(undef, maxnstep))
+    end
 
     p = Progress(pixels_x * pixels_y; desc = "Raytracing Image...", showspeed = true, barlen = 30)
     ProgressMeter.ijulia_behavior(:clear)
     progress_lock = ReentrantLock()
     println("Tracing Geodesics...")
     Threads.@threads :greedy for i in 0:(pixels_x - 1)
-        my_traj = task_trajs[i + 1]
+        my_traj = take!(traj_pool)
+        try
+            for j in 0:(pixels_y - 1)
+                nstep, _ = Geodesics.get_pixel(
+                    my_traj, i, j, Xcamera, Econ,
+                    fovx, fovy, freq_unitless,
+                    pixels_x, pixels_y, model.a,
+                    Rh, model.rmax_geo, model, xoff, yoff
+                )
 
-        for j in 0:(pixels_y - 1)
-            nstep, _ = Geodesics.get_pixel(
-                my_traj, i, j, Xcamera,
-                fovx, fovy, freq_unitless,
-                pixels_x, pixels_y, model.a,
-                Rh, model.rmax_geo, model, xoff, yoff
-            )
-
-            Radiation.integrate_emission!(
-                my_traj, nstep, Image,
-                i + 1, j + 1, freq, model.a, model, simulation_data
-            )
-
-            lock(progress_lock) do
-                if (i * pixels_y + j) % 2000 == 0
-                    ProgressMeter.next!(p; showvalues = [(:pixel, "($i, $j)"), (:total_done, "$(i*pixels_y + j)/$(pixels_x * pixels_y)")])
-                else
-                    ProgressMeter.next!(p)
-                end
+                Radiation.integrate_emission!(
+                    my_traj, nstep, Image,
+                    i + 1, j + 1, freq, model.a, model, simulation_data
+                )
             end
+            lock(progress_lock) do
+                ProgressMeter.next!(p; step = pixels_y)
+            end
+        finally
+            put!(traj_pool, my_traj)
         end
     end
     Image .*= freq^3

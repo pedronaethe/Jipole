@@ -1,0 +1,31 @@
+# Same run as ipole.par, for Jipole (read by run.jl; scripts/main.jl only drives GRMHD dumps).
+
+[disk]
+a = 0.99
+MBH = 10.0
+# Accretion rate as a fraction of Eddington, assuming 10% efficiency
+Mdot = 0.01
+# ipole's thin-disk model fixes the outer edge of the disk, and of the geodesics, at 100 r_g
+Rout = 100.0
+
+[camera]
+ro = 1.0e4
+theta_o = 75.0
+phi = 0.0
+
+[image]
+pixels_x = 80
+pixels_y = 80
+# Field of view in r_g
+dx = 40.0
+dy = 40.0
+
+[observing]
+freq = 2.417989e17
+source_distance_pc = 0.05
+
+[raytracing]
+maxnstep = 8000
+
+[output]
+filename = "output/jipole.h5"

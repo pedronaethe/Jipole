@@ -10,7 +10,7 @@ using ..Coordinates
 using ..Metrics
 using ..Utils
 
-export make_camera_tetrad, make_plasma_tetrad, null_normalize, tetrad_to_coordinate!, tetrad_to_coordinate
+export make_camera_tetrad, make_plasma_tetrad, null_normalize, tetrad_to_coordinate
 
 """
     make_camera_tetrad(X, bhspin, model)
@@ -69,7 +69,7 @@ along `b`, `e^3` is along the spatial part of `K`.
 - A tuple `(oddflag, Econ, Ecov)`.
 """
 function make_plasma_tetrad(Ucon, Kcon, Bcon, Gcov)
-    T = eltype(Ucon)
+    T = promote_type(eltype(Ucon), eltype(Kcon), eltype(Bcon), eltype(Gcov))
     ones_vector = SVector{4,T}(1.0, 1.0, 1.0, 1.0)
 
     e1 = Utils.set_econ_from_trial(1, Ucon)
@@ -162,32 +162,11 @@ function null_normalize(Kcon, fnorm)
     return SVector{4,T}(fnorm, Kcon[2] * scale, Kcon[3] * scale, Kcon[4] * scale)
 end
 
-"""
-    tetrad_to_coordinate!(Kcon, Econ, Kcon_tetrad)
-
-Convert a contravariant 4-vector from the tetrad frame to the coordinate
-frame.
-
-# Arguments
-- `Kcon`: Output vector, overwritten with the coordinate-frame 4-vector.
-- `Econ`: Tetrad basis vectors in covariant form.
-- `Kcon_tetrad`: Contravariant 4-vector in the tetrad frame.
-
-# Returns
-- `Kcon`.
-"""
-function tetrad_to_coordinate!(Kcon, Econ, Kcon_tetrad)
-    @inbounds for l in 1:4
-        Kcon[l] = Econ[1, l] * Kcon_tetrad[1] + Econ[2, l] * Kcon_tetrad[2] + Econ[3, l] * Kcon_tetrad[3] + Econ[4, l] * Kcon_tetrad[4]
-    end
-    return Kcon
-end
 
 """
     tetrad_to_coordinate(Econ, Kcon_tetrad)
 
-Non-mutating version of [`tetrad_to_coordinate!`](@ref), returning the
-coordinate-frame 4-vector directly instead of writing into a caller-
+Returning the coordinate-frame 4-vector directly instead of writing into a caller-
 supplied buffer.
 
 # Arguments

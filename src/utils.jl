@@ -8,7 +8,7 @@ using LinearAlgebra
 using HDF5
 using ..Constants
 
-export set_econ_from_trial, normalize_vector, project_out, levi_civita, check_handedness
+export set_econ_from_trial, normalize_vector, project_out, check_handedness
 
 
 """
@@ -174,22 +174,6 @@ function project_out(vcona, vconb, Gcov)
     T = promote_type(eltype(vcona), eltype(vconb), eltype(Gcov))
     return SVector{4,T}(vcona[1] - vconb[1] * fac, vcona[2] - vconb[2] * fac,
         vcona[3] - vconb[3] * fac, vcona[4] - vconb[4] * fac)
-end
-
-"""
-    levi_civita(i, j, k, l)
-
-Compute the (4-index) Levi-Civita symbol.
-
-# Arguments
-- `i`, `j`, `k`, `l`: Indices for which the Levi-Civita symbol is computed.
-
-# Returns
-- `0` if any two indices coincide, otherwise `+1`/`-1` depending on the
-  permutation parity.
-"""
-function levi_civita(i::Int, j::Int, k::Int, l::Int)
-    return (i == j || i == k || i == l || j == k || j == l || k == l) ? 0 : sign((i - j) * (k - l))
 end
 
 """

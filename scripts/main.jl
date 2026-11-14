@@ -87,6 +87,10 @@ if do_gradients
     isempty(unknown) || error("Unknown gradient parameter(s) $(unknown); choose from $(Jipole.Iharm.GRADIENT_PARAM_NAMES)")
 end
 
+# Polarized transfer (Stokes Q, U, V and Faraday depth). The [polarization] section is optional:
+# without it the run is unpolarized, exactly as before.
+const do_polarization = get(get(config, "polarization", Dict{String,Any}()), "on", false)
+
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
 const use_gpu = slow_light ? Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" : mode == "gpu"
@@ -140,19 +144,14 @@ if !slow_light
 
     
     Image = zeros(Float64, pixels_x, pixels_y)
-    if mode == "gpu"
-        # nmaxstep for the first GPU attempt. render_image_gpu! doubles it for any tile with a
-        # truncated geodesic, and the value it ends on carries over to the next dump.
-        gpu_maxnstep = 4000
-    elseif mode != "cpu"
-        error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
-    end
+    mode in ("cpu", "gpu") || error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
 
 
     #Loop through every file in the directory chosen.
     for current_dump_filepath in dump_files
         GC.gc()
         local model, simulation_data, Rh, DXsize, DYsize, fovx, fovy, Xcamera, p, scale_factor
+        local pol, grads_pol
         println("")
         println("Processing dump: $current_dump_filepath")
 
@@ -176,13 +175,23 @@ if !slow_light
 
         #Again, we have to separate CPU and GPU here, as they have different memory management strategies and different execution paths.
         if mode == "cpu"
-            if do_gradients
+            if do_gradients && do_polarization
+                ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
+                grad_image, pol, grads, grads_pol = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
+                      MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
+                      M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
+                      wrt=gradient_wrt, pol=true);
+                copyto!(Image, grad_image)
+            elseif do_gradients
                 ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
                 grad_image, grads = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
                     MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
                     M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
                     wrt=gradient_wrt);
                 copyto!(Image, grad_image)
+            elseif do_polarization
+                unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff)
+                copyto!(Image, unpol_image)
             else
                 copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
             end
@@ -192,8 +201,8 @@ if !slow_light
 
             println("Processing image in tiles...")
             gpu_time = @elapsed begin
-                global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                    nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                pol = do_polarization ? zeros(Float64, Jipole.Polarization.NIMG, pixels_x, pixels_y) : nothing
+                Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y; pol=pol)
             end
             @printf("GPU raytracing took %.3f s\n", gpu_time)
             println("Raytracing complete!")
@@ -208,6 +217,7 @@ if !slow_light
         (stokes_output_rd, stokes_output_wr) = redirect_stdout()
         try
             Jipole.Imaging.output_stokes_parameters(Image, freq, scale_factor, pixels_x, pixels_y, SourceD)
+            do_polarization && Jipole.ImagingPol.output_stokes_parameters_pol(pol, freq, scale_factor, SourceD)
         finally
             redirect_stdout(original_stdout)
         end
@@ -256,6 +266,10 @@ if !slow_light
         #Add gradients to the output data if they were calculated.
         do_gradients && (output_data["grads"] = grads)
 
+        #Add the polarized image, and its gradients, if they were calculated.
+        do_polarization && (output_data["pol"] = pol)
+        do_polarization && do_gradients && (output_data["grads_pol"] = grads_pol)
+
 
         # Determine the output filename based on whether we are processing a batch of dumps or a single dump.
         dump_index = batched ? Jipole.Utils.extract_dump_index(basename(current_dump_filepath)) : nothing
@@ -287,10 +301,7 @@ else
 
     advance_dump_path! = () -> (params_slowlight.current_dumps_path = Jipole.Slowlight.update_dump_path(params_slowlight, all_dumps_path))
 
-    simulation_data = Vector{Jipole.Iharm.IharmData{Float64,Array{Float64,3},Float64,Array{Float64,3}}}(undef, 3)
-    simulation_data[1] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
-    simulation_data[2] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
-    simulation_data[3] = Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!)
+    simulation_data = [Jipole.Iharm.load_data(params_slowlight.current_dumps_path, Rhigh, model; advance_path! = advance_dump_path!) for _ in 1:3]
 
     params_slowlight.tA = simulation_data[1].t
     params_slowlight.tB = simulation_data[2].t
@@ -302,87 +313,17 @@ else
     fovx = DXsize / ro
     fovy = DYsize / ro
     Xcamera = MVector{4,Float64}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, _ = Jipole.Tetrads.make_camera_tetrad(Xcamera, model.a, model)
     scale_factor = Jipole.Imaging.calculate_scale_factor(DXsize, DYsize, pixels_x, pixels_y, SourceD, model.L_unit)
 
     println("Tracing geodesics (dump-independent; traced once for the whole slow-light run)...")
 
-    dummy_svec = zero(SVector{4,Float64})
-    dummy_traj = Jipole.GeoTypes.OfTrajGeneric{Float64}(0.0, dummy_svec, dummy_svec, dummy_svec, dummy_svec)
-
-    row_trajs = [Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}(undef, maxnstep) for _ in 1:pixels_x]
-    for i in 1:pixels_x
-        for k in 1:maxnstep
-            row_trajs[i][k] = dummy_traj
-        end
-    end
-
-    all_geodesics = Matrix{Vector{Jipole.GeoTypes.OfTrajGeneric{Float64}}}(undef, pixels_x, pixels_y)
-    nsteps = zeros(Int, pixels_x, pixels_y)
-
-    row_t0 = zeros(Float64, pixels_x)
-    row_tgeoi = fill(-1e100, pixels_x)
-    row_tgeof = zeros(Float64, pixels_x)
-
-    p = Progress(pixels_x * pixels_y; desc="Tracing geodesics...", showspeed=true, barlen=30)
-    progress_lock = ReentrantLock()
-    #Calculate the geodesic in slowlight has to be done first.
-    Threads.@threads :greedy for i in 0:(pixels_x - 1)
-        my_traj = row_trajs[i + 1]
-
-        for j in 0:(pixels_y - 1)
-            nstep, _ = Jipole.Geodesics.get_pixel(my_traj, i, j, Xcamera, fovx, fovy, freq_unitless, pixels_x, pixels_y, model.a, Rh, model.rmax_geo, model, xoff, yoff)
-
-            nsteps[i + 1, j + 1] = nstep
-            all_geodesics[i + 1, j + 1] = my_traj[1:nstep]
-
-            final_step_time = my_traj[nstep].X[1]
-            if final_step_time < row_t0[i + 1]
-                row_t0[i + 1] = final_step_time
-            end
-
-            pixel_tgeoi = 1.0
-            pixel_tgeof = 1.0
-            for k in 1:nstep
-                X = my_traj[k].X
-                K = my_traj[k].Kcon
-
-                log_r = X[2]
-                t_coord = X[1]
-                k_r = K[2]
-
-                if pixel_tgeoi > 0.0 && log_r < log(100.0)
-                    pixel_tgeoi = t_coord
-                end
-                if pixel_tgeof > 0.0 && log_r > log(100.0) && k_r < 0.0
-                    pixel_tgeof = t_coord
-                end
-            end
-
-            if pixel_tgeoi < 0.0 && pixel_tgeoi > row_tgeoi[i + 1]
-                row_tgeoi[i + 1] = pixel_tgeoi
-            end
-            if pixel_tgeof < 0.0 && pixel_tgeof < row_tgeof[i + 1]
-                row_tgeof[i + 1] = pixel_tgeof
-            elseif pixel_tgeof > 0.0 && final_step_time < row_tgeof[i + 1]
-                row_tgeof[i + 1] = final_step_time
-            end
-
-            lock(progress_lock) do
-                ProgressMeter.next!(p; showvalues=[(:pixel, "($i, $j)"), (:total_done, "$(i * pixels_y + j)/$(pixels_x * pixels_y)")])
-            end
-        end
-    end
-    finish!(p)
-
-    t0 = minimum(row_t0)
-    tgeof = minimum(row_tgeof)
-    tgeoi = maximum(row_tgeoi)
+    all_geodesics, nsteps, _, t0, tgeof, tgeoi = Jipole.Slowlight.trace_slowlight(model, Xcamera, Econ, fovx, fovy, freq_unitless,
+        pixels_x, pixels_y, maxnstep, Rh, xoff, yoff)
 
     println("Calculated t0 (absolute longest time): $t0")
     println("Calculated tgeof (oldest active time): $tgeof")
     println("Calculated tgeoi (newest active time): $tgeoi")
-
-    row_trajs = nothing
     GC.gc()
 
     #Finally generate the image
@@ -391,7 +332,7 @@ else
         params_slowlight, simulation_data, all_geodesics, nsteps,
         model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path,
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
-        engine=slowlight_engine
+        engine=slowlight_engine, pol=do_polarization
     )
     println("Done!")
 end

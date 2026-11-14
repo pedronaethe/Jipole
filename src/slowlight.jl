@@ -16,6 +16,7 @@ using ..Iharm
 using ..Output
 using ..GeoTypes
 using ..Geodesics
+using ..Polarization
 using ..Utils_GPU
 using Dates
 export OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
@@ -117,63 +118,74 @@ function update_data!(params_slowlight::OfSlowLight, simulation_data, Rhigh::Flo
 end
 
 """
-    render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times,
-        pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
+      render_round_cpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, all_geodesics, valid_ks, target_times,
+          pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
 
-Render one round on the CPU: for every pixel and every currently-open
-frame in `valid_ks`, continue integrating intensity along that pixel's
-trajectory, threaded over pixels. Called from
-[`process_slowlight_images!`](@ref) when `engine = :CPU`.
+  Render one round on the CPU: for every pixel and every currently-open
+  frame in `valid_ks`, continue integrating intensity along that pixel's
+  trajectory, threaded over pixels. With `movie_N`/`movie_tauF` arrays (polarized
+  run) the coherency tensor and Faraday depth are carried along too, as in
+  ipole; with `nothing` the polarized code is not compiled in. Called from
+  [`process_slowlight_images!`](@ref) when `engine = :CPU`.
 
-# Arguments
-- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
-  in place.
-- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten
-  in place.
-- `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per
-  pixel.
-- `valid_ks`: Indices of the currently-active frames to render this
-  round.
-- `target_times`: Target simulation time for each frame.
-- `pixels_x`, `pixels_y`: Image resolution.
-- `params_slowlight`: Slow-light run state (time window `[tA, tB]`).
-- `freq`: Frequency, in cgs units.
-- `model`: Iharm model parameters.
-- `simulation_data`: 3-element window of loaded GRMHD snapshots.
+  # Arguments
+  - `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten in place.
+  - `movie_intensity`: Accumulated intensity per pixel/frame, overwritten in place.
+  - `movie_N`, `movie_tauF`: Coherency tensor and Faraday depth per pixel/frame,
+    overwritten in place, or `nothing` for an unpolarized run.
+  - `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per pixel.
+  - `valid_ks`: Indices of the currently-active frames to render this round.
+  - `target_times`: Target simulation time for each frame.
+  - `pixels_x`, `pixels_y`: Image resolution.
+  - `params_slowlight`: Slow-light run state (time window `[tA, tB]`).
+  - `freq`: Frequency, in cgs units.
+  - `model`: Iharm model parameters.
+  - `simulation_data`: 3-element window of loaded GRMHD snapshots.
 """
 function render_round_cpu!(
-    movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-    params_slowlight::OfSlowLight, freq, model, simulation_data
-)
-    p = Progress(length(valid_ks) * pixels_x * pixels_y;
-        desc = "Rendering $(length(valid_ks)) frame(s) this round on CPU...", showspeed = true, barlen = 30)
-    progress_lock = ReentrantLock()
+      movie_nstep, movie_intensity, movie_N, movie_tauF, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
+      params_slowlight::OfSlowLight, freq, model, simulation_data
+  )
+      polarized = movie_N !== nothing
+      Rh = 1 + sqrt(1.0 - model.a * model.a)
+      dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
 
-    Threads.@threads :greedy for i in 1:pixels_x
-        for j in 1:pixels_y
-            traj = all_geodesics[i, j]
-            for k in valid_ks
-                nstep = movie_nstep[i, j, k]
-                Intensity = movie_intensity[i, j, k]
-                dt = target_times[k] + 1e-5
+      p = Progress(length(valid_ks) * pixels_x * pixels_y;
+          desc = "Rendering $(length(valid_ks)) frame(s) this round on CPU...", showspeed = true, barlen = 30)
+      progress_lock = ReentrantLock()
 
-                while (nstep > 2)
-                    Xi = traj[nstep].X
-                    Xf = traj[nstep-1].X
-                    Kconi = traj[nstep].Kcon
-                    Kconf = traj[nstep-1].Kcon
+      Threads.@threads :greedy for i in 1:pixels_x
+          for j in 1:pixels_y
+              traj = all_geodesics[i, j]
+              for k in valid_ks
+                  nstep = movie_nstep[i, j, k]
+                  Intensity = movie_intensity[i, j, k]
+                  N = polarized ? movie_N[i, j, k] : Polarization.zero_tensor(Float64)
+                  tauF = polarized ? movie_tauF[i, j, k] : 0.0
+                  dt = target_times[k] + 1e-5
 
-                    Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
-                    Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
-                    if Xi[1] < params_slowlight.tA
-                        shift = params_slowlight.tA - Xi[1]
-                        Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
-                        Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
-                    end
-                    if Xi[1] >= params_slowlight.tB
+                  while (nstep > 2)
+                      Xi = traj[nstep].X
+                      Xf = traj[nstep-1].X
+                      Xh = traj[nstep].Xhalf
+                      Kconi = traj[nstep].Kcon
+                      Kconf = traj[nstep-1].Kcon
+
+                      # Move the step to the frame's time; the half-step point moves with it (as in ipole).
+                      Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
+                      Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
+                      Xh = SVector{4,Float64}(Xh[1] + dt, Xh[2], Xh[3], Xh[4])
+                      if Xi[1] < params_slowlight.tA
+                          shift = params_slowlight.tA - Xi[1]
+                          Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
+                          Xh = SVector{4,Float64}(Xh[1] + shift, Xh[2], Xh[3], Xh[4])
+                          Xi = SVector{4,Float64}(params_slowlight.tA, Xi[2], Xi[3], Xi[4])
+                      end
+                      if Xi[1] >= params_slowlight.tB
                         if Xf[1] >= params_slowlight.tf
                             shift = params_slowlight.tf - Xf[1]
                             Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
+                            Xh = SVector{4,Float64}(Xh[1] + shift, Xh[2], Xh[3], Xh[4])
                             Xf = SVector{4,Float64}(params_slowlight.tf, Xf[2], Xf[3], Xf[4])
                         else
                             break
@@ -185,60 +197,106 @@ function render_round_cpu!(
 
                     Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
 
+                    if polarized
+                        N, tauF = Polarization.polarized_step(N, tauF, Xi, Kconi, Xh, traj[nstep].Kconhalf, Xf, Kconf,
+                            traj[nstep-1].dl, dl_unit, Rh, freq, model.a, model, simulation_data)
+                    end
+
                     nstep -= 1
                 end
                 movie_nstep[i, j, k] = nstep
                 movie_intensity[i, j, k] = Intensity
+                if polarized
+                    movie_N[i, j, k] = N
+                    movie_tauF[i, j, k] = tauF
+                end
             end
         end
         lock(progress_lock) do
             ProgressMeter.next!(p; step = pixels_y * length(valid_ks))
-        end 
+        end
     end
     finish!(p)
     return nothing
 end
 
-"""
-    pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
+  """
+    flatten_rays(all_geodesics, nsteps)
 
-Each pixel's traced light ray has its own number of steps, so
-`all_geodesics` stores them as a list of differently-sized lists. The GPU
-instead needs one same-sized rectangular block. This function builds that
-block for one strip of the image (rows `j0` to `j1`): it copies each
-pixel's steps into `dest`, padding any leftover space with zeros for
-pixels whose ray was shorter than the longest one in the strip.
-
-Only one strip at a time, not the whole image, to keep memory use down --
-padding every pixel in the whole image to the single longest ray anywhere
-could need tens of GB. Called from [`render_round_gpu!`](@ref), once per
-strip per round.
+Put all rays back to back in one flat array, each at its own length, for the GPU.
+Pixels go in memory order (i fastest), so a block of image rows `j0:j1` is one
+contiguous slice. Padding every ray to the longest one instead took about 4.5 times
+more memory. Called once from [`process_slowlight_images!`](@ref) when `engine = :GPU`.
 
 # Arguments
-- `dest`: Output buffer, overwritten with the packed trajectories.
 - `all_geodesics`: Matrix of per-pixel geodesic trajectories.
 - `nsteps`: Matrix of trajectory lengths, one per pixel.
-- `pixels_x`: Image width.
-- `j0`, `j1`: Range of image rows to pack.
 
 # Returns
-- `dest`.
+- `(rays, offsets)`: the flat array, and where each pixel's ray starts in it
+(point `s` of pixel `(i, j)` is `rays[offsets[i, j] + s]`).
 """
-function pack_trajectory_tile!(dest, all_geodesics, nsteps, pixels_x, j0, j1)
-    zero_vec = SVector{4,Float64}(0.0, 0.0, 0.0, 0.0)
-    dummy = OfTrajGeneric{Float64}(0.0, zero_vec, zero_vec, zero_vec, zero_vec)
-    fill!(dest, dummy)
-    @inbounds for j in j0:j1, i in 1:pixels_x
-        traj = all_geodesics[i, j]
-        n = nsteps[i, j]
-        jj = j - j0 + 1
-        for s in 1:n
-            dest[i, jj, s] = traj[s]
-        end
+function flatten_rays(all_geodesics, nsteps)
+    offsets = similar(nsteps)
+    total = 0
+    for j in axes(nsteps, 2), i in axes(nsteps, 1)
+        offsets[i, j] = total
+        total += nsteps[i, j]
     end
-    return dest
+    rays = Vector{eltype(all_geodesics[1])}(undef, total)
+    for j in axes(nsteps, 2), i in axes(nsteps, 1)
+        copyto!(rays, offsets[i, j] + 1, all_geodesics[i, j], 1, nsteps[i, j])
+    end
+    return rays, offsets
 end
 
+
+"""
+    shifted_points(rays, off, nstep, dt, tA, tB, tf)
+
+The three points of one step of a stored ray (far end `nstep`, its half-step point, near
+end `nstep - 1`), moved to a frame's time (`dt` after the ray's own time) and clamped to
+the current data window, as in ipole (main.c:388–475): a step that starts before `tA` is
+moved up to `tA`, and one past `tB` either ends at `tf` or waits for the next round.
+Used by both passes of [`slowlight_kernel!`](@ref).
+
+# Arguments
+- `rays`: Stored ray points; point `s` of this ray is `rays[off + s]`.
+- `off`: Where this ray starts in `rays`.
+- `nstep`: The step's far end.
+- `dt`: The frame's target time plus `1e-5`.
+- `tA`, `tB`: Time window currently bracketed by the loaded dumps.
+- `tf`: Simulation time of the newest available dump.
+
+# Returns
+- `(Xi, Xh, Xf, stop)`: far end, half-step point and near end at the frame's time, and
+whether the step is past the window (the frame then stops here this round).
+"""
+@inline function shifted_points(rays, off, nstep, dt, tA, tB, tf)
+    @inbounds Xi = rays[off + nstep].X
+    @inbounds Xf = rays[off + nstep - 1].X
+    @inbounds Xh = rays[off + nstep].Xhalf
+    Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
+    Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
+    Xh = SVector{4,Float64}(Xh[1] + dt, Xh[2], Xh[3], Xh[4])
+    if Xi[1] < tA
+        shift = tA - Xi[1]
+        Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
+        Xh = SVector{4,Float64}(Xh[1] + shift, Xh[2], Xh[3], Xh[4])
+        Xi = SVector{4,Float64}(tA, Xi[2], Xi[3], Xi[4])
+    end
+    if Xi[1] >= tB
+        if Xf[1] >= tf
+            shift = tf - Xf[1]
+            Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
+            Xh = SVector{4,Float64}(Xh[1] + shift, Xh[2], Xh[3], Xh[4])
+            Xf = SVector{4,Float64}(tf, Xf[2], Xf[3], Xf[4])
+        else
+            return Xi, Xh, Xf, true
+        end
+    end     
+    return Xi, Xh, Xf, false
+end
 
 """
     trace_slowlight(model, Xcam, Econ, fovx, fovy, freq_unitless, pixels_x, pixels_y, maxnstep, Rh, xoff, yoff)
@@ -353,11 +411,13 @@ allows, until every requested frame has been produced.
 - `engine`: `:CPU` (default) integrates radiative transfer threaded over
   pixels on the CPU, exactly as before. `:GPU` runs the same physics on
   the GPU instead ([`render_round_gpu!`](@ref)/[`slowlight_kernel!`](@ref)).
+- `pol`: also render the polarized frames (Stokes I, Q, U, V and Faraday depth).
+- `qu_conv`: Q/U sign convention of the polarized frames, see `Polarization.save_pixel!`.
 """
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
     model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
-    engine::Symbol = :CPU
+    engine::Symbol = :CPU, pol::Bool = false, qu_conv::Int = 0
 )
     if engine === :GPU && isnothing(Base.get_extension(parentmodule(@__MODULE__), :JipoleCUDAExt))
         error("engine = :GPU needs CUDA.jl loaded: run `using CUDA` first")
@@ -380,6 +440,11 @@ function process_slowlight_images!(
 
     movie_nstep = zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
     movie_intensity = zeros(Float64, pixels_x, pixels_y, nimgs_concurrently)
+    # For polarization
+    movie_N = pol ? fill(Polarization.zero_tensor(Float64), pixels_x, pixels_y, nimgs_concurrently) : nothing
+    movie_tauF = pol ? zeros(Float64, pixels_x, pixels_y, nimgs_concurrently) : nothing
+    pol && println("Polarized frame state: $(round((sizeof(movie_N) + sizeof(movie_tauF)) / 1024^3, digits=2)) GB")
+    #
     target_times = zeros(Float64, nimgs_concurrently)
     valid_images = zeros(Float64, nimgs_concurrently)
 
@@ -388,15 +453,17 @@ function process_slowlight_images!(
     nopenimgs = 1
     output = "Image.%07.1f.h5"
 
-    max_nstep = 0
+    rays, offsets = nothing, nothing
     tile_height = pixels_y
     gpu_data = nothing
     if engine === :GPU
         println("Preparing GPU workspace...")
-        max_nstep = maximum(nsteps)
-        tile_height = gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+        rays, offsets = flatten_rays(all_geodesics, nsteps)
+        tile_height = gpu_tile_plan(nsteps, nimgs_concurrently, simulation_data; pol = pol)
+        # When all rays fit on the GPU, upload them once here and keep them for the whole run.
+        tile_height == pixels_y && (rays = Utils_GPU.copy_iharm_to_gpu(rays))
         gpu_data = [Utils_GPU.copy_iharm_to_gpu(d) for d in simulation_data]
-        println("GPU tiling: $(cld(pixels_y, tile_height)) tile(s) of height $tile_height (image is $(pixels_x)x$(pixels_y), up to $max_nstep steps/pixel)")
+        println("GPU tiling: $(cld(pixels_y, tile_height)) tile(s) of height $tile_height ($(round(sizeof(rays) / 1e9, digits=2)) GB of rays)")
     end
 
     while true
@@ -411,6 +478,10 @@ function process_slowlight_images!(
                         movie_intensity[i, j, nimg] = 0.0
                     end
                 end
+                if movie_N !== nothing
+                    fill!(view(movie_N, :, :, nimg), Polarization.zero_tensor(Float64))
+                    fill!(view(movie_tauF, :, :, nimg), 0.0)
+                end
                 nimg += 1
                 if nimg > nimgs_concurrently
                     nimg = 1
@@ -422,11 +493,11 @@ function process_slowlight_images!(
         valid_ks = [k for k in 1:nimgs_concurrently if valid_images[k] == 1]
 
         elapsed = @elapsed if engine === :CPU
-            render_round_cpu!(movie_nstep, movie_intensity, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
+            render_round_cpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
                 params_slowlight, freq, model, simulation_data)
         else
-            render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks,
-                nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
+             render_round_gpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, rays, offsets,
+                tile_height, valid_ks, target_times, params_slowlight, freq, model, gpu_data)
         end
         println("Round rendered in $(round(elapsed, digits=3))s on $engine")
 
@@ -460,6 +531,17 @@ function process_slowlight_images!(
                     "Xcamera"    => Xcamera,        
                     "Rhigh" => Rhigh            
                 )
+                if movie_N !== nothing
+                    # Polarized frame: project each pixel's tensor where its integration stopped, one step
+                    # short of the camera, as ipole does (project_N at the last point, main.c:467).
+                    pol_out = zeros(Polarization.NIMG, pixels_x, pixels_y)
+                    for i in 1:pixels_x, j in 1:pixels_y
+                        X_end = all_geodesics[i, j][movie_nstep[i, j, k]].X
+                        SI, SQ, SU, SV = Polarization.project_n(movie_N[i, j, k], X_end, model.a, model)
+                        Polarization.save_pixel!(pol_out, i, j, SI, SQ, SU, SV, movie_tauF[i, j, k], freq, qu_conv)
+                    end
+                    out_data["pol"] = pol_out
+                end
                 Output.generate_output_file(file_name, out_data; format="ipole")
                 println("Saving image $(file_name)")
 

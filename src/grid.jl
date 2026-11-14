@@ -181,14 +181,14 @@ function fill_ghosts!(A::AbstractArray{T,4}, mesh::BlockMesh) where {T}
         p = Tuple(I); b = p[4]
         # interior cells are data, skip them
         all(d -> ng[d] < p[d] <= ng[d] + nb[d], 1:3) && continue
-
-        # ghost cell centre, with the outer boundary conditions applied:
-        # zero gradient in X1/X2 (clamp onto the edge cell centre), periodic in X3
+        # ghost cell centre, with the outer boundary conditions applied
         xc = ntuple(d -> mesh.bstart[d, b] + (p[d] - ng[d] - 0.5) * mesh.bdx[d, b], 3)
-        x = ntuple(3) do d
-            d == 3 ? mesh.xmin[3] + mod(xc[3] - mesh.xmin[3], xmax[3] - mesh.xmin[3]) :
-                     clamp(xc[d], mesh.xmin[d] + 0.5 * mesh.bdx[d, b], xmax[d] - 0.5 * mesh.bdx[d, b])
-        end
+        below, above = xc[2] < mesh.xmin[2], xc[2] > xmax[2]
+        x1 = clamp(xc[1], mesh.xmin[1] + 0.5 * mesh.bdx[1, b], xmax[1] - 0.5 * mesh.bdx[1, b])
+        # across a pole: mirror theta about the pole and turn phi by half the phi range (as ipole)
+        x2 = below ? 2 * mesh.xmin[2] - xc[2] : above ? 2 * xmax[2] - xc[2] : xc[2]
+        x3 = (below || above) ? xc[3] + 0.5 * (xmax[3] - mesh.xmin[3]) : xc[3]
+        x = (x1, x2, mesh.xmin[3] + mod(x3 - mesh.xmin[3], xmax[3] - mesh.xmin[3]))
         s = find_block(mesh, x...)
 
         # How many cells of the neighbour to average in each direction (1 unless it is finer),

@@ -90,9 +90,6 @@ end
 # Polarized transfer (Stokes Q, U, V and Faraday depth). The [polarization] section is optional:
 # without it the run is unpolarized, exactly as before.
 const do_polarization = get(get(config, "polarization", Dict{String,Any}()), "on", false)
-if do_polarization
-    slow_light && error("Polarization is not supported in slow light mode.")
-end
 
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
@@ -335,14 +332,14 @@ else
     println("Calculated tgeof (oldest active time): $tgeof")
     println("Calculated tgeoi (newest active time): $tgeoi")
     GC.gc()
-    
+
     #Finally generate the image
     println("Starting slow-light image processing loop...")
     Jipole.Slowlight.process_slowlight_images!(
         params_slowlight, simulation_data, all_geodesics, nsteps,
         model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path,
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
-        engine=slowlight_engine
+        engine=slowlight_engine, pol=do_polarization
     )
     println("Done!")
 end

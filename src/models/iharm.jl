@@ -718,59 +718,38 @@ function init_physical_quantities(data, n::Int64, model::IharmParams, Rhigh::T2)
 end
 
 """
-    set_tinterp_ns(X, model, data)
+    interp_field(f, zone, X, model, data)
 
-Select the two GRMHD snapshots used for time interpolation, along with
-the per-position time-interpolation factor. Returns `(dataA, dataB,
-tinterp)` — the snapshots themselves, rather than their indices into
-`data`.
+Interpolate one field of the GRMHD snapshot(s) at `X`, e.g. `f = d -> d.ne`: in space
+with the zone weights and, in a slow-light run, in time between the two snapshots
+around `X[1]` (weight clamped to [0, 1], as in ipole).
 
-On the CPU, `data` is a `Vector` and this dispatches to the generic
-method below, branching on `model.slow_light` at runtime exactly as
-before. On the GPU, `data` is a `Tuple` of one (non-slow-light) or three
-(slow-light) snapshots; indexing a `Tuple` with a runtime-computed index
-isn't GPU-compilable (even inside a branch that's never actually taken,
-since `model.slow_light` is a runtime field, not a compile-time
-constant, so the compiler can't prove that branch dead and skip
-compiling it) — so the `Tuple`-specific methods below select on the
-tuple's length instead, which is resolved at compile time.
+Only the two arrays needed are picked (e.g. the density of snapshots 1 and 2), never
+whole snapshots: on the GPU, picking whole snapshots at run time puts them in slow
+local memory, which made the slow-light kernel about 25 times slower.
+
+On the CPU `data` is a `Vector`. On the GPU it is a `Tuple` of one snapshot (fast
+light) or three (slow light), told apart by the tuple's length at compile time.
 """
-function set_tinterp_ns(X, model::IharmParams, data)
+@inline function interp_field(f::F, zone, X, model::IharmParams, data) where {F}
     if model.slow_light
         nA, nB = X[1] < data[2].t ? (1, 2) : (2, 3)
-        dataA, dataB = data[nA], data[nB]
-        tinterp = clamp(1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t), 0.0, 1.0)
-        return dataA, dataB, tinterp
-    else
-        return data[1], data[1], 0.0
+        w = clamp(1.0 - (X[1] - data[nA].t) / (data[nB].t - data[nA].t), 0.0, 1.0)
+        return Grid.interp_scalar_time(zone, f(data[nA]), f(data[nB]), w, model.slow_light)
     end
+    return Grid.interp_scalar_time(zone, f(data[1]), f(data[1]), 0.0, model.slow_light)
 end
 
-"""
-    set_tinterp_ns(X, model, data::Tuple{T}) where {T}
+@inline interp_field(f::F, zone, X, model::IharmParams, data::Tuple{T}) where {F,T} =
+    Grid.interp_scalar_time(zone, f(data[1]), f(data[1]), 0.0, model.slow_light)
 
-GPU, non-slow-light variant of [`set_tinterp_ns`](@ref): `data` is a
-1-tuple, so there's nothing to interpolate between.
-"""
-@inline set_tinterp_ns(X, model::IharmParams, data::Tuple{T}) where {T} = (data[1], data[1], 0.0)
-
-"""
-    set_tinterp_ns(X, model, data::NTuple{3,T}) where {T}
-
-GPU, slow-light variant of [`set_tinterp_ns`](@ref): `data` is a 3-tuple
-of snapshots, and the pair to interpolate between is selected by
-comparing `X[1]` against the middle snapshot's time (resolved at compile
-time via the tuple's length, unlike the `Vector` method's runtime
-`model.slow_light` branch).
-"""
-@inline function set_tinterp_ns(X, model::IharmParams, data::NTuple{3,T}) where {T}
+@inline function interp_field(f::F, zone, X, model::IharmParams, data::NTuple{3,T}) where {F,T}
     if X[1] < data[2].t
-        dataA, dataB = data[1], data[2]
-    else
-        dataA, dataB = data[2], data[3]
+        w = clamp(1.0 - (X[1] - data[1].t) / (data[2].t - data[1].t), 0.0, 1.0)
+        return Grid.interp_scalar_time(zone, f(data[1]), f(data[2]), w, model.slow_light)
     end
-    tinterp = clamp(1.0 - (X[1] - dataA.t) / (dataB.t - dataA.t), 0.0, 1.0)
-    return dataA, dataB, tinterp
+    w = clamp(1.0 - (X[1] - data[2].t) / (data[3].t - data[2].t), 0.0, 1.0)
+    return Grid.interp_scalar_time(zone, f(data[2]), f(data[3]), w, model.slow_light)
 end
 
 """
@@ -791,8 +770,7 @@ density) at position `X`.
 @inline function get_model_sigma(zone::Grid.ZoneLoc, X, model::IharmParams, data)
     T = promote_type(typeof(zone.del2), eltype(data[1].sigma))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.sigma, dataB.sigma, tfac, model.slow_light)
+    return interp_field(d -> d.sigma, zone, X, model, data)
 end
 
 """
@@ -828,8 +806,7 @@ end
               sigma_smoothfac = cos(π / 2.0 / (sigma_above - model.sigma_cut) * (sigma - model.sigma_cut))
           end
       end
-      dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-      return Grid.interp_scalar_time(zone, dataA.ne, dataB.ne, tfac, model.slow_light) * sigma_smoothfac
+      return interp_field(d -> d.ne, zone, X, model, data) * sigma_smoothfac
   end
 
 """
@@ -850,8 +827,7 @@ Interpolate the dimensionless electron temperature at position `X`, using the zo
 @inline function get_model_thetae(zone::Grid.ZoneLoc, X, model::IharmParams, data)
     T = promote_type(typeof(zone.del2), eltype(data[1].θe))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.θe, dataB.θe, tfac, model.slow_light)
+     return interp_field(d -> d.θe, zone, X, model, data)
 end
 
 """
@@ -871,8 +847,7 @@ Interpolate the magnetic field strength at position `X`.
 @inline function get_model_b(zone::Grid.ZoneLoc, X, model::IharmParams, data)
     T = promote_type(typeof(zone.del2), eltype(data[1].b))
     !zone.in_domain && return zero(T)
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    return Grid.interp_scalar_time(zone, dataA.b, dataB.b, tfac, model.slow_light)
+    return interp_field(d -> d.b, zone, X, model, data)
 end
 
 
@@ -944,13 +919,12 @@ with the rest of the differentiable call path.
         return Ucon, Ucov, zero_vec, zero_vec
     end
 
-    dataA, dataB, tfac = set_tinterp_ns(X, model, data)
-    V = SVector(Grid.interp_scalar_time(zone, dataA.U1, dataB.U1, tfac, model.slow_light),
-                Grid.interp_scalar_time(zone, dataA.U2, dataB.U2, tfac, model.slow_light),
-                Grid.interp_scalar_time(zone, dataA.U3, dataB.U3, tfac, model.slow_light))
-    B = SVector(Grid.interp_scalar_time(zone, dataA.B1, dataB.B1, tfac, model.slow_light),
-                Grid.interp_scalar_time(zone, dataA.B2, dataB.B2, tfac, model.slow_light),
-                Grid.interp_scalar_time(zone, dataA.B3, dataB.B3, tfac, model.slow_light))
+    V = SVector(interp_field(d -> d.U1, zone, X, model, data),
+                interp_field(d -> d.U2, zone, X, model, data),
+                interp_field(d -> d.U3, zone, X, model, data))
+    B = SVector(interp_field(d -> d.B1, zone, X, model, data),
+                interp_field(d -> d.B2, zone, X, model, data),
+                interp_field(d -> d.B3, zone, X, model, data))
     return fluid_fourv(elT, V, B, gcov, gcon)
 end
 
@@ -982,12 +956,12 @@ end
 
     elT = promote_type(eltype(X), typeof(bhspin))
 
+    b = get_model_b(zone, X, model, data)
+    θe = get_model_thetae(zone, X, model, data)
     Ucon, Ucov, Bcon, Bcov = get_model_fourv(zone, X, Kcon, bhspin, model, data)
     nu = Radiation.get_fluid_nu(Kcon, Ucov)
     θ = Radiation.get_bk_angle(Kcon, Ucov, Bcon, Bcov)
-    b = get_model_b(zone, X, model, data)
-
-    θe = get_model_thetae(zone, X, model, data)
+    
     if MaxwellJuettnerPol.primal(θ) <= zero(elT) || MaxwellJuettnerPol.primal(θ) >= elT(π)
         return (z_base, z_base)
     end

@@ -10,8 +10,7 @@ using Adapt
 using Jipole
 using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Polarization, Slowlight, Utils_GPU, Tetrads
 using Jipole.GeoTypes: OfTrajGeneric, GPUTrajStep
-using Jipole.Slowlight: OfSlowLight, pack_trajectory_tile!
-
+using Jipole.Slowlight: OfSlowLight, shifted_points
   """
       copy_iharm_to_gpu(cpu_data)
 
@@ -99,123 +98,127 @@ function calculate_image!(
       data::T_data = nothing
   ) where {T_data}
 
-      if (i_global >= nx || j_global >= ny)
-          return nothing
-      end
-      # Known when the kernel is compiled: with d_pol = nothing the polarized code is not compiled in.
-      polarized = d_pol !== nothing
+    if (i_global >= nx || j_global >= ny)
+        return nothing
+    end
+    # Known when the kernel is compiled: with d_pol = nothing the polarized code is not compiled in.
+    polarized = d_pol !== nothing
 
-      Kcon0 = Geodesics.init_kcon(i_global, j_global, Econ, nx, ny, fovx, fovy)
-      Kcon = Kcon0 * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
-      dl_unit::Float64 = params.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
-      Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
+    Kcon0 = Geodesics.init_kcon(i_global, j_global, Econ, nx, ny, fovx, fovy)
+    Kcon = Kcon0 * (freq * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL))
+    dl_unit::Float64 = params.L_unit * Constants.HPL / (Constants.ME * Constants.CL^2)
+    Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
 
-      # This pixel's slice of the tile buffer; the tracer stops when it is full.
-      ptraj = view(traj, i_local, j_local, :)
-      step, truncated = Geodesics.trace_geodesic!(ptraj, Xcam, Kcon, bhspin, Rh, Rstop, params)
-      @inbounds d_truncated[i_local, j_local] = truncated
+    # This pixel's slice of the tile buffer; the tracer stops when it is full.
+    ptraj = view(traj, i_local, j_local, :)
+    step, truncated = Geodesics.trace_geodesic!(ptraj, Xcam, Kcon, bhspin, Rh, Rstop, params)
+    @inbounds d_truncated[i_local, j_local] = truncated
 
-      # Radiative transfer, from the far end of the geodesic to the camera.
-      Intensity = 0.0
-      N = Polarization.zero_tensor(Float64)
-      tauF = 0.0
+    # Radiative transfer, from the far end of the geodesic to the camera.
+    Intensity = 0.0
+    N = Polarization.zero_tensor(Float64)
+    tauF = 0.0
 
-      @inbounds far = ptraj[step]
-      ji, ki = Radiation.get_jk(far.X, far.Kcon, freq, bhspin, params, data)
+    @inbounds far = ptraj[step]
+    ji, ki = Radiation.get_jk(far.X, far.Kcon, freq, bhspin, params, data)
 
-      @inbounds for nstep in step:-1:2
-          ti = ptraj[nstep]
-          tf = ptraj[nstep - 1]
-          if polarized
-              # Half-step point of this step, recomputed from its near end.
-              _, _, Xhalf, Kconhalf = Geodesics.push_photon(tf.X, tf.Kcon, -tf.dl / dl_unit, bhspin, params)
-              # Parallel transport, then sources if inside the radiating region.
-              N, tauF = Polarization.polarized_step(N, tauF, ti.X, ti.Kcon, Xhalf, Kconhalf, tf.X, tf.Kcon,
-                  tf.dl, dl_unit, Rh, freq, bhspin, params, data)
-          end
+    @inbounds for nstep in step:-1:2
+        ti = ptraj[nstep]
+        tf = ptraj[nstep - 1]
+        if polarized
+            # Half-step point of this step, recomputed from its near end.
+            _, _, Xhalf, Kconhalf = Geodesics.push_photon(tf.X, tf.Kcon, -tf.dl / dl_unit, bhspin, params)
+            # Parallel transport, then sources if inside the radiating region.
+            N, tauF = Polarization.polarized_step(N, tauF, ti.X, ti.Kcon, Xhalf, Kconhalf, tf.X, tf.Kcon,
+                tf.dl, dl_unit, Rh, freq, bhspin, params, data)
+        end
 
-          if Radiation.radiating_region(tf.X, params, Rh)
-              jf, kf = Radiation.get_jk(tf.X, tf.Kcon, freq, bhspin, params, data)
-              Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, tf.dl)
-              ji = jf
-              ki = kf
-          end
-      end
+        if Radiation.radiating_region(tf.X, params, Rh)
+            jf, kf = Radiation.get_jk(tf.X, tf.Kcon, freq, bhspin, params, data)
+            Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, tf.dl)
+            ji = jf
+            ki = kf
+        end
+    end
 
-      @inbounds d_Image[i_global + 1, j_global + 1] = Intensity * (freq^3)
-      if polarized
-          SI, SQ, SU, SV = Polarization.project_n(N, Ecov)
-          Polarization.save_pixel!(d_pol, i_global + 1, j_global + 1, SI, SQ, SU, SV, tauF, freq, qu_conv)
-      end
-      return nothing
-  end
-
-
+    @inbounds d_Image[i_global + 1, j_global + 1] = Intensity * (freq^3)
+    if polarized
+        SI, SQ, SU, SV = Polarization.project_n(N, Ecov)
+        Polarization.save_pixel!(d_pol, i_global + 1, j_global + 1, SI, SQ, SU, SV, tauF, freq, qu_conv)
+    end
+    return nothing
+end
 
 """
-    render_round_gpu!(movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height,
-        valid_ks, nimgs_concurrently, target_times, pixels_x, pixels_y, params_slowlight, freq, model, gpu_data)
+    render_round_gpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, rays, offsets, tile_height,
+        valid_ks, target_times, params_slowlight, freq, model, gpu_data)
 
-Render one round on the GPU -- the `:GPU` counterpart of
-[`render_round_cpu!`](@ref). Goes tile by tile (rows sized by
-[`gpu_tile_plan`](@ref)): pack that tile's trajectories
-([`pack_trajectory_tile!`](@ref)) and upload it plus the current
-`movie_nstep`/`movie_intensity` state, run [`slowlight_kernel!`](@ref),
-then copy the results back to `movie_nstep`/`movie_intensity` so they're
-plain host arrays again afterwards, same as the CPU path. Called from
-[`process_slowlight_images!`](@ref) when `engine = :GPU`.
+Render one round on the GPU -- the `:GPU` counterpart of [`render_round_cpu!`](@ref).
+The rays are stored back to back at their own lengths (see [`flatten_rays`](@ref)).
+When they all fit on the GPU, `rays` is already a GPU array, uploaded once for the
+whole run; otherwise it is the host array and each tile (a block of image rows, sized
+by [`gpu_tile_plan`](@ref)) uploads its own contiguous slice. For each tile: upload
+the per-frame state (`movie_nstep`/`movie_intensity`, and `movie_N`/`movie_tauF` in a
+polarized run), run [`slowlight_kernel!`](@ref) with one layer of 8x8-thread blocks per
+open frame, then copy the state back so it is plain host arrays again afterwards, same
+as the CPU path. Called from [`process_slowlight_images!`](@ref) when `engine = :GPU`.
 
 # Arguments
-- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten
-  in place.
-- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten
-  in place.
-- `all_geodesics`: Matrix of pre-traced geodesic trajectories, one per
-  pixel.
-- `nsteps`: Matrix of trajectory lengths, one per pixel.
-- `max_nstep`: Longest trajectory length across all pixels.
+- `movie_nstep`: Remaining trajectory steps per pixel/frame, overwritten in place.
+- `movie_intensity`: Accumulated intensity per pixel/frame, overwritten in place.
+- `movie_N`, `movie_tauF`: Coherency tensor and Faraday depth per pixel/frame,
+overwritten in place, or `nothing` for an unpolarized run.
+- `rays`: All rays, back to back (a GPU array when they all fit, else the host array).
+- `offsets`: Where each pixel's ray starts in `rays` (its point `s` is `rays[offsets[i, j] + s]`).
 - `tile_height`: Number of image rows per tile (see [`gpu_tile_plan`](@ref)).
-- `valid_ks`: Indices of the currently-active frames to render this
-  round.
-- `nimgs_concurrently`: Number of frames rendered concurrently.
+- `valid_ks`: Indices of the currently-active frames to render this round.
 - `target_times`: Target simulation time for each frame.
-- `pixels_x`, `pixels_y`: Image resolution.
 - `params_slowlight`: Slow-light run state (time window `[tA, tB, tf]`).
 - `freq`: Frequency, in cgs units.
 - `model`: Iharm model parameters.
 - `gpu_data`: 3-element vector of GPU-resident GRMHD snapshots.
 """
 function Slowlight.render_round_gpu!(
-    movie_nstep, movie_intensity, all_geodesics, nsteps, max_nstep, tile_height, valid_ks, nimgs_concurrently,
-    target_times, pixels_x, pixels_y, params_slowlight::OfSlowLight, freq, model, gpu_data
+    movie_nstep, movie_intensity, movie_N, movie_tauF, rays, offsets, tile_height, valid_ks,
+    target_times, params_slowlight::OfSlowLight, freq, model, gpu_data
 )
-    threads_per_block = (16, 16)
-    valid_mask_host = zeros(Int, nimgs_concurrently)
-    for k in valid_ks
-        valid_mask_host[k] = 1
-    end
-    d_valid_mask = CuArray(valid_mask_host)
+    # 8x8 blocks: a block keeps its place on the GPU until its slowest thread is done, and small
+    # square blocks hold neighbouring pixels with similar ray lengths (1.4x faster than 16x16).
+    threads_per_block = (8, 8)
+    pixels_x, pixels_y = size(offsets)
+    n_tiles = cld(pixels_y, tile_height)
+    println("Rendering $(length(valid_ks)) frame(s) this round on GPU ($n_tiles tile(s) of height $tile_height)...")
+    isempty(valid_ks) && return nothing
+
+    d_valid_ks = CuArray(valid_ks)
     d_target_times = CuArray(target_times)
     data_tuple = Tuple(gpu_data)
 
-    n_tiles = cld(pixels_y, tile_height)
-    println("Rendering $(length(valid_ks)) frame(s) this round on GPU ($n_tiles tile(s) of height $tile_height)...")
-
-    traj_tile_host = Array{OfTrajGeneric{Float64}}(undef, pixels_x, tile_height, max_nstep)
     for j0 in 1:tile_height:pixels_y
         j1 = min(j0 + tile_height - 1, pixels_y)
         tile_ny = j1 - j0 + 1
 
-        traj_view = tile_ny == tile_height ? traj_tile_host : Array{OfTrajGeneric{Float64}}(undef, pixels_x, tile_ny, max_nstep)
-        pack_trajectory_tile!(traj_view, all_geodesics, nsteps, pixels_x, j0, j1)
-        d_traj = CuArray(traj_view)
-
+        # The tile's rays: all of them if already on the GPU, else the tile's contiguous slice.
+        if rays isa CuArray
+            d_rays = rays
+            d_offsets = CuArray(offsets[:, j0:j1])
+        else
+            first = offsets[1, j0] + 1
+            last = j1 < pixels_y ? offsets[1, j1 + 1] : length(rays)
+            d_rays = CuArray{eltype(rays)}(undef, last - first + 1)
+            copyto!(d_rays, 1, rays, first, last - first + 1)
+            d_offsets = CuArray(offsets[:, j0:j1] .- (first - 1))
+        end
         d_nstep = CuArray(@view movie_nstep[:, j0:j1, :])
         d_intensity = CuArray(@view movie_intensity[:, j0:j1, :])
+        d_N = movie_N === nothing ? nothing : CuArray(@view movie_N[:, j0:j1, :])
+        d_tauF = movie_tauF === nothing ? nothing : CuArray(@view movie_tauF[:, j0:j1, :])
 
-        blocks_per_grid = (cld(pixels_x, threads_per_block[1]), cld(tile_ny, threads_per_block[2]))
+        # one layer of blocks per open frame: every frame of every pixel runs in parallel
+        blocks_per_grid = (cld(pixels_x, threads_per_block[1]), cld(tile_ny, threads_per_block[2]),
+        length(valid_ks))
         @cuda threads = threads_per_block blocks = blocks_per_grid slowlight_kernel!(
-            d_traj, d_nstep, d_intensity, d_valid_mask, d_target_times,
+            d_rays, d_offsets, d_nstep, d_intensity, d_N, d_tauF, d_valid_ks, d_target_times,
             params_slowlight.tA, params_slowlight.tB, params_slowlight.tf,
             freq, model.a, model, data_tuple
         )
@@ -223,29 +226,41 @@ function Slowlight.render_round_gpu!(
 
         copyto!(@view(movie_nstep[:, j0:j1, :]), Array(d_nstep))
         copyto!(@view(movie_intensity[:, j0:j1, :]), Array(d_intensity))
+        if movie_N !== nothing
+            copyto!(@view(movie_N[:, j0:j1, :]), Array(d_N))
+            copyto!(@view(movie_tauF[:, j0:j1, :]), Array(d_tauF))
+        end
     end
     return nothing
 end
 
 
 """
-    slowlight_kernel!(traj, nstep_state, intensity, valid_mask, target_times,
+    slowlight_kernel!(rays, offsets, nstep_state, intensity, N_state, tauF_state, valid_ks,
+target_times,
         tA, tB, tf, freq, bhspin, model, data)
 
-The GPU kernel itself: one thread per pixel `(i, j)`, looping over every
-active frame `k` (skipping any where `valid_mask[k] == 0`) and continuing
-that pixel's intensity integration along its trajectory. Same math as
-[`render_round_cpu!`](@ref)'s inner loop, just run on the GPU. Launched
-via `@cuda` from [`render_round_gpu!`](@ref).
+The GPU kernel itself: one thread per pixel `(i, j)` and open frame (`valid_ks[blockIdx().z]`),
+so all frames of all pixels run in parallel. Each thread continues that frame's integration
+along the pixel's ray (`rays[offsets[i, j] + 1]` onward), with the same math as
+[`render_round_cpu!`](@ref)'s inner loop, in two passes over the same steps:
+
+1. the intensity, up to the step where the frame leaves the current data window;
+2. in a polarized run, the coherency tensor and Faraday depth over those same steps.
+
+Two passes keep the coherency tensor (64 registers) out of the intensity's emissivity
+calls, which cuts the polarized kernel's spills and run time by about 15%. With
+`N_state = nothing` the second pass is not compiled into the kernel. Launched via `@cuda`
+from [`render_round_gpu!`](@ref).
 
 # Arguments
-- `traj`: Packed per-pixel geodesic trajectories for this tile (see
-  [`pack_trajectory_tile!`](@ref)).
-- `nstep_state`: Remaining trajectory steps per pixel/frame, overwritten
-  in place.
-- `intensity`: Accumulated intensity per pixel/frame, overwritten in
-  place.
-- `valid_mask`: Which frames are currently active (nonzero entries).
+- `rays`: The tile's rays, back to back (see [`flatten_rays`](@ref)).
+- `offsets`: Where each pixel's ray starts in `rays`.
+- `nstep_state`: Remaining trajectory steps per pixel/frame, overwritten in place.
+- `intensity`: Accumulated intensity per pixel/frame, overwritten in place.
+- `N_state`, `tauF_state`: Coherency tensor and Faraday depth per pixel/frame,
+overwritten in place, or `nothing` for an unpolarized run.
+- `valid_ks`: Indices of the open frames; block layer `z` works on frame `valid_ks[z]`.
 - `target_times`: Target simulation time for each frame.
 - `tA`, `tB`: Time window currently bracketed by `data`.
 - `tf`: Simulation time of the newest available dump.
@@ -255,101 +270,90 @@ via `@cuda` from [`render_round_gpu!`](@ref).
 - `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (kept in step
 with the CPU window by `process_slowlight_images!`).
 """
-function slowlight_kernel!(
-    traj, nstep_state, intensity, valid_mask, target_times,
+ function slowlight_kernel!(
+    rays, offsets, nstep_state, intensity, N_state, tauF_state, valid_ks, target_times,
     tA::Float64, tB::Float64, tf::Float64,
     freq::Float64, bhspin::Float64, model, data
 )
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    nx, ny = size(offsets)
+    (i <= nx && j <= ny) || return nothing
 
-    nx, ny, _ = size(traj)
-    nk = length(valid_mask)
+    @inbounds k = valid_ks[blockIdx().z]
+    @inbounds off = offsets[i, j]
 
-    if i <= nx && j <= ny
-        @inbounds for k in 1:nk
-            if valid_mask[k] == 0
-                continue
+    @inbounds begin
+        nstep_start = nstep_state[i, j, k]
+        dt = target_times[k] + 1e-5
+
+        # Pass 1: the intensity.
+        nstep = nstep_start
+        Intensity = intensity[i, j, k]
+        while nstep > 2
+            Xi, _, Xf, stop = shifted_points(rays, off, nstep, dt, tA, tB, tf)
+            stop && break
+            ji, ki = Radiation.get_jk(Xi, rays[off + nstep].Kcon, freq, bhspin, model, data)
+            jf, kf = Radiation.get_jk(Xf, rays[off + nstep - 1].Kcon, freq, bhspin, model, data)
+            Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, rays[off + nstep - 1].dl)
+            nstep -= 1
+        end
+        nstep_state[i, j, k] = nstep
+        intensity[i, j, k] = Intensity
+
+        # Pass 2 (polarized run): the coherency tensor and Faraday depth, over the same steps.
+        if N_state !== nothing
+            Rh = 1.0 + sqrt(1.0 - bhspin * bhspin)
+            dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
+            N = N_state[i, j, k]
+            tauF = tauF_state[i, j, k]
+            for s in nstep_start:-1:(nstep + 1)
+                Xi, Xh, Xf, _ = shifted_points(rays, off, s, dt, tA, tB, tf)
+                N, tauF = Polarization.polarized_step(N, tauF, Xi, rays[off + s].Kcon, Xh, rays[off + s].Kconhalf,
+                Xf, rays[off + s - 1].Kcon, rays[off + s - 1].dl, dl_unit, Rh, freq, bhspin,
+                model, data)
             end
-
-            nstep = nstep_state[i, j, k]
-            Intensity = intensity[i, j, k]
-            dt = target_times[k] + 1e-5
-
-            while nstep > 2
-                Xi = traj[i, j, nstep].X
-                Xf = traj[i, j, nstep-1].X
-                Kconi = traj[i, j, nstep].Kcon
-                Kconf = traj[i, j, nstep-1].Kcon
-
-                Xi = SVector{4,Float64}(Xi[1] + dt, Xi[2], Xi[3], Xi[4])
-                Xf = SVector{4,Float64}(Xf[1] + dt, Xf[2], Xf[3], Xf[4])
-                if Xi[1] < tA
-                    shift = tA - Xi[1]
-                    Xf = SVector{4,Float64}(Xf[1] + shift, Xf[2], Xf[3], Xf[4])
-                    Xi = SVector{4,Float64}(tA, Xi[2], Xi[3], Xi[4])
-                end
-                if Xi[1] >= tB
-                    if Xf[1] >= tf
-                        shift = tf - Xf[1]
-                        Xi = SVector{4,Float64}(Xi[1] + shift, Xi[2], Xi[3], Xi[4])
-                        Xf = SVector{4,Float64}(tf, Xf[2], Xf[3], Xf[4])
-                    else
-                        break
-                    end
-                end
-
-                ji, ki = Radiation.get_jk(Xi, Kconi, freq, bhspin, model, data)
-                jf, kf = Radiation.get_jk(Xf, Kconf, freq, bhspin, model, data)
-
-                Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[i, j, nstep-1].dl)
-
-                nstep -= 1
-            end
-
-            nstep_state[i, j, k] = nstep
-            intensity[i, j, k] = Intensity
+            N_state[i, j, k] = N
+            tauF_state[i, j, k] = tauF
         end
     end
     return nothing
 end
 
-
 """
-    gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
+    gpu_tile_plan(nsteps, nimgs_concurrently, simulation_data; pol=false)
 
-Decide how many image rows fit in one GPU tile, by checking how much
-memory is actually free right now -- on both the GPU (`CUDA.available_memory()`)
-and the host (`Sys.free_memory()`, since [`pack_trajectory_tile!`](@ref)
-builds each tile on the host first) -- and picking the size that fits
-the tighter of the two. Called once from [`process_slowlight_images!`](@ref)
-when `engine = :GPU`, before the rounds loop starts.
+Decide how many image rows fit in one GPU tile, from the GPU memory free right now
+(`CUDA.available_memory()`) and the rays' real lengths (`nsteps`). When the answer is
+the whole image, [`process_slowlight_images!`](@ref) uploads all rays once and keeps
+them. Called once from [`process_slowlight_images!`](@ref) when `engine = :GPU`,
+before the rounds loop starts.
 
 # Arguments
-- `pixels_x`, `pixels_y`: Image resolution.
-- `max_nstep`: Longest trajectory length across all pixels.
+- `nsteps`: Matrix of trajectory lengths, one per pixel.
 - `nimgs_concurrently`: Number of frames rendered concurrently.
 - `simulation_data`: 3-element window of loaded GRMHD snapshots, used to
-  estimate their GPU memory footprint.
+estimate their GPU memory footprint.
+- `pol`: Whether the per-frame polarized state is kept too.
 
 # Returns
 - `tile_height`: number of image rows (the `j` dimension) per tile.
 """
-function Slowlight.gpu_tile_plan(pixels_x, pixels_y, max_nstep, nimgs_concurrently, simulation_data)
-    traj_elem_bytes = sizeof(OfTrajGeneric{Float64})
-
+function Slowlight.gpu_tile_plan(nsteps, nimgs_concurrently, simulation_data; pol::Bool = false)
+    pixels_x, pixels_y = size(nsteps)
     grid_bytes = 3 * Base.summarysize(simulation_data[1])
-    state_bytes = pixels_x * pixels_y * nimgs_concurrently * (sizeof(Float64) + sizeof(Int))
+    # nstep and intensity per pixel/frame, plus the coherency tensor and Faraday depth when polarized
+    state_elem_bytes = sizeof(Float64) + sizeof(Int) + (pol ? sizeof(SMatrix{4,4,ComplexF64,16}) +
+sizeof(Float64) : 0)
+    state_bytes = pixels_x * pixels_y * nimgs_concurrently * state_elem_bytes
 
-    gpu_usable_bytes = max(CUDA.available_memory() - grid_bytes - state_bytes, 0)
-    host_usable_bytes = Sys.free_memory()
+    safety_fraction = 0.6
+    usable_bytes = floor(Int, max(CUDA.available_memory() - grid_bytes - state_bytes, 0) *
+safety_fraction)
 
-    safety_fraction = 0.6 
-    usable_bytes = floor(Int, min(gpu_usable_bytes, host_usable_bytes) * safety_fraction)
-
-    row_bytes = pixels_x * max_nstep * traj_elem_bytes
-    tile_height = row_bytes <= 0 ? pixels_y : clamp(usable_bytes ÷ row_bytes, 1, pixels_y)
-    return tile_height
+    # bytes of the image row with the most ray points
+    row_bytes = maximum(sum(nsteps; dims = 1)) * sizeof(OfTrajGeneric{Float64})
+    return clamp(usable_bytes ÷ row_bytes, 1, pixels_y)
 end
 
 function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;

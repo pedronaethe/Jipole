@@ -85,7 +85,7 @@ function gcov_func(X, bhspin, model, R0::Float64=0.0)
             0.0, 0.0, 0.0, r * r * sin(th)^2
         )
     end
-
+    dxdX = Coordinates.set_ks_jacobian(X, model)
     cth = cos(th)
     sth = sin(th)
     s2 = sth^2
@@ -102,8 +102,6 @@ function gcov_func(X, bhspin, model, R0::Float64=0.0)
         0.0, 0.0, rho2, 0.0,
         term3, term4, 0.0, s2 * (rho2 + bhspin^2 * s2 * term1)
     )
-
-    dxdX = Coordinates.set_ks_jacobian(X, model)
 
     return transpose(dxdX) * Gcov_ks * dxdX
 end

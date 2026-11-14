@@ -16,4 +16,7 @@ returning an equivalent `IharmData` whose array fields are `CuArray`s.
 """
 function copy_iharm_to_gpu end
 
+# How many units of work fit on the GPU. Defined in JipoleCUDAExt.jl.
+function gpu_tile_plan end
+
 end

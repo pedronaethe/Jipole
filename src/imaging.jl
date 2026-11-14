@@ -87,9 +87,13 @@ function raytrace_image_gpu! end
 
 """
     render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-        pol=nothing, qu_conv=0, nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
+        pol=nothing, qu_conv=0, nmaxstep=16000)
 
-Raytrace the full image on the GPU tile by tile into the host array `Image`.
+Raytrace the full image on the GPU into the host array `Image` (and `pol`), one square tile
+at a time, each as large as the free GPU memory holds geodesic buffers of `nmaxstep` points
+for ([`Utils_GPU.gpu_tile_plan`](@ref)). A geodesic longer than `nmaxstep` points is cut
+there, losing its emission beyond that point; a warning says how many were cut. Returns
+that number.
 """
 function render_image_gpu! end
 

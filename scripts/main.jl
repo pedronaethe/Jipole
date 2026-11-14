@@ -144,13 +144,7 @@ if !slow_light
 
     
     Image = zeros(Float64, pixels_x, pixels_y)
-    if mode == "gpu"
-        # nmaxstep for the first GPU attempt. render_image_gpu! doubles it for any tile with a
-        # truncated geodesic, and the value it ends on carries over to the next dump.
-        gpu_maxnstep = 4000
-    elseif mode != "cpu"
-        error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
-    end
+    mode in ("cpu", "gpu") || error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
 
 
     #Loop through every file in the directory chosen.
@@ -208,8 +202,7 @@ if !slow_light
             println("Processing image in tiles...")
             gpu_time = @elapsed begin
                 pol = do_polarization ? zeros(Float64, Jipole.Polarization.NIMG, pixels_x, pixels_y) : nothing
-                global gpu_maxnstep = Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y;
-                      pol=pol, nmaxstep=gpu_maxnstep, nmaxstep_ceiling=50000, block_size=128)
+                Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y; pol=pol)
             end
             @printf("GPU raytracing took %.3f s\n", gpu_time)
             println("Raytracing complete!")

@@ -320,96 +320,72 @@ with the CPU window by `process_slowlight_images!`).
     return nothing
 end
 
-"""
-    gpu_tile_plan(nsteps, nimgs_concurrently, simulation_data; pol=false)
+ """
+    gpu_tile_plan(unit_bytes; reserve_bytes=0)
 
-Decide how many image rows fit in one GPU tile, from the GPU memory free right now
-(`CUDA.available_memory()`) and the rays' real lengths (`nsteps`). When the answer is
-the whole image, [`process_slowlight_images!`](@ref) uploads all rays once and keeps
-them. Called once from [`process_slowlight_images!`](@ref) when `engine = :GPU`,
-before the rounds loop starts.
+How many units of work fit on the GPU at once: as many as fit, at `unit_bytes` each, in 60%
+of the GPU memory that is free (after `reserve_bytes` for whatever else must stay on the GPU).
+Each renderer shapes its tiles from this number: slow light takes image rows of stored rays
+([`process_slowlight_images!`](@ref)), fast light square tiles of pixels with one geodesic
+buffer each ([`Imaging.render_image_gpu!`](@ref)).
 
 # Arguments
-- `nsteps`: Matrix of trajectory lengths, one per pixel.
-- `nimgs_concurrently`: Number of frames rendered concurrently.
-- `simulation_data`: 3-element window of loaded GRMHD snapshots, used to
-estimate their GPU memory footprint.
-- `pol`: Whether the per-frame polarized state is kept too.
+- `unit_bytes`: GPU memory one unit needs (a row of stored rays, or one pixel's geodesic buffer).
+- `reserve_bytes`: GPU memory to leave for everything else.
 
 # Returns
-- `tile_height`: number of image rows (the `j` dimension) per tile.
+- The number of units that fit (at least 1).
 """
-function Slowlight.gpu_tile_plan(nsteps, nimgs_concurrently, simulation_data; pol::Bool = false)
-    pixels_x, pixels_y = size(nsteps)
-    grid_bytes = 3 * Base.summarysize(simulation_data[1])
-    # nstep and intensity per pixel/frame, plus the coherency tensor and Faraday depth when polarized
-    state_elem_bytes = sizeof(Float64) + sizeof(Int) + (pol ? sizeof(SMatrix{4,4,ComplexF64,16}) +
-sizeof(Float64) : 0)
-    state_bytes = pixels_x * pixels_y * nimgs_concurrently * state_elem_bytes
-
-    safety_fraction = 0.6
-    usable_bytes = floor(Int, max(CUDA.available_memory() - grid_bytes - state_bytes, 0) *
-safety_fraction)
-
-    # bytes of the image row with the most ray points
-    row_bytes = maximum(sum(nsteps; dims = 1)) * sizeof(OfTrajGeneric{Float64})
-    return clamp(usable_bytes ÷ row_bytes, 1, pixels_y)
+function Utils_GPU.gpu_tile_plan(unit_bytes; reserve_bytes = 0)
+    CUDA.reclaim()    # so memory CUDA.jl keeps cached counts as free
+    return max(1, floor(Int, 0.6 * max(CUDA.available_memory() - reserve_bytes, 0) / unit_bytes))
 end
 
 function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-      pol=nothing, qu_conv::Int=0, nmaxstep=16000, nmaxstep_ceiling=50000, block_size=64)
+    pol=nothing, qu_conv::Int=0, nmaxstep=16000)
 
-      threads_per_block = (16, 16)
-      blocks_per_grid = (cld(block_size, threads_per_block[1]), cld(block_size, threads_per_block[2]))
+    # 8x8 blocks: a block keeps its place on the GPU until its slowest ray is done, and small
+    # square blocks hold neighbouring pixels with similar ray lengths.
+    threads_per_block = (8, 8)
 
-      T = promote_type(typeof(ro), typeof(θo), typeof(phi), typeof(model.a))
+    T = promote_type(typeof(ro), typeof(θo), typeof(phi), typeof(model.a))
 
-      Xcam = SVector{4, Float64}(Camera.camera_position(ro, θo, phi, model.a, model))
-      _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, model.a, model)
-      Econ = SMatrix{4, 4, Float64, 16}(Econ)
-      Ecov = SMatrix{4, 4, Float64, 16}(Ecov)
+    Xcam = SVector{4, Float64}(Camera.camera_position(ro, θo, phi, model.a, model))
+    _, Econ, Ecov = Tetrads.make_camera_tetrad(Xcam, model.a, model)
+    Econ = SMatrix{4, 4, Float64, 16}(Econ)
+    Ecov = SMatrix{4, 4, Float64, 16}(Ecov)
 
-      d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
-      d_truncated = CUDA.zeros(Bool, block_size, block_size)
-      d_Image = CUDA.zeros(Float64, nx, ny)
-      d_pol = pol === nothing ? nothing : CUDA.zeros(Float64, Polarization.NIMG, nx, ny)
+    d_Image = CUDA.zeros(Float64, nx, ny)
+    d_pol = pol === nothing ? nothing : CUDA.zeros(Float64, Polarization.NIMG, nx, ny)
 
-      CUDA.@time begin
-        for i_offset in 0:block_size:(nx - 1)
-            for j_offset in 0:block_size:(ny - 1)
-                # Grow nmaxstep until the tile has no truncated geodesic or the ceiling is hit.
-                while true
-                    CUDA.fill!(d_truncated, false)
-                    @cuda threads=threads_per_block blocks=blocks_per_grid Imaging.raytrace_image_gpu!(
-                        d_traj, d_Image, d_pol, d_truncated,
-                        i_offset, j_offset, block_size, block_size,
-                        Xcam, Econ, Ecov, model.a, nx, ny,
-                        freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model
-                    )
-                    CUDA.synchronize()
+    # Square tiles of as many pixels as the free GPU memory holds geodesic buffers for, split evenly
+    # over the image and rounded up to whole 8x8 blocks. Each tile waits for its longest ray, and
+    # squares keep the long photon-ring rays (near the image centre) in few tiles.
+    side = max(8, isqrt(Utils_GPU.gpu_tile_plan(nmaxstep * sizeof(GPUTrajStep{T}))) ÷ 8 * 8)
+    tile_x = cld(cld(nx, cld(nx, side)), 8) * 8
+    tile_y = cld(cld(ny, cld(ny, side)), 8) * 8
 
-                    any(d_truncated) || break
+    d_traj = CuArray{GPUTrajStep{T}}(undef, tile_x, tile_y, nmaxstep)
+    d_truncated = CUDA.zeros(Bool, tile_x, tile_y)
+    n_truncated = 0
 
-                    if nmaxstep >= nmaxstep_ceiling
-                        @warn "Tile (i_offset=$i_offset, j_offset=$j_offset) still truncated at the absolute step ceiling ($nmaxstep_ceiling); keeping its result as-is."
-                        break
-                    end
-
-                    nmaxstep = min(nmaxstep * 2, nmaxstep_ceiling)
-                    println("Tile (i_offset=$i_offset, j_offset=$j_offset) truncated a geodesic; retrying with nmaxstep = $nmaxstep")
-                    CUDA.unsafe_free!(d_traj)
-                    d_traj = CuArray{GPUTrajStep{T}}(undef, block_size, block_size, nmaxstep)
-                end
-            end
-        end
-        CUDA.synchronize()
+    CUDA.@time for i_offset in 0:tile_x:(nx - 1), j_offset in 0:tile_y:(ny - 1)
+        CUDA.fill!(d_truncated, false)
+        @cuda threads=threads_per_block blocks=(cld(tile_x, threads_per_block[1]), cld(tile_y, threads_per_block[2])) Imaging.raytrace_image_gpu!(
+            d_traj, d_Image, d_pol, d_truncated,
+            i_offset, j_offset, tile_x, tile_y,
+            Xcam, Econ, Ecov, model.a, nx, ny,
+            freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model
+        )
+        n_truncated += count(d_truncated)
     end
+    n_truncated > 0 && @warn "$n_truncated geodesic(s) were longer than nmaxstep = $nmaxstep points and were cut there; raise nmaxstep to include them."
 
     copyto!(Image, d_Image)
     pol === nothing || copyto!(pol, d_pol)
     CUDA.unsafe_free!(d_traj)
     all(isfinite, Image) || error("NaN or Inf intensity in the GPU image.")
-    return nmaxstep
+    return n_truncated
 end
 
 end

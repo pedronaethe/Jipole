@@ -23,10 +23,6 @@ export OfSlowLight, update_dump_path, get_specific_dump_time, update_data!,
     process_slowlight_images!
 
 
-"""
-    GPU functions defined in JipoleCUDAExt.jl
-"""
-function gpu_tile_plan end
 function render_round_gpu! end
 
 """
@@ -459,7 +455,10 @@ function process_slowlight_images!(
     if engine === :GPU
         println("Preparing GPU workspace...")
         rays, offsets = flatten_rays(all_geodesics, nsteps)
-        tile_height = gpu_tile_plan(nsteps, nimgs_concurrently, simulation_data; pol = pol)
+        # Rows per tile: a row's stored rays must fit next to the 3 snapshots and the frame state.
+        state_bytes = sizeof(movie_nstep) + sizeof(movie_intensity) + (pol ? sizeof(movie_N) + sizeof(movie_tauF) : 0)
+        tile_height = min(pixels_y, Utils_GPU.gpu_tile_plan(maximum(sum(nsteps; dims = 1)) * sizeof(eltype(rays));
+        reserve_bytes = 3 * Base.summarysize(simulation_data[1]) + state_bytes))
         # When all rays fit on the GPU, upload them once here and keep them for the whole run.
         tile_height == pixels_y && (rays = Utils_GPU.copy_iharm_to_gpu(rays))
         gpu_data = [Utils_GPU.copy_iharm_to_gpu(d) for d in simulation_data]

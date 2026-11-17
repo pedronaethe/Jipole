@@ -255,13 +255,14 @@ parameters and the frame vectors are zero.
 end
 
 """
-    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing)
+    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing, lens = nothing)
 
 Stokes I pixel of the thin disk. There is no emission along the ray: `Image[I, J]`
 is the surface intensity ([`disk_surface`](@ref)) at the disk crossing closest to
 the camera. `data` is unused by this model.
 """
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing) where {T}
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, data=nothing, lens = nothing) where {T}
+    lens === nothing || error("Images split by lensing band are not implemented for the thin disk")
     Intensity = zero(T)
     for nstep = nsteps:-1:2
         Xi = traj[nstep].X
@@ -294,7 +295,7 @@ tetrad-frame tensor is replaced.
 end
 
 """
-    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model::ThinDiskParams, sink::PolSink)
+    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model::ThinDiskParams, sink::PolSink, lens = nothing)
 
 Polarized pixel of the thin disk: the Stokes I pixel from the method above, then
 the polarized pixel from `Polarization.integrate_emission_pol`, started behind
@@ -309,8 +310,8 @@ of a step are not seen, in ipole or here.
 (The generic `PolSink` method would be ambiguous with the thin disk's own
 Stokes I method; this method also resolves that.)
 """
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, sink::Polarization.PolSink) where {T}
-    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data)
+function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::ThinDiskParams, sink::Polarization.PolSink, lens = nothing) where {T}
+    Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data, lens)
 
     nsteps_pol = nsteps
     n_left = -1

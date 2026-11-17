@@ -16,7 +16,10 @@ println("Using configuration: $config_filepath")
 # If any parameter is missing, it will use the default value and print a warning.
 
 const MBH = Jipole.Utils.get_config(config, "physical", "MBH", 6.2e9)
-const slow_light = Jipole.Utils.get_config(config, "physical", "slow_light", false)
+const slow_light = get(get(config, "slowlight", Dict{String,Any}()), "on", false)
+
+# Now slowlight is set by on = true.
+haskey(get(config, "physical", Dict()), "slow_light") && error("[physical].slow_light is gone: use [slowlight] on = true.")
 
 
 m_unit_def = Jipole.Utils.get_config(config, "physical", "m_unit", "MAD")
@@ -75,11 +78,18 @@ const source_distance_pc = Jipole.Utils.get_config(config, "observing", "source_
 const maxnstep = Jipole.Utils.get_config(config, "raytracing", "maxnstep", 25000)
 const mode = Jipole.Utils.get_config(config, "raytracing", "mode", "cpu")
 
+# Which tracing mode
+const brisk = get(config, "brisklight", Dict{String,Any}())
+const brisklight = get(brisk, "on", false)
+const fast_cadence = get(get(config, "fastlight", Dict{String,Any}()), "cadence", nothing)
+brisklight && slow_light && error("[brisklight] and [slowlight] are both on: turn one off.")
+
 
 #check how to do gradients
 const do_gradients = Jipole.Utils.get_config(config, "gradient", "on", false)
 const gradient_wrt = Tuple(Symbol.(Jipole.Utils.get_config(config, "gradient", "wrt", String[])))
 if do_gradients
+    brisklight && error("Gradients are not supported in brisk light mode.")
     slow_light && error("Gradients are not supported in slow light mode.")
     mode == "gpu" && error("Gradients are only implemented for mode = \"cpu\".")
     isempty(gradient_wrt) && error("[gradient].wrt must list at least one parameter, e.g. wrt = [\"M_unit\"]")
@@ -87,13 +97,21 @@ if do_gradients
     isempty(unknown) || error("Unknown gradient parameter(s) $(unknown); choose from $(Jipole.Iharm.GRADIENT_PARAM_NAMES)")
 end
 
+# Images split by lensing band ([output] max_lens = n): bands 0 to n, counted in z turns
+# between the emission and the camera, the last band also holding the higher ones.
+const max_lens = get(get(config, "output", Dict{String,Any}()), "max_lens", nothing)
+max_lens !== nothing && (slow_light || do_gradients || mode == "gpu") && error("[output].max_lens works in fast and brisk light on the CPU, without gradients (for slow light, use [brisklight] p = 1).")
+
 # Polarized transfer (Stokes Q, U, V and Faraday depth). The [polarization] section is optional:
 # without it the run is unpolarized, exactly as before.
 const do_polarization = get(get(config, "polarization", Dict{String,Any}()), "on", false)
 
 # CUDA.jl takes several seconds to load, so only load it when this run uses the GPU. Loading it
 # also loads Jipole's CUDA extension (ext/JipoleCUDAExt.jl), which holds all the GPU code.
-const use_gpu = slow_light ? Jipole.Utils.get_config(config, "slowlight", "engine", "cpu") == "gpu" : mode == "gpu"
+const use_gpu = mode == "gpu"
+
+# Add a check for the removed [slowlight].engine parameter, which is now set by [raytracing].mode. This is to avoid confusion for users who have old config files.
+haskey(get(config, "slowlight", Dict()), "engine") && error("[slowlight].engine is gone: CPU or GPU is set by [raytracing].mode for every mode.")
 
 if do_gradients && use_gpu
     println("Using GPU for gradient computations in this version has not been tested. This will land soon, for now, use CPU mode.")
@@ -139,11 +157,46 @@ else
 end
 
 # Fast light branching
-if !slow_light
+if brisklight || fast_cadence !== nothing
+    # Surely enough, if you wanna do brisklight or fastlight movies, you need to provide a directory of dumps, duh. 
+    isdir(dump_filepath) || error("[brisklight] and [fastlight] need [dump].dump_filepath to be a directory of dumps")
+
+    # Don't allow GPU for now, I'll fix this later, but if you are reading this, it means I failed to fix it later lol.
+    use_gpu && println("Brisk light and the fast-light cadence run on the CPU for now.")
+
+    #Setting up parameters.
+    reader = Jipole.Kharma.is_kharma_dump(dump_files[1]) ? Jipole.Kharma : Jipole.Iharm
+    model = reader.read_header(dump_files[1], MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit,
+        sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit)
+    Rh = 1 + sqrt(1.0 - model.a^2)
+    DXsize = SourceD / model.L_unit / Jipole.Constants.MUAS_PER_RAD * fov_size
+    fovx = fovy = DXsize / ro
+
+    #integrating
+    Xcamera = MVector{4,Float64}(Jipole.Camera.camera_position(ro, th, phi, model.a, model))
+    _, Econ, _ = Jipole.Tetrads.make_camera_tetrad(Xcamera, model.a, model)
+    all_geodesics, nsteps = Jipole.Slowlight.trace_slowlight(model, Xcamera, Econ, fovx, fovy, freq_unitless,
+        pixels_x, pixels_y, maxnstep, Rh, xoff, yoff)
+    meta = Dict{String,Any}("params" => model, "ro" => ro, "theta_o" => th, "phi" => phi, "fovx" => fovx,
+        "fovy" => fovy, "freq" => freq, "SourceD" => SourceD, "Xcamera" => Xcamera, "Rhigh" => Rhigh,
+        "scale" => Jipole.Imaging.calculate_scale_factor(DXsize, DXsize, pixels_x, pixels_y, SourceD, model.L_unit))
+    
+    settings = brisklight ? brisk : config["fastlight"]
+    windows, t_ref = brisklight ?
+        Jipole.Brisklight.brisk_windows(all_geodesics, nsteps, model, get(brisk, "n_bands", 2), get(brisk, "p", 0.5)) :
+        ([(0.0, 0.0)], 0.0)
+    Jipole.Brisklight.process_brisklight_images!(all_geodesics, nsteps, windows, t_ref, dump_files,
+        path -> reader.load_data(path, Rhigh, model), model, freq, meta;
+        cadence=get(settings, "cadence", 10.0), t_start=get(settings, "t_start", nothing),
+        n_frames=get(settings, "n_frames", nothing), fast=!brisklight, pol=do_polarization, max_lens = max_lens,
+        output_dir=dirname(abspath(output_filename)))
+    println("Done!")
+elseif !slow_light
     const batched = length(dump_files) > 1
 
     
     Image = zeros(Float64, pixels_x, pixels_y)
+    Lens = max_lens === nothing ? nothing : zeros(Float64, pixels_x, pixels_y, max_lens + 1)
     mode in ("cpu", "gpu") || error("Invalid mode: $mode. Must be 'cpu' or 'gpu'.")
 
 
@@ -190,10 +243,10 @@ if !slow_light
                     wrt=gradient_wrt);
                 copyto!(Image, grad_image)
             elseif do_polarization
-                unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff)
+                unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff; lens = Lens)
                 copyto!(Image, unpol_image)
             else
-                copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff))
+                copyto!(Image, Jipole.Imaging.raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff; lens = Lens))
             end
         else
             println("Copying simulation data grid to the GPU...")
@@ -268,6 +321,7 @@ if !slow_light
 
         #Add the polarized image, and its gradients, if they were calculated.
         do_polarization && (output_data["pol"] = pol)
+        Lens === nothing || (output_data["lens"] = Lens)
         do_polarization && do_gradients && (output_data["grads_pol"] = grads_pol)
 
 

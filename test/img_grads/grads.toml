@@ -1,9 +1,5 @@
 [physical]
 MBH = 6.2e9
-# When true, dump_filepath below must be a directory: the whole
-# t_init..t_final range is used as the slow-light dump sequence (see
-# [slowlight]) instead of one image per dump.
-slow_light = false
 
 #it can be MAD/SANE or any float value
 m_unit = 3e26
@@ -11,12 +7,6 @@ m_unit = 3e26
 [dump]
 # dump_filepath can point to a single dump file, or to a directory of dumps.
 dump_filepath = "output/dump.h5"
-
-# Only read when [physical].slow_light = true.
-[slowlight]
-image_cadence = 10.0
-#either cpu or gpu
-engine = "cpu"
 
 
 [gradient]

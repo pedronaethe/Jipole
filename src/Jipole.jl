@@ -38,6 +38,7 @@ include("output.jl")
 include("fitting.jl")
 include("utils_gpu.jl")
 include("slowlight.jl")
+include("brisklight.jl")
 
 
 using PrecompileTools: @setup_workload, @compile_workload

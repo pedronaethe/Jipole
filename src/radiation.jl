@@ -15,6 +15,7 @@ using ..Constants
 using ..GeoTypes
 using ..AbstractModels
 using ..DebugFunctions
+using ..Coordinates
 
 export get_fluid_nu, bnu_inv, get_jk, integrate_emission!, get_bk_angle,
     approximate_solve, radiating_region
@@ -101,7 +102,22 @@ This is model-specific: each model provides its own method, dispatched on
 function radiating_region end
 
 """
-    integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, data=nothing)
+    z_turn(traj, k, model)
+
+Whether the ray turns around in z = r cos θ at step `k`, i.e. dz changes sign there. A ray step's
+lensing band is the number of these turns between it and the camera (at `traj[1]`).
+"""
+@inline function z_turn(traj, k, model)
+    function z(X)
+        r, th = Coordinates.bl_coord(X, model)
+        return r * cos(th)
+    end
+    zk = z(traj[k].X)
+    return (z(traj[k+1].X) - zk) * (zk - z(traj[k-1].X)) < 0
+end
+
+"""
+    integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, data=nothing, lens = nothing)
 
 Integrate the emission along the geodesic trajectory `traj`, writing the
 resulting intensity into `Image[I, J]`.
@@ -120,8 +136,9 @@ crossing emission model.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Model parameters.
 - `data`: Model-specific auxiliary data.
+- `lens`: Optional array to accumulate the intensity in each lensing band.
 """
-function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing) where {T}
+function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing, lens = nothing) where {T}
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
     Xi = traj[nsteps].X
@@ -129,8 +146,16 @@ function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::In
     ji, ki = get_jk(Xi, Kconi, freq, bhspin, model, data)
 
     Intensity = zero(T)
+    band = 0                        # z-turns between the current step and the camera
+    
+    if lens !== nothing
+        lens[I, J, :] .= zero(T)
+        band = count(k -> z_turn(traj, k, model), 2:nsteps-1)
+    end
+    
     for nstep = nsteps:-1:2
         Xf = traj[nstep-1].X
+        lens !== nothing && nstep < nsteps && z_turn(traj, nstep, model) && (band -= 1)
         if !radiating_region(Xf, model, Rh)
             continue
         end
@@ -138,6 +163,13 @@ function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::In
 
         jf, kf = get_jk(Xf, Kconf, freq, bhspin, model, data)
         Intensity = approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
+        if lens !== nothing
+            # every band is attenuated, and the step's emission goes to its own band
+            own = min(band, size(lens, 3) - 1) + 1
+            for b in axes(lens, 3)
+                lens[I, J, b] = approximate_solve(lens[I, J, b], b == own ? ji : zero(ji), ki, b == own ? jf : zero(jf), kf, traj[nstep-1].dl)
+            end
+        end
 
         if isnan(Intensity) || isinf(Intensity)
             @error "NaN or Inf encountered in intensity calculation at pixel ($I, $J)"

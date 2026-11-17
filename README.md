@@ -58,7 +58,7 @@ Every run is set up by a TOML parameter file (see `scripts/pars/example_par.toml
 
 | Section | What it sets |
 |---|---|
-| `[physical]` | Black hole mass `MBH` in solar masses, mass unit `m_unit` (`"MAD"`, `"SANE"` or a number in grams), `slow_light` switch |
+| `[physical]` | Black hole mass `MBH` in solar masses, mass unit `m_unit` (`"MAD"`, `"SANE"` or a number in grams) |
 | `[dump]` | `dump_filepath`: a single dump or a directory of dumps (iharm3d `.h5` or KHARMA `.phdf`); `t_init`/`t_final` select dumps by simulation time when it is a directory |
 | `[plasma]` | Electron temperature model (`Rhigh`, `Rlow`, `beta_crit`), polar cut `th_beg`, magnetization cuts `sigma_cut`, `sigma_cut_high` |
 | `[camera]` | Observer distance `ro` in units of M, inclination `theta_o` and azimuth `phi` (degrees) |
@@ -75,7 +75,7 @@ You can download an example dump file in [dataverse](https://dataverse.harvard.e
 
 With `on = true`, Jipole also computes the derivative of every pixel's intensity with respect to each parameter listed in `wrt`, using forward-mode automatic differentiation (ForwardDiff.jl). They are written next to the image as `grad/<parameter>`.
 
-Available parameters: `MBH`, `M_unit`, `Rhigh`, `Rlow`, `beta_crit`, `th_beg`, `sigma_cut`, `sigma_cut_high`, `ro`, `th`, `phi`, `sourceD`. Gradients currently require `mode = "cpu"` and `slow_light = false`.
+Available parameters: `MBH`, `M_unit`, `Rhigh`, `Rlow`, `beta_crit`, `th_beg`, `sigma_cut`, `sigma_cut_high`, `ro`, `th`, `phi`, `sourceD`. Gradients currently require `mode = "cpu"` and `[slowlight] on = false`.
 
 #### Polarization (`[polarization]`)
 
@@ -92,15 +92,15 @@ With `flux_fit = true`, Jipole first finds the `m_unit` for which the mean flux 
 - The fit averages `fit_amount` evenly spaced dumps, rendered at a reduced resolution `fitting_res`, and stops when the mean flux is within `fitting_tol` of the target.
 - `fit_save = true` also keeps the fit images in `<output folder>/fit/`.
 
-#### Slow light (`[physical].slow_light`, `[slowlight]`)
+#### Slow light (`[slowlight]`)
 
-By default, each dump is imaged on its own (fast light). With `slow_light = true`, Jipole accounts for the light travel time through the evolving flow:
+By default, each dump is imaged on its own (fast light). With `[slowlight] on = true`, Jipole accounts for the light travel time through the evolving flow:
 
 - Every pixel's geodesic is traced once.
 - Radiative transfer is then integrated through a sliding window of three consecutive dumps as simulation time advances.
 - This produces one frame every `image_cadence` (GM/c³).
 
-`dump_filepath` must be a directory. `engine = "cpu"` or `"gpu"` selects where the transfer runs. Output goes to a `slow_sims` folder.
+`dump_filepath` must be a directory. `[raytracing] mode` selects CPU or GPU, as in every other mode. Output goes to a `slow_sims` folder.
 
 #### GPU
 

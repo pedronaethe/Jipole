@@ -116,6 +116,7 @@ Trace rays to form an image of the source.
  - `Rh`: Schwarzschild radius of the black hole.
  - `xoff`: X-offset for the image.
  - `yoff": Y-offset for the image.
+ - 'lens': Optional array to accumulate the intensity in each lensing band.
 
  # Returns
  - Returns: The formed image as a 2D array of Float64 values.
@@ -123,7 +124,7 @@ Trace rays to form an image of the source.
 """
 #TODO (PNM): Put the camera parameters inside a camera structure, it will be more neat and organized.
 function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y,
-                         fovx, fovy, maxnstep, Rh, xoff, yoff)
+                         fovx, fovy, maxnstep, Rh, xoff, yoff; lens = nothing)
     T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a))
 
     Xcamera = SVector{4,T}(Camera.camera_position(ro, th, phi, model.a, model))
@@ -156,7 +157,7 @@ function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pix
 
                 Radiation.integrate_emission!(
                     my_traj, nstep, Image,
-                    i + 1, j + 1, freq, model.a, model, simulation_data
+                    i + 1, j + 1, freq, model.a, model, simulation_data, lens
                 )
             end
             lock(progress_lock) do
@@ -167,6 +168,7 @@ function raytrace_image(model, simulation_data, ro, th, phi, freq, pixels_x, pix
         end
     end
     Image .*= freq^3
+    lens === nothing || (lens .*= freq^3)
     finish!(p)
 
     return Image

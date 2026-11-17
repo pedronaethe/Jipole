@@ -40,7 +40,7 @@ to its pixel loop.
   I, Q, U, V (CGS specific intensity) and the Faraday depth for each pixel.
 """
 function raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y,
-                            fovx, fovy, maxnstep, Rh, xoff, yoff; qu_conv::Int=0)
+                            fovx, fovy, maxnstep, Rh, xoff, yoff; qu_conv::Int=0, lens=nothing)
     # Same element type as the image allocated inside `Imaging.raytrace_image`.
     T = promote_type(typeof(ro), typeof(th), typeof(phi), typeof(model.a))
 
@@ -48,7 +48,7 @@ function raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x,
     sink = Polarization.PolSink(simulation_data, pol, qu_conv)
 
     Image = Imaging.raytrace_image(model, sink, ro, th, phi, freq, pixels_x, pixels_y,
-                                   fovx, fovy, maxnstep, Rh, xoff, yoff)
+                                   fovx, fovy, maxnstep, Rh, xoff, yoff; lens = lens)
     return Image, pol
 end
 

@@ -2,7 +2,6 @@
 
 [physical]
 MBH = 6.2e9
-slow_light = false
 m_unit = 1.672e26
 
 [dump]

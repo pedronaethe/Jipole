@@ -78,7 +78,7 @@ end
 
 """
     raytrace_image_gpu!(d_traj, d_Image, d_pol, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
-        Xcam, Econ, Ecov, bhspin, nx, ny, freq, fovx, fovy, Rstop, qu_conv, data, params)
+        Xcam, Econ, Ecov, bhspin, nx, ny, freq, fovx, fovy, Rstop, qu_conv, data, params, d_lens = nothing)
 
 GPU kernel that raytraces one tile of the image, unpolarized (`d_pol = nothing`) or
 polarized.
@@ -87,9 +87,9 @@ function raytrace_image_gpu! end
 
 """
     render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-        pol=nothing, qu_conv=0, nmaxstep=16000)
+        pol=nothing, qu_conv=0, nmaxstep=16000, lens = nothing)
 
-Raytrace the full image on the GPU into the host array `Image` (and `pol`), one square tile
+Raytrace the full image on the GPU into the host array `Image` (and `pol`, lens), one square tile
 at a time, each as large as the free GPU memory holds geodesic buffers of `nmaxstep` points
 for ([`Utils_GPU.gpu_tile_plan`](@ref)). A geodesic longer than `nmaxstep` points is cut
 there, losing its emission beyond that point; a warning says how many were cut. Returns

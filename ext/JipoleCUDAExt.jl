@@ -8,7 +8,7 @@ using CUDA
 using StaticArrays
 using Adapt
 using Jipole
-using Jipole: Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Polarization, Slowlight, Utils_GPU, Tetrads
+using Jipole: Brisklight, Constants, Camera, Geodesics, Radiation, Iharm, Imaging, Polarization, Slowlight, Utils_GPU, Tetrads
 using Jipole.GeoTypes: OfTrajGeneric, GPUTrajStep
 using Jipole.Slowlight: OfSlowLight, shifted_points
   """
@@ -24,7 +24,7 @@ using Jipole.Slowlight: OfSlowLight, shifted_points
 
   """
       raytrace_image_gpu!(d_traj, d_Image, d_pol, d_truncated, i_offset, j_offset, block_size_x, block_size_y,
-          Xcam, Econ, Ecov, bhspin, nx, ny, freq, fovx, fovy, Rstop, qu_conv, data, params)
+          Xcam, Econ, Ecov, bhspin, nx, ny, freq, fovx, fovy, Rstop, qu_conv, data, params, d_lens = nothing)
 
   GPU kernel for one tile of the image: each thread takes one pixel of the tile and runs
   [`calculate_image!`](@ref) on it. Launched once per tile by `render_image_gpu!`, because the
@@ -37,7 +37,7 @@ using Jipole.Slowlight: OfSlowLight, shifted_points
       d_traj, d_Image, d_pol, d_truncated,
       i_offset, j_offset, block_size_x, block_size_y,
       Xcam, Econ, Ecov, bhspin, nx, ny,
-      freq, fovx, fovy, Rstop, qu_conv, data, params
+      freq, fovx, fovy, Rstop, qu_conv, data, params, d_lens = nothing
   )
       local_i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
       local_j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
@@ -48,7 +48,7 @@ using Jipole.Slowlight: OfSlowLight, shifted_points
       if local_i <= block_size_x && local_j <= block_size_y && i < nx && j < ny
           calculate_image!(
               d_traj, d_Image, d_pol, d_truncated, Xcam, Econ, Ecov, bhspin, nx, ny,
-              i, j, local_i, local_j, freq, fovx, fovy, Rstop, qu_conv, params, data
+              i, j, local_i, local_j, freq, fovx, fovy, Rstop, qu_conv, params, data, d_lens
           )
       end
       return nothing
@@ -56,7 +56,7 @@ using Jipole.Slowlight: OfSlowLight, shifted_points
 
 """
       calculate_image!(traj, d_Image, d_pol, d_truncated, Xcam, Econ, Ecov, bhspin, nx, ny,
-          i_global, j_global, i_local, j_local, freq, fovx, fovy, Rstop, qu_conv, params, data=nothing)
+          i_global, j_global, i_local, j_local, freq, fovx, fovy, Rstop, qu_conv, params, data=nothing, d_lens=nothing)
 
   Per-pixel body of the GPU kernel. Traces the geodesic of pixel (i_global, j_global) with
   `Geodesics.trace_geodesic!` into this pixel's slice of the tile buffer, then integrates the
@@ -87,6 +87,7 @@ using Jipole.Slowlight: OfSlowLight, shifted_points
   - `qu_conv`: Q/U sign convention, see `Polarization.save_pixel!`.
   - `params`: Model parameters.
   - `data`: Model data (e.g. `Iharm`'s GRMHD snapshots).
+  - `d_lens`: Image split by lensing band, `(nx, ny, nbands)`, or `nothing`.
   """
 function calculate_image!(
       traj, d_Image, d_pol, d_truncated,
@@ -95,7 +96,7 @@ function calculate_image!(
       i_global::Int64, j_global::Int64,
       i_local::Int64, j_local::Int64,
       freq::Float64, fovx::Float64, fovy::Float64, Rstop::Float64, qu_conv::Int64, params,
-      data::T_data = nothing
+      data::T_data = nothing, d_lens = nothing
   ) where {T_data}
 
     if (i_global >= nx || j_global >= ny)
@@ -121,10 +122,12 @@ function calculate_image!(
 
     @inbounds far = ptraj[step]
     ji, ki = Radiation.get_jk(far.X, far.Kcon, freq, bhspin, params, data)
+    band = d_lens === nothing ? 0 : count(k -> Radiation.z_turn(ptraj, k, params), 2:step-1)
 
     @inbounds for nstep in step:-1:2
         ti = ptraj[nstep]
         tf = ptraj[nstep - 1]
+        d_lens !== nothing && nstep < step && Radiation.z_turn(ptraj, nstep, params) && (band -= 1)
         if polarized
             # Half-step point of this step, recomputed from its near end.
             _, _, Xhalf, Kconhalf = Geodesics.push_photon(tf.X, tf.Kcon, -tf.dl / dl_unit, bhspin, params)
@@ -136,6 +139,7 @@ function calculate_image!(
         if Radiation.radiating_region(tf.X, params, Rh)
             jf, kf = Radiation.get_jk(tf.X, tf.Kcon, freq, bhspin, params, data)
             Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, tf.dl)
+            d_lens === nothing || Radiation.lens_step!(d_lens, band, ji, ki, jf, kf, tf.dl, i_global + 1, j_global + 1)
             ji = jf
             ki = kf
         end
@@ -149,9 +153,25 @@ function calculate_image!(
     return nothing
 end
 
+
+"""
+    tile_rays(rays, offsets, j0, j1)
+
+The rays of image rows `j0:j1` on the GPU, and where each pixel's ray starts in them: all the rays
+if they are already on the GPU, else the rows' contiguous slice of the host rays, uploaded now.
+"""
+function tile_rays(rays, offsets, j0, j1)
+    rays isa CuArray && return rays, CuArray(offsets[:, j0:j1])
+    first = offsets[1, j0] + 1
+    last = j1 < size(offsets, 2) ? offsets[1, j1 + 1] : length(rays)
+    d_rays = CuArray{eltype(rays)}(undef, last - first + 1)
+    copyto!(d_rays, 1, rays, first, last - first + 1)
+    return d_rays, CuArray(offsets[:, j0:j1] .- (first - 1))
+end
+
 """
     render_round_gpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, rays, offsets, tile_height,
-        valid_ks, target_times, params_slowlight, freq, model, gpu_data)
+        valid_ks, target_times, params_slowlight, freq, model, gpu_data, movie_lens = nothing, movie_band = nothing)
 
 Render one round on the GPU -- the `:GPU` counterpart of [`render_round_cpu!`](@ref).
 The rays are stored back to back at their own lengths (see [`flatten_rays`](@ref)).
@@ -177,10 +197,11 @@ overwritten in place, or `nothing` for an unpolarized run.
 - `freq`: Frequency, in cgs units.
 - `model`: Iharm model parameters.
 - `gpu_data`: 3-element vector of GPU-resident GRMHD snapshots.
+- `movie_lens`, `movie_band`: optional arrays to hold the image split by lensing band, if the user wants it.
 """
 function Slowlight.render_round_gpu!(
     movie_nstep, movie_intensity, movie_N, movie_tauF, rays, offsets, tile_height, valid_ks,
-    target_times, params_slowlight::OfSlowLight, freq, model, gpu_data
+    target_times, params_slowlight::OfSlowLight, freq, model, gpu_data, movie_lens = nothing, movie_band = nothing
 )
     # 8x8 blocks: a block keeps its place on the GPU until its slowest thread is done, and small
     # square blocks hold neighbouring pixels with similar ray lengths (1.4x faster than 16x16).
@@ -199,28 +220,21 @@ function Slowlight.render_round_gpu!(
         tile_ny = j1 - j0 + 1
 
         # The tile's rays: all of them if already on the GPU, else the tile's contiguous slice.
-        if rays isa CuArray
-            d_rays = rays
-            d_offsets = CuArray(offsets[:, j0:j1])
-        else
-            first = offsets[1, j0] + 1
-            last = j1 < pixels_y ? offsets[1, j1 + 1] : length(rays)
-            d_rays = CuArray{eltype(rays)}(undef, last - first + 1)
-            copyto!(d_rays, 1, rays, first, last - first + 1)
-            d_offsets = CuArray(offsets[:, j0:j1] .- (first - 1))
-        end
+        d_rays, d_offsets = tile_rays(rays, offsets, j0, j1)
         d_nstep = CuArray(@view movie_nstep[:, j0:j1, :])
         d_intensity = CuArray(@view movie_intensity[:, j0:j1, :])
         d_N = movie_N === nothing ? nothing : CuArray(@view movie_N[:, j0:j1, :])
         d_tauF = movie_tauF === nothing ? nothing : CuArray(@view movie_tauF[:, j0:j1, :])
-
+        d_lens = movie_lens === nothing ? nothing : CuArray(@view movie_lens[:, j0:j1, :, :])
+        d_band = movie_band === nothing ? nothing : CuArray(@view movie_band[:, j0:j1, :])
+        
         # one layer of blocks per open frame: every frame of every pixel runs in parallel
         blocks_per_grid = (cld(pixels_x, threads_per_block[1]), cld(tile_ny, threads_per_block[2]),
         length(valid_ks))
         @cuda threads = threads_per_block blocks = blocks_per_grid slowlight_kernel!(
             d_rays, d_offsets, d_nstep, d_intensity, d_N, d_tauF, d_valid_ks, d_target_times,
             params_slowlight.tA, params_slowlight.tB, params_slowlight.tf,
-            freq, model.a, model, data_tuple
+            freq, model.a, model, data_tuple, d_lens, d_band
         )
         CUDA.synchronize()
 
@@ -230,6 +244,10 @@ function Slowlight.render_round_gpu!(
             copyto!(@view(movie_N[:, j0:j1, :]), Array(d_N))
             copyto!(@view(movie_tauF[:, j0:j1, :]), Array(d_tauF))
         end
+        if movie_lens != nothing
+            copyto!(@view(movie_lens[:, j0:j1, :, :]), Array(d_lens))
+            copyto!(@view(movie_band[:, j0:j1, :]), Array(d_band))
+        end
     end
     return nothing
 end
@@ -237,8 +255,7 @@ end
 
 """
     slowlight_kernel!(rays, offsets, nstep_state, intensity, N_state, tauF_state, valid_ks,
-target_times,
-        tA, tB, tf, freq, bhspin, model, data)
+target_times, tA, tB, tf, freq, bhspin, model, data, lens_state = nothing, band_state = nothing)
 
 The GPU kernel itself: one thread per pixel `(i, j)` and open frame (`valid_ks[blockIdx().z]`),
 so all frames of all pixels run in parallel. Each thread continues that frame's integration
@@ -267,13 +284,13 @@ overwritten in place, or `nothing` for an unpolarized run.
 - `freq`: Frequency, in cgs units.
 - `bhspin`: Dimensionless black hole spin parameter.
 - `model`: Iharm model parameters.
-- `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (kept in step
-with the CPU window by `process_slowlight_images!`).
+- `data`: GPU-resident, 3-snapshot `NTuple` of GRMHD snapshots (kept in step with the CPU window by `process_slowlight_images!`).
+- `lens_state`, `band_state`: optional arrays to hold the image split by lensing band, if the user wants it.
 """
  function slowlight_kernel!(
     rays, offsets, nstep_state, intensity, N_state, tauF_state, valid_ks, target_times,
     tA::Float64, tB::Float64, tf::Float64,
-    freq::Float64, bhspin::Float64, model, data
+    freq::Float64, bhspin::Float64, model, data, lens_state = nothing, band_state = nothing
 )
     i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
     j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
@@ -290,16 +307,20 @@ with the CPU window by `process_slowlight_images!`).
         # Pass 1: the intensity.
         nstep = nstep_start
         Intensity = intensity[i, j, k]
+        band = band_state === nothing ? 0 : band_state[i, j, k]
         while nstep > 2
             Xi, _, Xf, stop = shifted_points(rays, off, nstep, dt, tA, tB, tf)
             stop && break
             ji, ki = Radiation.get_jk(Xi, rays[off + nstep].Kcon, freq, bhspin, model, data)
             jf, kf = Radiation.get_jk(Xf, rays[off + nstep - 1].Kcon, freq, bhspin, model, data)
             Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, rays[off + nstep - 1].dl)
+            lens_state === nothing || Radiation.lens_step!(lens_state, band, ji, ki, jf, kf, rays[off + nstep - 1].dl, i, j, k)
             nstep -= 1
+            lens_state !== nothing && Radiation.z_turn(rays, off + nstep, model) && (band -= 1)
         end
         nstep_state[i, j, k] = nstep
         intensity[i, j, k] = Intensity
+        band_state === nothing || (band_state[i, j, k] = band)
 
         # Pass 2 (polarized run): the coherency tensor and Faraday depth, over the same steps.
         if N_state !== nothing
@@ -342,7 +363,7 @@ function Utils_GPU.gpu_tile_plan(unit_bytes; reserve_bytes = 0)
 end
 
 function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, freq, fovx, fovy, nx, ny;
-    pol=nothing, qu_conv::Int=0, nmaxstep=16000)
+    pol=nothing, qu_conv::Int=0, nmaxstep=16000, lens = nothing)
 
     # 8x8 blocks: a block keeps its place on the GPU until its slowest ray is done, and small
     # square blocks hold neighbouring pixels with similar ray lengths.
@@ -357,7 +378,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
 
     d_Image = CUDA.zeros(Float64, nx, ny)
     d_pol = pol === nothing ? nothing : CUDA.zeros(Float64, Polarization.NIMG, nx, ny)
-
+    d_lens = lens === nothing ? nothing : CUDA.zeros(Float64, nx, ny, size(lens, 3))
     # Square tiles of as many pixels as the free GPU memory holds geodesic buffers for, split evenly
     # over the image and rounded up to whole 8x8 blocks. Each tile waits for its longest ray, and
     # squares keep the long photon-ring rays (near the image centre) in few tiles.
@@ -375,7 +396,7 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
             d_traj, d_Image, d_pol, d_truncated,
             i_offset, j_offset, tile_x, tile_y,
             Xcam, Econ, Ecov, model.a, nx, ny,
-            freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model
+            freq, fovx, fovy, model.rmax_geo, qu_conv, gpu_sim_data, model, d_lens
         )
         n_truncated += count(d_truncated)
     end
@@ -383,9 +404,71 @@ function Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, θo, phi, fre
 
     copyto!(Image, d_Image)
     pol === nothing || copyto!(pol, d_pol)
+    lens === nothing || (copyto!(lens, d_lens); lens .*= freq^3)
     CUDA.unsafe_free!(d_traj)
     all(isfinite, Image) || error("NaN or Inf intensity in the GPU image.")
     return n_truncated
 end
 
+
+"""
+    DumpColumns(cols)
+
+A frame's dumps on the GPU, stored field by field.
+"""
+struct DumpColumns{C}
+    cols::C
+end
+
+struct DumpView{C}
+    cols::C
+    k::Int
+end
+
+Base.length(d::DumpColumns) = length(d.cols.t)
+Base.getindex(d::DumpColumns, k) = DumpView(d.cols, k)
+@inline Base.getproperty(v::DumpView, name::Symbol) = @inbounds getfield(getfield(v, :cols), name)[getfield(v, :k)]
+
+"""
+    brisk_kernel!(rays, offsets, nsteps, Image, pol, lens, cols, shift, tA, tB, freq, model, qu_conv)
+
+One thread per pixel runs `Radiation.integrate_emission!` over the pixel's stored ray, with the frame's
+dumps as a `Brisklight.FrameData`: the CPU pixel loop of `process_brisklight_images!`.
+"""
+function brisk_kernel!(rays, offsets, nsteps, Image, pol, lens, cols, shift, tA, tB, freq, model, qu_conv)
+    i = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    j = (blockIdx().y - 1) * blockDim().y + threadIdx().y
+    (i <= size(offsets, 1) && j <= size(offsets, 2)) || return nothing
+    @inbounds off, ns = offsets[i, j], nsteps[i, j]
+    data = Brisklight.FrameData(DumpColumns(cols), shift, tA, tB)
+    sink = pol === nothing ? data : Polarization.PolSink(data, pol, qu_conv)
+    Radiation.integrate_emission!(view(rays, off+1:off+ns), ns, Image, i, j, freq, model.a, model, sink, lens)
+    return nothing
+end
+
+"""
+    render_frame_gpu!(Image, pol, lens, rays, offsets, nsteps, tile_height, gpu_snaps, shift, tA, tB, freq, model, qu_conv)
+
+One brisk-light frame on the GPU: [`brisk_kernel!`](@ref) on `tile_height` image rows at a time,
+writing `Image` (and `pol`, `lens`) as the CPU loop does.
+"""
+function Brisklight.render_frame_gpu!(Image, pol, lens, rays, offsets, nsteps, tile_height, gpu_snaps, shift, tA, tB,
+        freq, model, qu_conv)
+    names = fieldnames(eltype(gpu_snaps))
+    cols = NamedTuple{names}(map(nm -> CuArray([cudaconvert(getfield(g, nm)) for g in gpu_snaps]), names))
+    nx, ny = size(offsets)
+    for j0 in 1:tile_height:ny
+        j1 = min(j0 + tile_height - 1, ny)
+        d_rays, d_offsets = tile_rays(rays, offsets, j0, j1)
+        d_Image = CUDA.zeros(Float64, nx, j1 - j0 + 1)
+        d_pol = pol === nothing ? nothing : CUDA.zeros(Float64, Polarization.NIMG, nx, j1 - j0 + 1)
+        d_lens = lens === nothing ? nothing : CUDA.zeros(Float64, nx, j1 - j0 + 1, size(lens, 3))
+        @cuda threads=(8, 8) blocks=(cld(nx, 8), cld(j1 - j0 + 1, 8)) brisk_kernel!(d_rays, d_offsets,
+            CuArray(nsteps[:, j0:j1]), d_Image, d_pol, d_lens, cols, shift, tA, tB, freq, model, qu_conv)
+        copyto!(@view(Image[:, j0:j1]), Array(d_Image))
+        pol === nothing || copyto!(@view(pol[:, :, j0:j1]), Array(d_pol))
+        lens === nothing || copyto!(@view(lens[:, j0:j1, :]), Array(d_lens))
+    end
+    return nothing
+end
 end

@@ -697,7 +697,7 @@ in `traj[n-1]`.
 - A tuple `(SI, SQ, SU, SV, tauF)`: invariant Stokes parameters at the camera
   (multiply by `freq^3` for specific intensities) and the Faraday depth.
 """
-function integrate_emission_pol(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, freq, bhspin, model::AbstractModel, data=nothing) where {T}
+function integrate_emission_pol(traj::AbstractVector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, freq, bhspin, model::AbstractModel, data=nothing) where {T}
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
     dl_unit = model.L_unit * Constants.HPL / (Constants.ME * Constants.CL * Constants.CL)
 
@@ -780,7 +780,7 @@ Leung et al. (2011) emissivity averaged over each step, the polarized one the
 Dexter (2016) fits evaluated at the end of each step. Their Stokes I therefore
 differ slightly, by design.
 """
-function Radiation.integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, sink::PolSink, lens = nothing) where {T}
+function Radiation.integrate_emission!(traj::AbstractVector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, sink::PolSink, lens = nothing) where {T}
     Radiation.integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, sink.data, lens)
     SI, SQ, SU, SV, tauF = integrate_emission_pol(traj, nsteps, freq, bhspin, model, sink.data)
     save_pixel!(sink.pol, I, J, SI, SQ, SU, SV, tauF, freq, sink.qu_conv)

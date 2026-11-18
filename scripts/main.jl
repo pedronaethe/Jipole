@@ -100,7 +100,6 @@ end
 # Images split by lensing band ([output] max_lens = n): bands 0 to n, counted in z turns
 # between the emission and the camera, the last band also holding the higher ones.
 const max_lens = get(get(config, "output", Dict{String,Any}()), "max_lens", nothing)
-max_lens !== nothing && (slow_light || do_gradients || mode == "gpu") && error("[output].max_lens works in fast and brisk light on the CPU, without gradients (for slow light, use [brisklight] p = 1).")
 
 # Polarized transfer (Stokes Q, U, V and Faraday depth). The [polarization] section is optional:
 # without it the run is unpolarized, exactly as before.
@@ -161,9 +160,6 @@ if brisklight || fast_cadence !== nothing
     # Surely enough, if you wanna do brisklight or fastlight movies, you need to provide a directory of dumps, duh. 
     isdir(dump_filepath) || error("[brisklight] and [fastlight] need [dump].dump_filepath to be a directory of dumps")
 
-    # Don't allow GPU for now, I'll fix this later, but if you are reading this, it means I failed to fix it later lol.
-    use_gpu && println("Brisk light and the fast-light cadence run on the CPU for now.")
-
     #Setting up parameters.
     reader = Jipole.Kharma.is_kharma_dump(dump_files[1]) ? Jipole.Kharma : Jipole.Iharm
     model = reader.read_header(dump_files[1], MBH; th_beg=th_beg, Rlow=Rlow, Rhigh=Rhigh, beta_crit=beta_crit,
@@ -188,7 +184,7 @@ if brisklight || fast_cadence !== nothing
     Jipole.Brisklight.process_brisklight_images!(all_geodesics, nsteps, windows, t_ref, dump_files,
         path -> reader.load_data(path, Rhigh, model), model, freq, meta;
         cadence=get(settings, "cadence", 10.0), t_start=get(settings, "t_start", nothing),
-        n_frames=get(settings, "n_frames", nothing), fast=!brisklight, pol=do_polarization, max_lens = max_lens,
+        n_frames=get(settings, "n_frames", nothing), fast=!brisklight, pol=do_polarization, max_lens = max_lens, gpu=use_gpu,
         output_dir=dirname(abspath(output_filename)))
     println("Done!")
 elseif !slow_light
@@ -233,14 +229,14 @@ elseif !slow_light
                 grad_image, pol, grads, grads_pol = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
                       MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
                       M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
-                      wrt=gradient_wrt, pol=true);
+                      wrt=gradient_wrt, pol=true, lens=Lens);
                 copyto!(Image, grad_image)
             elseif do_gradients
                 ctx = Jipole.Iharm.grmhd_context(model, simulation_data[1])
                 grad_image, grads = Jipole.Iharm.calculate_gradients(ctx, freq, pixels_x, pixels_y, fov_size, maxnstep, xoff, yoff;
                     MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg, sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high,
                     M_unit=M_unit, ro=ro, th=th, phi=phi, sourceD=SourceD,
-                    wrt=gradient_wrt);
+                    wrt=gradient_wrt, lens=Lens);
                 copyto!(Image, grad_image)
             elseif do_polarization
                 unpol_image, pol = Jipole.ImagingPol.raytrace_image_pol(model, simulation_data, ro, th, phi, freq, pixels_x, pixels_y, fovx, fovy, maxnstep, Rh, xoff, yoff; lens = Lens)
@@ -255,7 +251,7 @@ elseif !slow_light
             println("Processing image in tiles...")
             gpu_time = @elapsed begin
                 pol = do_polarization ? zeros(Float64, Jipole.Polarization.NIMG, pixels_x, pixels_y) : nothing
-                Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y; pol=pol)
+                Jipole.Imaging.render_image_gpu!(Image, model, gpu_sim_data, ro, th, phi, freq, fovx, fovy, pixels_x, pixels_y; pol=pol, lens = Lens)
             end
             @printf("GPU raytracing took %.3f s\n", gpu_time)
             println("Raytracing complete!")
@@ -386,7 +382,7 @@ else
         params_slowlight, simulation_data, all_geodesics, nsteps,
         model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path,
         Xcamera, ro, th, phi, fovx, fovy, SourceD, scale_factor;
-        engine=slowlight_engine, pol=do_polarization
+        engine=slowlight_engine, pol=do_polarization, max_lens = max_lens
     )
     println("Done!")
 end

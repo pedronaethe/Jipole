@@ -115,7 +115,7 @@ end
 
 """
       render_round_cpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, all_geodesics, valid_ks, target_times,
-          pixels_x, pixels_y, params_slowlight, freq, model, simulation_data)
+          pixels_x, pixels_y, params_slowlight, freq, model, simulation_data, movie_lens, movie_band)
 
   Render one round on the CPU: for every pixel and every currently-open
   frame in `valid_ks`, continue integrating intensity along that pixel's
@@ -137,10 +137,11 @@ end
   - `freq`: Frequency, in cgs units.
   - `model`: Iharm model parameters.
   - `simulation_data`: 3-element window of loaded GRMHD snapshots.
+  - `movie_lens`, `movie_band`: optional arrays to hold the image split by lensing band, if the user wants it.
 """
 function render_round_cpu!(
       movie_nstep, movie_intensity, movie_N, movie_tauF, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-      params_slowlight::OfSlowLight, freq, model, simulation_data
+      params_slowlight::OfSlowLight, freq, model, simulation_data, movie_lens = nothing, movie_band = nothing
   )
       polarized = movie_N !== nothing
       Rh = 1 + sqrt(1.0 - model.a * model.a)
@@ -159,6 +160,7 @@ function render_round_cpu!(
                   N = polarized ? movie_N[i, j, k] : Polarization.zero_tensor(Float64)
                   tauF = polarized ? movie_tauF[i, j, k] : 0.0
                   dt = target_times[k] + 1e-5
+                  band = movie_band === nothing ? 0 : movie_band[i, j, k]
 
                   while (nstep > 2)
                       Xi = traj[nstep].X
@@ -192,16 +194,18 @@ function render_round_cpu!(
                     jf, kf = Radiation.get_jk(Xf, Kconf, freq, model.a, model, simulation_data)
 
                     Intensity = Radiation.approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
-
+                    movie_lens === nothing || Radiation.lens_step!(movie_lens, band, ji, ki, jf, kf, traj[nstep-1].dl, i, j, k)
                     if polarized
                         N, tauF = Polarization.polarized_step(N, tauF, Xi, Kconi, Xh, traj[nstep].Kconhalf, Xf, Kconf,
                             traj[nstep-1].dl, dl_unit, Rh, freq, model.a, model, simulation_data)
                     end
 
                     nstep -= 1
+                    movie_lens !== nothing && Radiation.z_turn(traj, nstep, model) && (band -= 1)
                 end
                 movie_nstep[i, j, k] = nstep
                 movie_intensity[i, j, k] = Intensity
+                movie_band === nothing || (movie_band[i, j, k] = band)
                 if polarized
                     movie_N[i, j, k] = N
                     movie_tauF[i, j, k] = tauF
@@ -409,11 +413,12 @@ allows, until every requested frame has been produced.
   the GPU instead ([`render_round_gpu!`](@ref)/[`slowlight_kernel!`](@ref)).
 - `pol`: also render the polarized frames (Stokes I, Q, U, V and Faraday depth).
 - `qu_conv`: Q/U sign convention of the polarized frames, see `Polarization.save_pixel!`.
+- `max_lens`: Max lensing bands to split the outputted image.
 """
 function process_slowlight_images!(
     params_slowlight, simulation_data, all_geodesics, nsteps,
     model, t0, tgeof, tgeoi, pixels_x, pixels_y, freq, Rhigh, all_dumps_path, Xcamera, ro, theta_o, phi, fovx, fovy, SourceD, scale;
-    engine::Symbol = :CPU, pol::Bool = false, qu_conv::Int = 0
+    engine::Symbol = :CPU, pol::Bool = false, qu_conv::Int = 0, max_lens = nothing
 )
     if engine === :GPU && isnothing(Base.get_extension(parentmodule(@__MODULE__), :JipoleCUDAExt))
         error("engine = :GPU needs CUDA.jl loaded: run `using CUDA` first")
@@ -439,6 +444,11 @@ function process_slowlight_images!(
     # For polarization
     movie_N = pol ? fill(Polarization.zero_tensor(Float64), pixels_x, pixels_y, nimgs_concurrently) : nothing
     movie_tauF = pol ? zeros(Float64, pixels_x, pixels_y, nimgs_concurrently) : nothing
+    # Images split by lensing band following the z-turns
+    movie_lens = max_lens === nothing ? nothing : zeros(Float64, pixels_x, pixels_y, nimgs_concurrently, max_lens + 1)
+    movie_band = max_lens === nothing ? nothing : zeros(Int, pixels_x, pixels_y, nimgs_concurrently)
+    turns = max_lens === nothing ? nothing : [count(s -> Radiation.z_turn(all_geodesics[i, j], s, model), 2:nsteps[i, j]-1) for i in 1:pixels_x, j in 1:pixels_y]
+    #
     pol && println("Polarized frame state: $(round((sizeof(movie_N) + sizeof(movie_tauF)) / 1024^3, digits=2)) GB")
     #
     target_times = zeros(Float64, nimgs_concurrently)
@@ -456,7 +466,7 @@ function process_slowlight_images!(
         println("Preparing GPU workspace...")
         rays, offsets = flatten_rays(all_geodesics, nsteps)
         # Rows per tile: a row's stored rays must fit next to the 3 snapshots and the frame state.
-        state_bytes = sizeof(movie_nstep) + sizeof(movie_intensity) + (pol ? sizeof(movie_N) + sizeof(movie_tauF) : 0)
+        state_bytes = sizeof(movie_nstep) + sizeof(movie_intensity) + (pol ? sizeof(movie_N) + sizeof(movie_tauF) : 0) + (movie_lens === nothing ? 0 : sizeof(movie_lens) + sizeof(movie_band))
         tile_height = min(pixels_y, Utils_GPU.gpu_tile_plan(maximum(sum(nsteps; dims = 1)) * sizeof(eltype(rays));
         reserve_bytes = 3 * Base.summarysize(simulation_data[1]) + state_bytes))
         # When all rays fit on the GPU, upload them once here and keep them for the whole run.
@@ -481,6 +491,10 @@ function process_slowlight_images!(
                     fill!(view(movie_N, :, :, nimg), Polarization.zero_tensor(Float64))
                     fill!(view(movie_tauF, :, :, nimg), 0.0)
                 end
+                if movie_lens !== nothing
+                    fill!(view(movie_lens, :, :, nimg, :), 0.0)
+                    movie_band[:, :, nimg] .= turns
+                end
                 nimg += 1
                 if nimg > nimgs_concurrently
                     nimg = 1
@@ -493,10 +507,10 @@ function process_slowlight_images!(
 
         elapsed = @elapsed if engine === :CPU
             render_round_cpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, all_geodesics, valid_ks, target_times, pixels_x, pixels_y,
-                params_slowlight, freq, model, simulation_data)
+                params_slowlight, freq, model, simulation_data, movie_lens, movie_band)
         else
              render_round_gpu!(movie_nstep, movie_intensity, movie_N, movie_tauF, rays, offsets,
-                tile_height, valid_ks, target_times, params_slowlight, freq, model, gpu_data)
+                tile_height, valid_ks, target_times, params_slowlight, freq, model, gpu_data, movie_lens, movie_band)
         end
         println("Round rendered in $(round(elapsed, digits=3))s on $engine")
 
@@ -541,6 +555,7 @@ function process_slowlight_images!(
                     end
                     out_data["pol"] = pol_out
                 end
+                movie_lens === nothing || (out_data["lens"] = movie_lens[:, :, k, :] .* freq^3)
                 Output.generate_output_file(file_name, out_data; format="ipole")
                 println("Saving image $(file_name)")
 

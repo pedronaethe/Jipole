@@ -1143,7 +1143,7 @@ end
 """
     calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep, xoff, yoff;
         MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit,
-        ro, th, phi, sourceD, wrt=(), pol=false)
+        ro, th, phi, sourceD, wrt=(), pol=false, lens = nothing)
 
 The image (and, with `pol=true`, the polarized image) and their derivatives with
 respect to the parameters in `wrt`, from one forward-mode pass of dual numbers
@@ -1159,6 +1159,7 @@ through the ordinary ray-tracing code.
 - keyword arguments: values of the differentiable parameters (see
 `GRADIENT_PARAM_NAMES`); `wrt` lists the ones to differentiate.
 - `pol`: also compute the polarized image and its derivatives.
+- 'lens': optional array to hold the image split by lensing band, if the user wants it.
 
 # Returns
 - `pol=false`: `Image` if `wrt` is empty, otherwise `(Image, grads)`.
@@ -1169,7 +1170,7 @@ through the ordinary ray-tracing code.
 """
  function calculate_gradients(ctx, freq, pixels_x, pixels_y, fovx_uas, maxnstep, xoff, yoff;
         MBH, Rhigh, Rlow, beta_crit, th_beg, sigma_cut, sigma_cut_high, M_unit,
-        ro, th, phi, sourceD, wrt::NTuple{N,Symbol}=(), pol::Bool=false) where N
+        ro, th, phi, sourceD, wrt::NTuple{N,Symbol}=(), pol::Bool=false, lens=nothing) where N
 
     p = dual_problem(ctx; MBH=MBH, Rhigh=Rhigh, Rlow=Rlow, beta_crit=beta_crit, th_beg=th_beg,
         sigma_cut=sigma_cut, sigma_cut_high=sigma_cut_high, M_unit=M_unit,
@@ -1182,18 +1183,22 @@ through the ordinary ray-tracing code.
 
     # One array of derivatives per parameter in wrt.
     grads_of(A) = NamedTuple{wrt}(Tuple(ForwardDiff.partials.(A, i) for i in 1:N))
+    # The image split by lensing band, in dual numbers like the image; `lens` gets its values.
+    lens_d = lens === nothing ? nothing : zeros(promote_type(typeof(p.ro), typeof(p.th), typeof(p.phi), typeof(p.model.a)), size(lens))
 
     if pol
         Image_dual, pol_dual = ImagingPol.raytrace_image_pol(p.model, p.data, p.ro, p.th, p.phi, freq,
-            pixels_x, pixels_y, fovx_d, fovy_d, maxnstep, Rh, xoff, yoff)
+            pixels_x, pixels_y, fovx_d, fovy_d, maxnstep, Rh, xoff, yoff; lens = lens_d)
         Image, pol_img = ForwardDiff.value.(Image_dual), ForwardDiff.value.(pol_dual)
+        lens === nothing || (lens .= ForwardDiff.value.(lens_d))
         N == 0 && return Image, pol_img
         return Image, pol_img, grads_of(Image_dual), grads_of(pol_dual)
     end
 
     Image_dual = Imaging.raytrace_image(p.model, p.data, p.ro, p.th, p.phi, freq,
-        pixels_x, pixels_y, fovx_d, fovy_d, maxnstep, Rh, xoff, yoff)
+        pixels_x, pixels_y, fovx_d, fovy_d, maxnstep, Rh, xoff, yoff; lens = lens_d)
     Image = ForwardDiff.value.(Image_dual)
+    lens === nothing || (lens .= ForwardDiff.value.(lens_d))
     N == 0 && return Image
     return Image, grads_of(Image_dual)
 end

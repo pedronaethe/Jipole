@@ -117,6 +117,20 @@ lensing band is the number of these turns between it and the camera (at `traj[1]
 end
 
 """
+    lens_step!(lens, band, ji, ki, jf, kf, dl, I...)
+
+[`approximate_solve`](@ref) for the image split by lensing band, `lens[I..., b]`: every band is
+attenuated, and the step's emission goes to its own band (the last band also holds the higher ones).
+"""
+@inline function lens_step!(lens, band, ji, ki, jf, kf, dl, I...)
+    own = min(band, size(lens, ndims(lens)) - 1) + 1
+    for b in axes(lens, ndims(lens))
+        lens[I..., b] = approximate_solve(lens[I..., b], b == own ? ji : zero(ji), ki, b == own ? jf : zero(jf), kf, dl)
+    end
+    return nothing
+end
+
+"""
     integrate_emission!(traj, nsteps, Image, I, J, freq, bhspin, model, data=nothing, lens = nothing)
 
 Integrate the emission along the geodesic trajectory `traj`, writing the
@@ -138,7 +152,7 @@ crossing emission model.
 - `data`: Model-specific auxiliary data.
 - `lens`: Optional array to accumulate the intensity in each lensing band.
 """
-function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing, lens = nothing) where {T}
+function integrate_emission!(traj::AbstractVector{GeoTypes.OfTrajGeneric{T}}, nsteps::Int, Image, I, J, freq, bhspin, model::AbstractModel, data=nothing, lens = nothing) where {T}
     Rh = 1 + sqrt(1.0 - bhspin * bhspin)
 
     Xi = traj[nsteps].X
@@ -163,21 +177,9 @@ function integrate_emission!(traj::Vector{GeoTypes.OfTrajGeneric{T}}, nsteps::In
 
         jf, kf = get_jk(Xf, Kconf, freq, bhspin, model, data)
         Intensity = approximate_solve(Intensity, ji, ki, jf, kf, traj[nstep-1].dl)
-        if lens !== nothing
-            # every band is attenuated, and the step's emission goes to its own band
-            own = min(band, size(lens, 3) - 1) + 1
-            for b in axes(lens, 3)
-                lens[I, J, b] = approximate_solve(lens[I, J, b], b == own ? ji : zero(ji), ki, b == own ? jf : zero(jf), kf, traj[nstep-1].dl)
-            end
-        end
+        lens === nothing || lens_step!(lens, band, ji, ki, jf, kf, traj[nstep-1].dl, I, J)
 
-        if isnan(Intensity) || isinf(Intensity)
-            @error "NaN or Inf encountered in intensity calculation at pixel ($I, $J)"
-            println("Intensity = $Intensity")
-            DebugFunctions.print_vector("Kconf =", Kconf)
-            DebugFunctions.print_vector("Kconi =", Kconi)
-            error("NaN or Inf encountered in intensity calculation")
-        end
+        isfinite(Intensity) || error("NaN or Inf encountered in intensity calculation")
         ji = jf
         ki = kf
     end

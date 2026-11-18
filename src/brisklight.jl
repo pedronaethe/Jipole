@@ -17,6 +17,8 @@ using ..Polarization
 using ..Coordinates
 using ..Utils
 using ..Output
+using ..Slowlight
+using ..Utils_GPU
 
 export FrameData, brisk_windows, process_brisklight_images!
 
@@ -111,17 +113,24 @@ function brisk_windows(all_geodesics, nsteps, model, n_bands, p)
     return windows, t_ref
 end
 
+"""
+    render_frame_gpu!(Image, pol, lens, rays, offsets, nsteps, tile_height, gpu_snaps, shift, tA, tB, freq, model, qu_conv)
+
+The GPU version of a frame's pixel loop in [`process_brisklight_images!`](@ref). Defined in the CUDA extension.
+"""
+function render_frame_gpu! end
+
 
 """
     process_brisklight_images!(all_geodesics, nsteps, windows, t_ref, dump_files, load_dump, model,
-        freq, meta; cadence, t_start=nothing, n_frames=nothing, fast=false, pol=false, qu_conv=0, max_lens = nothing,
+        freq, meta; cadence, t_start=nothing, n_frames=nothing, fast=false, pol=false, qu_conv=0, max_lens = nothing, gpu = false,
         output_dir=".")
 
 Render a movie from a dump series over stored rays: one frame every `cadence` (M), each
 loading only the dumps it needs with `load_dump(path)` (kept while later frames still need them).
 """
 function process_brisklight_images!(all_geodesics, nsteps, windows, t_ref, dump_files, load_dump, model,
-        freq, meta; cadence, t_start=nothing, n_frames=nothing, fast=false, pol=false, qu_conv=0, max_lens = nothing, output_dir=".")
+        freq, meta; cadence, t_start=nothing, n_frames=nothing, fast=false, pol=false, qu_conv=0, max_lens = nothing, gpu = false, output_dir=".")
     times = [Utils.dump_time(f) for f in dump_files]
     lo, hi = minimum(first, windows), maximum(last, windows)
     t_first, t_last = times[1] - lo + t_ref, times[end] - hi + t_ref
@@ -134,22 +143,42 @@ function process_brisklight_images!(all_geodesics, nsteps, windows, t_ref, dump_
     pol_image = pol ? zeros(Polarization.NIMG, nx, ny) : nothing
     lens = max_lens === nothing ? nothing : zeros(nx, ny, max_lens + 1)
     loaded = Dict{Int,Any}()
+    # the dumps around each window, shifted to the frame with this shift
+    dumps_around(shift) = sort!(unique!([k for (a, b) in windows
+        for k in clamp(searchsortedlast(times, a + shift), 1, length(times)):
+            clamp(searchsortedfirst(times, b + shift), 1, length(times))]))
+    if gpu
+        # The rays back to back: on the GPU when they fit next to a frame's dumps, else sent in tiles of image rows.
+        rays, offsets = Slowlight.flatten_rays(all_geodesics, nsteps)
+        first_dumps = dumps_around(t_f - t_ref)
+        dump_bytes = Base.summarysize(get!(() -> load_dump(dump_files[first_dumps[1]]), loaded, first_dumps[1]))
+        tile_height = min(ny, Utils_GPU.gpu_tile_plan(maximum(sum(nsteps; dims=1)) * sizeof(eltype(rays));
+                                                    reserve_bytes=(length(first_dumps) + 1) * dump_bytes))
+        tile_height == ny && (rays = Utils_GPU.copy_iharm_to_gpu(rays))
+        gpu_loaded = Dict{Int,Any}()
+    end
+
     nframe = 0
     while t_f <= t_last + 1e-9 && (n_frames === nothing || nframe < n_frames)
         shift = t_f - t_ref
+        needed = dumps_around(shift)
         # the dumps around each window, shifted to this frame
-        needed = sort!(unique!([k for (a, b) in windows
-                                for k in clamp(searchsortedlast(times, a + shift), 1, length(times)):
-                                        clamp(searchsortedfirst(times, b + shift), 1, length(times))]))
         foreach(k -> k < needed[1] && delete!(loaded, k), collect(keys(loaded)))
         snaps = map(k -> get!(() -> load_dump(dump_files[k]), loaded, k), needed)
         tA, tB = fast ? (t_f, t_f) : (times[needed[1]], times[needed[end]])
         data = FrameData(snaps, shift, tA, tB)
         sink = pol ? Polarization.PolSink(data, pol_image, qu_conv) : data
 
-        elapsed = @elapsed Threads.@threads for i in 1:nx
-            for j in 1:ny
-                Radiation.integrate_emission!(all_geodesics[i, j], nsteps[i, j], Image, i, j, freq, model.a, model, sink, lens)
+        # if gpu, use the kenrel, if not, loop over to integrate emission!
+        elapsed = @elapsed if gpu
+            foreach(k -> k < needed[1] && delete!(gpu_loaded, k), collect(keys(gpu_loaded)))
+            gpu_snaps = map(k -> get!(() -> Utils_GPU.copy_iharm_to_gpu(loaded[k]), gpu_loaded, k), needed)
+            render_frame_gpu!(Image, pol_image, lens, rays, offsets, nsteps, tile_height, gpu_snaps, shift, tA, tB, freq, model, qu_conv)
+        else
+            Threads.@threads for i in 1:nx
+                for j in 1:ny
+                    Radiation.integrate_emission!(all_geodesics[i, j], nsteps[i, j], Image, i, j, freq, model.a, model, sink, lens)
+                end
             end
         end
         out = copy(meta)
